@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Virtual environment / uv
+.venv/
+
+# Env files
+.env
+
+# Editors
+.vscode/
+.idea/
+
+# Caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
