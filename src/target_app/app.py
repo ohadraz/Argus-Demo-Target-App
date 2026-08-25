@@ -144,13 +144,27 @@ class MetricBucket(BaseModel):
     request_volume: int
 
 
-def _bucket_id(seeded_at: datetime, offset_minutes: int) -> str:
-    """Format the minute `offset_minutes` after `seeded_at` as a bucket id.
+def _scenario_span_minutes(scenario_id: str) -> int:
+    return max(entry.offset_minutes for entry in SCENARIOS[scenario_id])
+
+
+def _bucket_id(seeded_at: datetime, offset_minutes: int, span_minutes: int) -> str:
+    """Format one scenario minute as a bucket id, anchored so the scenario's
+    *last* minute is the seed instant.
+
+    The incident has therefore already happened by the time anything asks
+    about it, which is the only way round it can be: a consumer windowing its
+    retrieval will end that window at "now", because no minute after now
+    exists to be read. Anchoring the scenario's *first* minute at the seed
+    instant would put the rest of the incident in the future, where a correct
+    reader cannot see it.
 
     The same string prefixes that minute's log lines, so a caller can match a
     bucket to its entries without re-parsing either.
     """
-    minute = seeded_at.replace(second=0, microsecond=0) + timedelta(minutes=offset_minutes)
+    minute = seeded_at.replace(second=0, microsecond=0) + timedelta(
+        minutes=offset_minutes - span_minutes
+    )
     return minute.strftime(TIMESTAMP_FORMAT)
 
 
@@ -186,8 +200,9 @@ def scenario_status() -> ScenarioStatus:
 def logs() -> list[str]:
     if _active_scenario is None or _seeded_at is None:
         return []
+    span_minutes = _scenario_span_minutes(_active_scenario)
     return [
-        f"{_bucket_id(_seeded_at, entry.offset_minutes)} {message}"
+        f"{_bucket_id(_seeded_at, entry.offset_minutes, span_minutes)} {message}"
         for entry in SCENARIOS[_active_scenario]
         for message in entry.messages
     ]
@@ -197,9 +212,10 @@ def logs() -> list[str]:
 def metrics() -> list[MetricBucket]:
     if _active_scenario is None or _seeded_at is None:
         return []
+    span_minutes = _scenario_span_minutes(_active_scenario)
     return [
         MetricBucket(
-            bucket_id=_bucket_id(_seeded_at, entry.offset_minutes),
+            bucket_id=_bucket_id(_seeded_at, entry.offset_minutes, span_minutes),
             error_rate=entry.error_rate,
             p50_ms=entry.p50_ms,
             p95_ms=entry.p95_ms,
