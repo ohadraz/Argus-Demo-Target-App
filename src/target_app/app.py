@@ -12,12 +12,30 @@ TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 @dataclass(frozen=True)
+class ScenarioDeploy:
+    """A deployment that happened during a scenario's minute.
+
+    Only some scenarios have one - a feature flag flip is not a deploy - and
+    that difference is the point: a consumer reading deploy history must be
+    able to tell an incident a deploy caused from one it did not.
+    """
+
+    revision: str
+    repo_url: str
+    path: str
+    target_revision: str = "main"
+    initiated_by: str = "kuki"
+
+
+@dataclass(frozen=True)
 class ScenarioMinute:
     """One minute of a scenario: its log messages and its aggregated metrics.
 
     Logs and metrics are authored together, per minute, so the two endpoints
     cannot drift apart - `GET /logs` flattens the messages and `GET /metrics`
-    emits one bucket, both anchored to the same seed instant.
+    emits one bucket, both anchored to the same seed instant. A minute that
+    also carries a `deploy` shows up in the Argo CD stand-in's revision history
+    at that same minute, for the same reason.
     """
 
     offset_minutes: int
@@ -26,6 +44,7 @@ class ScenarioMinute:
     p50_ms: int
     p95_ms: int
     request_volume: int
+    deploy: ScenarioDeploy | None = None
 
 
 # feature-flag-toggle spikes the error rate while latency stays flat;
@@ -79,18 +98,26 @@ SCENARIOS: dict[str, tuple[ScenarioMinute, ...]] = {
     "bad-deployment": (
         ScenarioMinute(
             offset_minutes=0,
+            # No mention of the deploy. The Argo CD channel is the only place
+            # it is recorded, so a diagnosis of BAD_DEPLOYMENT can only have
+            # come from there - which is what the e2e case is for.
             messages=(
-                "INFO target-service: deploy started, version 1.4.2 -> 1.4.3",
-                "INFO target-service: deploy completed, version 1.4.3 live",
+                "INFO target-service: request succeeded",
+                "INFO target-service: request succeeded",
             ),
             error_rate=0.01,
             p50_ms=40,
             p95_ms=220,
             request_volume=1150,
+            deploy=ScenarioDeploy(
+                revision="9f4c1e7b2a3d5c8e1f0b6a4d2c9e7b5a3f1d8c6e",
+                repo_url="https://github.com/kuki/k8s-configs",
+                path="apps/target-service/production",
+            ),
         ),
         ScenarioMinute(
             offset_minutes=1,
-            messages=("WARN target-service: p95 latency climbing since deploy of version 1.4.3",),
+            messages=("WARN target-service: p95 latency climbing",),
             error_rate=0.02,
             p50_ms=95,
             p95_ms=900,
@@ -107,8 +134,8 @@ SCENARIOS: dict[str, tuple[ScenarioMinute, ...]] = {
         ScenarioMinute(
             offset_minutes=3,
             messages=(
-                "ERROR target-service: request timeout after 5000ms, version 1.4.3",
-                "ERROR target-service: request timeout after 5000ms, version 1.4.3",
+                "ERROR target-service: request timeout after 5000ms",
+                "ERROR target-service: request timeout after 5000ms",
             ),
             error_rate=0.12,
             p50_ms=320,
@@ -142,6 +169,46 @@ class MetricBucket(BaseModel):
     p50_ms: int
     p95_ms: int
     request_volume: int
+
+
+# The four models below mirror Argo CD's own wire shape, field names included -
+# `repoURL`, `deployedAt`, `targetRevision`. They are deliberately camelCase and
+# deliberately not this service's house style: the point of the stand-in is that
+# the adapter reading it is the same code that reads a real Argo CD server,
+# so
+# anything renamed here would be a lie the adapter would have to be written
+# around.
+class ArgoCdSource(BaseModel):
+    repoURL: str  # noqa: N815
+    path: str
+    targetRevision: str  # noqa: N815
+
+
+class ArgoCdInitiator(BaseModel):
+    username: str
+
+
+class ArgoCdRevisionHistory(BaseModel):
+    id: int
+    revision: str
+    deployedAt: str  # noqa: N815
+    deployStartedAt: str  # noqa: N815
+    source: ArgoCdSource
+    initiatedBy: ArgoCdInitiator  # noqa: N815
+
+
+class ArgoCdApplicationMetadata(BaseModel):
+    name: str
+    namespace: str
+
+
+class ArgoCdApplicationStatus(BaseModel):
+    history: list[ArgoCdRevisionHistory]
+
+
+class ArgoCdApplication(BaseModel):
+    metadata: ArgoCdApplicationMetadata
+    status: ArgoCdApplicationStatus
 
 
 def _scenario_span_minutes(scenario_id: str) -> int:
@@ -206,6 +273,54 @@ def logs() -> list[str]:
         for entry in SCENARIOS[_active_scenario]
         for message in entry.messages
     ]
+
+
+@app.get("/argocd/{application}", response_model=ArgoCdApplication)
+def argocd_application(application: str) -> ArgoCdApplication:
+    """Stands in for Argo CD's `GET /api/v1/applications/{name}`.
+
+    Answers from whichever scenario is seeded, whatever application it is asked
+    about - exactly as `/logs` and `/metrics` do - but echoes the requested name
+    back in `metadata.name`, because a real Argo CD identifies the application it
+    was asked for and an adapter is entitled to rely on that.
+
+    A scenario with no deploy returns an empty history rather than an error: no
+    deploy is a real answer, and the whole reason this endpoint exists is to let
+    a consumer tell an incident a deploy caused from one it did not.
+    """
+    metadata = ArgoCdApplicationMetadata(name=application, namespace="argocd")
+
+    if _active_scenario is None or _seeded_at is None:
+        return ArgoCdApplication(
+            metadata=metadata, status=ArgoCdApplicationStatus(history=[])
+        )
+
+    span_minutes = _scenario_span_minutes(_active_scenario)
+    history = [
+        ArgoCdRevisionHistory(
+            id=index,
+            revision=entry.deploy.revision,
+            deployedAt=_bucket_id(_seeded_at, entry.offset_minutes, span_minutes),
+            # A deploy takes a moment; Argo reports when it started as well as
+            # when it landed. The minute before is close enough for a fixture,
+            # and keeps the two fields distinguishable.
+            deployStartedAt=_bucket_id(
+                _seeded_at, entry.offset_minutes - 1, span_minutes
+            ),
+            source=ArgoCdSource(
+                repoURL=entry.deploy.repo_url,
+                path=entry.deploy.path,
+                targetRevision=entry.deploy.target_revision,
+            ),
+            initiatedBy=ArgoCdInitiator(username=entry.deploy.initiated_by),
+        )
+        for index, entry in enumerate(SCENARIOS[_active_scenario], start=1)
+        if entry.deploy is not None
+    ]
+
+    return ArgoCdApplication(
+        metadata=metadata, status=ArgoCdApplicationStatus(history=history)
+    )
 
 
 @app.get("/metrics", response_model=list[MetricBucket])
