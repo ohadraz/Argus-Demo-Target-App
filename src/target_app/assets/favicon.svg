@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img"
+     aria-label="Io - a perfume flacon">
+  <!-- The shop's mark. A flacon, because the tab has to say *beauty and
+       fragrance shop* at sixteen pixels and nothing else in this palette says
+       it as fast. The watching eye belongs to Argus, not to Io - it is the
+       thing looking at the shop, and putting it on the shop's own tab gets
+       that backwards. Palette is `io.svg`'s: the teal of her dress, the gold
+       of her diadem, the rose of her lips. -->
+  <rect width="64" height="64" rx="14" fill="#14484c"/>
+
+  <!-- Cap and neck -->
+  <rect x="26" y="11" width="12" height="8" rx="2.5" fill="#e9c46a"/>
+  <rect x="29" y="18" width="6" height="6" fill="#e9c46a" opacity=".85"/>
+
+  <!-- Body: shoulders sloping out of the neck, softly rounded base -->
+  <path d="M25 24 h14 c6 3 9 8 9 15 v8 a7 7 0 0 1 -7 7 H23 a7 7 0 0 1 -7 -7
+           v-8 c0 -7 3 -12 9 -15 Z" fill="#fffaf1"/>
+
+  <!-- What is in it, filled to just under the shoulder -->
+  <path d="M16.4 38 h31.2 v9 a7 7 0 0 1 -7 7 H23.4 a7 7 0 0 1 -7 -7 Z"
+        fill="#d4756c"/>
+
+  <!-- A single highlight down the glass. One stroke, or it turns to noise. -->
+  <path d="M23 32 q-2 5 -2 12" fill="none" stroke="#ffffff" stroke-width="2.4"
+        stroke-linecap="round" opacity=".55"/>
+</svg>

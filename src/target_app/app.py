@@ -1,158 +1,64 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from datetime import datetime
+
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-app = FastAPI()
+from target_app import console
+from target_app.flags import FlagClient, FlagProviderUnavailable
+from target_app.generator import GeneratedMinute, generate
+from target_app.scenarios import (
+    SCENARIOS,
+    TIMESTAMP_FORMAT,
+    Scenario,
+    bucket_id,
+    scenario_span_minutes,
+)
+from target_app.settings import get_unleash_settings
+from target_app.state import ScenarioState
 
-TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# How much history the generated channels serve. Wide enough that a reader
+# looking for the service's calm baseline finds plenty of it either side of an
+# incident, and narrow enough that generating it stays cheap.
+GENERATED_SPAN_MINUTES = 90
+
+flags = FlagClient()
+state = ScenarioState(flags)
 
 
-@dataclass(frozen=True)
-class ScenarioDeploy:
-    """A deployment that happened during a scenario's minute.
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+    """Makes sure the flag this service reads exists, and is unambiguous, before
+    serving.
 
-    Only some scenarios have one - a feature flag flip is not a deploy - and
-    that difference is the point: a consumer reading deploy history must be
-    able to tell an incident a deploy caused from one it did not.
+    Waits for the provider rather than assuming it: compose ordering already
+    holds this container back until the provider is healthy, but a service
+    started by hand has no such promise, and crash-looping against a provider
+    that is thirty seconds from ready helps nobody.
     """
-
-    revision: str
-    repo_url: str
-    path: str
-    target_revision: str = "main"
-    initiated_by: str = "kuki"
+    flags.wait_until_reachable()
+    flags.ensure_only_one_environment()
+    flags.ensure_flag_exists()
+    yield
 
 
-@dataclass(frozen=True)
-class ScenarioMinute:
-    """One minute of a scenario: its log messages and its aggregated metrics.
+app = FastAPI(lifespan=lifespan)
 
-    Logs and metrics are authored together, per minute, so the two endpoints
-    cannot drift apart - `GET /logs` flattens the messages and `GET /metrics`
-    emits one bucket, both anchored to the same seed instant. A minute that
-    also carries a `deploy` shows up in the Argo CD stand-in's revision history
-    at that same minute, for the same reason.
-    """
-
-    offset_minutes: int
-    messages: tuple[str, ...]
-    error_rate: float
-    p50_ms: int
-    p95_ms: int
-    request_volume: int
-    deploy: ScenarioDeploy | None = None
-
-
-# feature-flag-toggle spikes the error rate while latency stays flat;
-# bad-deployment spikes p95 latency while the error rate stays mild. The two
-# failure modes are distinguishable from the metrics alone.
-SCENARIOS: dict[str, tuple[ScenarioMinute, ...]] = {
-    "feature-flag-toggle": (
-        ScenarioMinute(
-            offset_minutes=0,
-            messages=(
-                "INFO target-service: feature flag 'checkout-v2' is off, request succeeded",
-                "INFO target-service: feature flag 'checkout-v2' is off, request succeeded",
-            ),
-            error_rate=0.01,
-            p50_ms=45,
-            p95_ms=210,
-            request_volume=1200,
-        ),
-        ScenarioMinute(
-            offset_minutes=1,
-            messages=(
-                "WARN target-service: feature flag 'checkout-v2' toggled from 'off' to 'on'",
-            ),
-            error_rate=0.03,
-            p50_ms=47,
-            p95_ms=215,
-            request_volume=1180,
-        ),
-        ScenarioMinute(
-            offset_minutes=2,
-            messages=(
-                "ERROR target-service: request failed - feature flag 'checkout-v2' is on, error rate elevated",
-                "ERROR target-service: request failed - feature flag 'checkout-v2' is on, error rate elevated",
-            ),
-            error_rate=0.38,
-            p50_ms=46,
-            p95_ms=220,
-            request_volume=1210,
-        ),
-        ScenarioMinute(
-            offset_minutes=3,
-            messages=(
-                "ERROR target-service: request failed - feature flag 'checkout-v2' is on, error rate at 41% over the last minute",
-            ),
-            error_rate=0.41,
-            p50_ms=48,
-            p95_ms=225,
-            request_volume=1195,
-        ),
-    ),
-    "bad-deployment": (
-        ScenarioMinute(
-            offset_minutes=0,
-            # No mention of the deploy. The Argo CD channel is the only place
-            # it is recorded, so a diagnosis of BAD_DEPLOYMENT can only have
-            # come from there - which is what the e2e case is for.
-            messages=(
-                "INFO target-service: request succeeded",
-                "INFO target-service: request succeeded",
-            ),
-            error_rate=0.01,
-            p50_ms=40,
-            p95_ms=220,
-            request_volume=1150,
-            deploy=ScenarioDeploy(
-                revision="9f4c1e7b2a3d5c8e1f0b6a4d2c9e7b5a3f1d8c6e",
-                repo_url="https://github.com/kuki/k8s-configs",
-                path="apps/target-service/production",
-            ),
-        ),
-        ScenarioMinute(
-            offset_minutes=1,
-            messages=("WARN target-service: p95 latency climbing",),
-            error_rate=0.02,
-            p50_ms=95,
-            p95_ms=900,
-            request_volume=1120,
-        ),
-        ScenarioMinute(
-            offset_minutes=2,
-            messages=("WARN target-service: p95 latency at 1800ms, up from a 220ms baseline",),
-            error_rate=0.04,
-            p50_ms=180,
-            p95_ms=1800,
-            request_volume=1090,
-        ),
-        ScenarioMinute(
-            offset_minutes=3,
-            messages=(
-                "ERROR target-service: request timeout after 5000ms",
-                "ERROR target-service: request timeout after 5000ms",
-            ),
-            error_rate=0.12,
-            p50_ms=320,
-            p95_ms=5000,
-            request_volume=1050,
-        ),
-    ),
-}
-
-# In-memory only: a restart clears these back to None. The scenario content
-# above is code, not state, so it survives restarts unaffected.
-_active_scenario: str | None = None
-# The instant the active scenario was seeded, truncated to the minute. Every
-# log timestamp and metric bucket id is this plus the entry's offset, so a
-# freshly seeded scenario always reads as recent instead of drifting into the
-# past the way baked-in absolute timestamps would.
-_seeded_at: datetime | None = None
+# The shop's own artwork. Served from a directory rather than inlined so the
+# image can be edited as an image, and mounted from a path relative to this
+# module so it resolves the same in the container as in a local checkout.
+app.mount(
+    "/assets",
+    StaticFiles(directory=Path(__file__).parent / "assets"),
+    name="assets",
+)
 
 
 class SeedRequest(BaseModel):
@@ -161,6 +67,26 @@ class SeedRequest(BaseModel):
 
 class ScenarioStatus(BaseModel):
     active_scenario: str | None
+
+
+class ScenarioSummary(BaseModel):
+    id: str
+    title: str
+    description: str
+    is_generated: bool
+
+
+class ScenarioCatalog(BaseModel):
+    scenarios: list[ScenarioSummary]
+    active_scenario: str | None
+    flag: str
+    flag_is_on: bool
+    phase: str
+    # The minute the incident stopped, once it has. A consumer marks it rather
+    # than inferring it: the drop is visible in the numbers, but which minute
+    # *caused* the drop is a fact this service holds and a reader would only be
+    # guessing at.
+    recovered_at: str | None
 
 
 class MetricBucket(BaseModel):
@@ -175,8 +101,7 @@ class MetricBucket(BaseModel):
 # `repoURL`, `deployedAt`, `targetRevision`. They are deliberately camelCase and
 # deliberately not this service's house style: the point of the stand-in is that
 # the adapter reading it is the same code that reads a real Argo CD server,
-# so
-# anything renamed here would be a lie the adapter would have to be written
+# so anything renamed here would be a lie the adapter would have to be written
 # around.
 class ArgoCdSource(BaseModel):
     repoURL: str  # noqa: N815
@@ -211,68 +136,120 @@ class ArgoCdApplication(BaseModel):
     status: ArgoCdApplicationStatus
 
 
-def _scenario_span_minutes(scenario_id: str) -> int:
-    return max(entry.offset_minutes for entry in SCENARIOS[scenario_id])
-
-
-def _bucket_id(seeded_at: datetime, offset_minutes: int, span_minutes: int) -> str:
-    """Format one scenario minute as a bucket id, anchored so the scenario's
-    *last* minute is the seed instant.
-
-    The incident has therefore already happened by the time anything asks
-    about it, which is the only way round it can be: a consumer windowing its
-    retrieval will end that window at "now", because no minute after now
-    exists to be read. Anchoring the scenario's *first* minute at the seed
-    instant would put the rest of the incident in the future, where a correct
-    reader cannot see it.
-
-    The same string prefixes that minute's log lines, so a caller can match a
-    bucket to its entries without re-parsing either.
-    """
-    minute = seeded_at.replace(second=0, microsecond=0) + timedelta(
-        minutes=offset_minutes - span_minutes
-    )
-    return minute.strftime(TIMESTAMP_FORMAT)
-
-
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/", response_class=HTMLResponse)
+def operator_console() -> str:
+    """The operator's view of this service - see `target_app.console`."""
+    return console.PAGE
+
+
+@app.get("/scenario/catalog", response_model=ScenarioCatalog)
+def scenario_catalog() -> ScenarioCatalog:
+    """What can be staged, what is staged, and what the flag actually reads.
+
+    The flag's live state is here rather than left implicit because a scenario
+    left running by an earlier session is otherwise invisible: the in-memory
+    active-scenario record clears on restart while the flag, which lives
+    somewhere else entirely, does not.
+    """
+    return ScenarioCatalog(
+        scenarios=[
+            ScenarioSummary(
+                id=scenario.id,
+                title=scenario.title,
+                description=scenario.description,
+                is_generated=scenario.is_generated,
+            )
+            for scenario in SCENARIOS.values()
+        ],
+        active_scenario=state.active_scenario_id,
+        flag=get_unleash_settings().flag,
+        flag_is_on=_flag_is_on(),
+        phase=state.phase(),
+        recovered_at=_recovered_at(),
+    )
+
+
+def _recovered_at() -> str | None:
+    window = state.generated_window()
+
+    if window is None or window[0].turned_off_at is None:
+        return None
+
+    return window[0].turned_off_at.replace(second=0, microsecond=0).strftime(
+        TIMESTAMP_FORMAT
+    )
+
+
 @app.post("/scenario/seed", response_model=ScenarioStatus)
 def seed_scenario(body: SeedRequest) -> ScenarioStatus:
-    global _active_scenario, _seeded_at
     if body.scenario_id not in SCENARIOS:
         raise HTTPException(status_code=400, detail=f"unknown scenario id: {body.scenario_id}")
-    _active_scenario = body.scenario_id
-    _seeded_at = datetime.now(UTC).replace(second=0, microsecond=0)
-    return ScenarioStatus(active_scenario=_active_scenario)
+
+    try:
+        state.seed(SCENARIOS[body.scenario_id])
+    except FlagProviderUnavailable as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+    return ScenarioStatus(active_scenario=state.active_scenario_id)
 
 
 @app.post("/scenario/reset", response_model=ScenarioStatus)
 def reset_scenario() -> ScenarioStatus:
-    global _active_scenario, _seeded_at
-    _active_scenario = None
-    _seeded_at = None
-    return ScenarioStatus(active_scenario=_active_scenario)
+    try:
+        state.reset()
+    except FlagProviderUnavailable as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+    return ScenarioStatus(active_scenario=state.active_scenario_id)
 
 
 @app.get("/scenario/status", response_model=ScenarioStatus)
 def scenario_status() -> ScenarioStatus:
-    return ScenarioStatus(active_scenario=_active_scenario)
+    return ScenarioStatus(active_scenario=state.active_scenario_id)
 
 
 @app.get("/logs", response_model=list[str])
 def logs() -> list[str]:
-    if _active_scenario is None or _seeded_at is None:
+    active = state.active
+
+    if active is None:
         return []
-    span_minutes = _scenario_span_minutes(_active_scenario)
-    return [
-        f"{_bucket_id(_seeded_at, entry.offset_minutes, span_minutes)} {message}"
-        for entry in SCENARIOS[_active_scenario]
-        for message in entry.messages
-    ]
+
+    if active.scenario.is_generated:
+        return [
+            line
+            for minute in _generated_minutes()
+            for line in minute.log_lines
+        ]
+
+    return _authored_log_lines(active.scenario, active.seeded_at)
+
+
+@app.get("/metrics", response_model=list[MetricBucket])
+def metrics() -> list[MetricBucket]:
+    active = state.active
+
+    if active is None:
+        return []
+
+    if active.scenario.is_generated:
+        return [
+            MetricBucket(
+                bucket_id=minute.minute_id,
+                error_rate=minute.error_rate,
+                p50_ms=minute.p50_ms,
+                p95_ms=minute.p95_ms,
+                request_volume=minute.request_volume,
+            )
+            for minute in _generated_minutes()
+        ]
+
+    return _authored_metrics(active.scenario, active.seeded_at)
 
 
 @app.get("/argocd/{application}", response_model=ArgoCdApplication)
@@ -286,26 +263,28 @@ def argocd_application(application: str) -> ArgoCdApplication:
 
     A scenario with no deploy returns an empty history rather than an error: no
     deploy is a real answer, and the whole reason this endpoint exists is to let
-    a consumer tell an incident a deploy caused from one it did not.
+    a consumer tell an incident a deploy caused from one it did not. A generated
+    scenario has no deploys at all, and answers the same way.
     """
     metadata = ArgoCdApplicationMetadata(name=application, namespace="argocd")
+    active = state.active
 
-    if _active_scenario is None or _seeded_at is None:
+    if active is None or active.seeded_at is None or active.scenario.is_generated:
         return ArgoCdApplication(
             metadata=metadata, status=ArgoCdApplicationStatus(history=[])
         )
 
-    span_minutes = _scenario_span_minutes(_active_scenario)
+    span_minutes = scenario_span_minutes(active.scenario)
     history = [
         ArgoCdRevisionHistory(
             id=index,
             revision=entry.deploy.revision,
-            deployedAt=_bucket_id(_seeded_at, entry.offset_minutes, span_minutes),
+            deployedAt=bucket_id(active.seeded_at, entry.offset_minutes, span_minutes),
             # A deploy takes a moment; Argo reports when it started as well as
             # when it landed. The minute before is close enough for a fixture,
             # and keeps the two fields distinguishable.
-            deployStartedAt=_bucket_id(
-                _seeded_at, entry.offset_minutes - 1, span_minutes
+            deployStartedAt=bucket_id(
+                active.seeded_at, entry.offset_minutes - 1, span_minutes
             ),
             source=ArgoCdSource(
                 repoURL=entry.deploy.repo_url,
@@ -314,7 +293,7 @@ def argocd_application(application: str) -> ArgoCdApplication:
             ),
             initiatedBy=ArgoCdInitiator(username=entry.deploy.initiated_by),
         )
-        for index, entry in enumerate(SCENARIOS[_active_scenario], start=1)
+        for index, entry in enumerate(active.scenario.minutes, start=1)
         if entry.deploy is not None
     ]
 
@@ -323,18 +302,61 @@ def argocd_application(application: str) -> ArgoCdApplication:
     )
 
 
-@app.get("/metrics", response_model=list[MetricBucket])
-def metrics() -> list[MetricBucket]:
-    if _active_scenario is None or _seeded_at is None:
+def _generated_minutes() -> list[GeneratedMinute]:
+    """The generated window, run up to whatever instant the scenario has
+    reached.
+
+    That instant is `now` while the incident is live and for a settling period
+    after it recovers, and stops moving afterwards - which is how a finished
+    scenario stops without being cleared.
+    """
+    window = state.generated_window()
+
+    if window is None:
         return []
-    span_minutes = _scenario_span_minutes(_active_scenario)
+
+    timeline, up_to = window
+    return generate(timeline, up_to, GENERATED_SPAN_MINUTES)
+
+
+def _authored_log_lines(scenario: Scenario, seeded_at: datetime | None) -> list[str]:
+    if seeded_at is None:
+        return []
+
+    span_minutes = scenario_span_minutes(scenario)
+    return [
+        f"{bucket_id(seeded_at, entry.offset_minutes, span_minutes)} {message}"
+        for entry in scenario.minutes
+        for message in entry.messages
+    ]
+
+
+def _authored_metrics(scenario: Scenario, seeded_at: datetime | None) -> list[MetricBucket]:
+    if seeded_at is None:
+        return []
+
+    span_minutes = scenario_span_minutes(scenario)
     return [
         MetricBucket(
-            bucket_id=_bucket_id(_seeded_at, entry.offset_minutes, span_minutes),
+            bucket_id=bucket_id(seeded_at, entry.offset_minutes, span_minutes),
             error_rate=entry.error_rate,
             p50_ms=entry.p50_ms,
             p95_ms=entry.p95_ms,
             request_volume=entry.request_volume,
         )
-        for entry in SCENARIOS[_active_scenario]
+        for entry in scenario.minutes
     ]
+
+
+def _flag_is_on() -> bool:
+    """Whether the flag reads on, answering `False` if the provider cannot say.
+
+    The only place in this service where an unreachable provider is not an
+    error. This feeds a status line on a page, and a page that fails to render
+    because a checkbox could not be filled in is worse than one that renders
+    with the checkbox clear.
+    """
+    try:
+        return flags.is_enabled()
+    except FlagProviderUnavailable:
+        return False

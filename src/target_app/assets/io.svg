@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 268" role="img"
+     aria-label="Io, a nymph, beneath a scatter of watching eyes">
+  <defs>
+    <linearGradient id="skin" x1="0" y1="0" x2="0.25" y2="1">
+      <stop offset="0%"   stop-color="#fbe7c8"/>
+      <stop offset="55%"  stop-color="#f3d2a7"/>
+      <stop offset="100%" stop-color="#e0b386"/>
+    </linearGradient>
+    <linearGradient id="hair" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"   stop-color="#24706c"/>
+      <stop offset="55%"  stop-color="#14484c"/>
+      <stop offset="100%" stop-color="#0b2f33"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="46%">
+      <stop offset="0%"   stop-color="#2a9d8f" stop-opacity=".2"/>
+      <stop offset="100%" stop-color="#2a9d8f" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="blush" cx="50%" cy="50%">
+      <stop offset="0%"   stop-color="#e08a7d" stop-opacity=".4"/>
+      <stop offset="100%" stop-color="#e08a7d" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- One eye of the hundred. Placed many times and never at an opacity that
+         announces itself: the watcher should be noticed on a second look, not
+         be the first thing the page says. -->
+    <g id="eye">
+      <path d="M-12 0 Q0 -8 12 0 Q0 8 -12 0 Z"
+            fill="none" stroke="#2a9d8f" stroke-width="1.3"/>
+      <circle r="3" fill="#2a9d8f"/>
+    </g>
+  </defs>
+
+  <circle cx="120" cy="128" r="118" fill="url(#glow)"/>
+
+  <g opacity=".18">
+    <use href="#eye" x="24"  y="44"/>
+    <use href="#eye" x="216" y="56"  transform="rotate(8 216 56)"/>
+    <use href="#eye" x="22"  y="182" transform="rotate(-9 22 182)"/>
+    <use href="#eye" x="218" y="172" transform="rotate(6 218 172)"/>
+    <use href="#eye" x="120" y="18"  transform="rotate(-4 120 18)"/>
+    <use href="#eye" x="58"  y="248" transform="rotate(5 58 248)"/>
+    <use href="#eye" x="184" y="250" transform="rotate(-6 184 250)"/>
+  </g>
+
+  <!-- Everything tilts a few degrees. A perfectly upright, perfectly symmetric
+       head reads as a mask; a small tilt is most of what makes a drawn face
+       look gentle rather than stiff. -->
+  <g transform="rotate(-4 120 140)">
+
+    <!-- Hair falling behind, longer than the face, waved at the ends -->
+    <path d="M120 48 c48 0 74 34 74 78 c0 32 -6 56 -14 78
+             c-10 -15 -8 -32 -4 -47 c-8 13 -18 19 -30 21
+             l-26 6 -26 -6 c-12 -2 -22 -8 -30 -21
+             c4 15 6 32 -4 47 c-8 -22 -14 -46 -14 -78 c0 -44 26 -78 74 -78 Z"
+          fill="url(#hair)"/>
+
+    <!-- Neck: short, and mostly hidden by the jaw. A long neck is the single
+         easiest way to make a drawn head look wrong. -->
+    <path d="M108 172 h24 v18 c0 8 -12 13 -12 13 s-12 -5 -12 -13 Z"
+          fill="url(#skin)"/>
+    <path d="M108 178 q12 12 24 0 v7 q-12 10 -24 0 Z" fill="#c99a6d" opacity=".3"/>
+
+    <!-- Shoulders, and the fall of her dress -->
+    <path d="M120 196 c26 4 46 16 54 34 H66 c8 -18 28 -30 54 -34 Z"
+          fill="#1d6f6b" opacity=".92"/>
+
+    <!-- Face: a soft oval, narrow at the chin -->
+    <path d="M120 66 c25 0 41 20 41 49 c0 33 -18 63 -41 63 s-41 -30 -41 -63
+             c0 -29 16 -49 41 -49 Z" fill="url(#skin)"/>
+
+    <ellipse cx="93"  cy="134" rx="12" ry="7" fill="url(#blush)"/>
+    <ellipse cx="147" cy="134" rx="12" ry="7" fill="url(#blush)"/>
+
+    <!-- Hair over the crown, parted, coming low enough that the forehead is a
+         forehead rather than a dome -->
+    <path d="M120 56 c31 0 46 20 47 44 c-5 -9 -12 -15 -21 -18
+             c-9 8 -43 8 -52 0 c-9 3 -16 9 -21 18 c1 -24 16 -44 47 -44 Z"
+          fill="url(#hair)"/>
+    <path d="M79 96 c-6 20 -6 38 0 56 c-8 -8 -12 -20 -12 -34 c0 -10 4 -18 12 -22 Z"
+          fill="url(#hair)"/>
+    <path d="M161 96 c6 20 6 38 0 56 c8 -8 12 -20 12 -34 c0 -10 -4 -18 -12 -22 Z"
+          fill="url(#hair)"/>
+
+    <!-- Brows. Each stops well short of the centre line: they meet only in the
+         drawing that forgot to leave a gap. -->
+    <path d="M87 108 q13 -8 25 -3"  fill="none" stroke="#9a6a3c"
+          stroke-width="2" stroke-linecap="round" opacity=".8"/>
+    <path d="M153 108 q-13 -8 -25 -3" fill="none" stroke="#9a6a3c"
+          stroke-width="2" stroke-linecap="round" opacity=".8"/>
+
+    <!-- Eyes: a full eye's width apart, which is where they sit on a real face.
+         Large almonds, upper lid heavy so the gaze reads soft rather than
+         staring, lashes at the outer corners. -->
+    <g>
+      <path d="M87 122 q13 -12 26 -2 q-13 11 -26 2 Z" fill="#fffaf1"/>
+      <circle cx="100" cy="121" r="5.2" fill="#1d6f6b"/>
+      <circle cx="100" cy="121" r="2.1" fill="#08181a"/>
+      <circle cx="102" cy="119" r="1.4" fill="#ffffff" opacity=".92"/>
+      <path d="M87 122 q13 -12 26 -2" fill="none" stroke="#3b2a1c"
+            stroke-width="2.2" stroke-linecap="round"/>
+      <path d="M87 121 q-4 -2 -8 -5" fill="none" stroke="#3b2a1c"
+            stroke-width="1.6" stroke-linecap="round"/>
+
+      <path d="M127 120 q13 -10 26 2 q-13 10 -26 -2 Z" fill="#fffaf1"/>
+      <circle cx="140" cy="121" r="5.2" fill="#1d6f6b"/>
+      <circle cx="140" cy="121" r="2.1" fill="#08181a"/>
+      <circle cx="142" cy="119" r="1.4" fill="#ffffff" opacity=".92"/>
+      <path d="M127 120 q13 -10 26 2" fill="none" stroke="#3b2a1c"
+            stroke-width="2.2" stroke-linecap="round"/>
+      <path d="M153 122 q4 -2 8 -5" fill="none" stroke="#3b2a1c"
+            stroke-width="1.6" stroke-linecap="round"/>
+    </g>
+
+    <!-- Nose: small, barely stated -->
+    <path d="M119 134 q-5 9 -2 12 q3 2 6 0" fill="none" stroke="#c99a6d"
+          stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- Lips: full, with a defined cupid's bow -->
+    <path d="M109 157 q5 -6 11 -2 q6 -4 11 2 q-6 3 -11 2 q-5 1 -11 -2 Z"
+          fill="#d4756c"/>
+    <path d="M109 157 q11 11 22 0 q-11 6 -22 0 Z" fill="#c25d5a"/>
+    <path d="M109 157 q11 4 22 0" fill="none" stroke="#a94a49"
+          stroke-width="1" stroke-linecap="round"/>
+
+    <!-- The diadem, and the crescent horn set into it -->
+    <path d="M88 92 q32 -17 64 0" fill="none" stroke="#e9c46a"
+          stroke-width="2.8" stroke-linecap="round" opacity=".95"/>
+    <path d="M107 83 a17 17 0 0 1 26 0 a21 21 0 0 0 -26 0 Z" fill="#e9c46a"/>
+    <circle cx="120" cy="90" r="3.2" fill="#e9c46a"/>
+  </g>
+</svg>

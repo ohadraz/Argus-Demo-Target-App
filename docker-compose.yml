@@ -1,0 +1,92 @@
+# The Target Environment, standalone.
+#
+# `docker compose up` here brings up a working target environment on its own:
+# the service, the feature-flag provider it reads its flag from, and that
+# provider's database. Nothing in this file mentions Argus, and nothing in it
+# needs Argus to be running - Argus reaches this environment over HTTP the same
+# way it would reach a real one, and the environment neither knows nor cares.
+services:
+  unleash-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: unleash
+      POSTGRES_PASSWORD: unleash
+      POSTGRES_DB: unleash
+    # Not published to the host: nothing outside this stack reads it, and
+    # Argus's own Postgres already holds 5432.
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U unleash"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  unleash:
+    # Pinned rather than tracking `latest`: the init-token environment
+    # variables below have been renamed across versions, and a wrong one makes
+    # the container refuse to start. The names, the admin paths and the
+    # evaluation response shape were all verified against this exact tag -
+    # re-verify on any bump.
+    image: unleashorg/unleash-server:8.1.0
+    depends_on:
+      unleash-db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgres://unleash:unleash@unleash-db:5432/unleash"
+      DATABASE_SSL: "false"
+      LOG_LEVEL: "warn"
+      # Applied on first startup only - changing these means bringing the
+      # provider's volume down with `-v`.
+      UNLEASH_DEFAULT_ADMIN_USERNAME: "argus"
+      UNLEASH_DEFAULT_ADMIN_PASSWORD: "argus"
+      # Seeded so the stack is usable with nobody logging into the console
+      # first. Insecure by design and safe by scope: reachable only from this
+      # network and a local port, holding nothing but a demo flag.
+      #
+      # The admin token is the write credential - it is what toggles a flag.
+      # The frontend token can only evaluate.
+      INIT_ADMIN_API_TOKENS: "*:*.argus-demo-admin-token"
+      # Scoped to production, the one environment the Target Service keeps -
+      # a token is bound to its environment, so this has to move with
+      # `UNLEASH_ENVIRONMENT` below. These are created on first startup only:
+      # changing one means `docker compose down -v` for the provider's volume.
+      INIT_FRONTEND_API_TOKENS: "default:production.argus-demo-frontend-token"
+    ports:
+      # Published so the flag can be watched, and changed, in Unleash's own
+      # console during a demo.
+      - "4242:4242"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:4242/health || exit 1"]
+      interval: 2s
+      timeout: 10s
+      retries: 30
+      start_period: 5s
+
+  target-service:
+    build:
+      context: .
+    depends_on:
+      # The service evaluates its flag on every read and bootstraps the flag at
+      # startup, so it has nothing to serve until the provider is up. Its
+      # bootstrap retries as well - this only spares it the retries in the
+      # common case.
+      unleash:
+        condition: service_healthy
+    environment:
+      UNLEASH_BASE_URL: "http://unleash:4242"
+      UNLEASH_PROJECT: "default"
+      UNLEASH_ENVIRONMENT: "production"
+      UNLEASH_FLAG: "monthly-spend-feature"
+      # The service holds the admin token because in this fixture it plays the
+      # operator who toggled the flag on - `POST /scenario/seed` is the click
+      # that started the incident.
+      UNLEASH_ADMIN_TOKEN: "*:*.argus-demo-admin-token"
+      UNLEASH_FRONTEND_TOKEN: "default:production.argus-demo-frontend-token"
+    ports:
+      - "8080:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 2s
+      timeout: 2s
+      retries: 15
