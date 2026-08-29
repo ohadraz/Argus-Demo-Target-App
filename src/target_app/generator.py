@@ -4,13 +4,10 @@ import random
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from io_shop.account_page import serve_account_page
+from io_shop.accounts import Account, Purchase
+from io_shop.rollout import CANARY_SHARE
 from target_app.settings import get_unleash_settings
-from target_app.spend_summary import (
-    CANARY_SHARE,
-    Account,
-    Purchase,
-    render_spend_summary,
-)
 
 """Telemetry generated from live flag state, at the moment it is asked for.
 
@@ -131,7 +128,11 @@ class GeneratedMinute:
     log_lines: tuple[str, ...]
 
 
-def generate(timeline: FlagTimeline, now: datetime, span_minutes: int) -> list[GeneratedMinute]:
+def generate(timeline: FlagTimeline,
+             now: datetime,
+             span_minutes: int,
+             flag: str | None = None,
+             breaks_when_flag_is_on: bool = True) -> list[GeneratedMinute]:
     """Every minute from `span_minutes` ago up to and including the one in
     progress.
 
@@ -139,27 +140,48 @@ def generate(timeline: FlagTimeline, now: datetime, span_minutes: int) -> list[G
     the current minute that have actually happened. That is what real monitoring
     reports, and it is what lets a reverted flag show up as recovery within
     seconds instead of at the next minute boundary.
+
+    `timeline` records when the shop was *broken*, not when the flag was on.
+    The two coincide for a flag that breaks things by being switched on, and
+    are opposites for one that breaks things by being switched off - which is
+    what `breaks_when_flag_is_on` is for. It changes nothing about the fault,
+    which is the same fault either way; it decides only what the logs report the
+    flag as reading, and reporting that backwards would put a lie in the one
+    channel a reader has for telling which way the flag moved.
     """
     current_minute = now.replace(second=0, microsecond=0)
     elapsed_in_current = int((now - current_minute).total_seconds())
+    named_flag = flag or get_unleash_settings().flag
 
     minutes = [
         _generate_minute(
             timeline,
             current_minute - timedelta(minutes=offset),
             elapsed_seconds=_SECONDS_PER_MINUTE,
+            flag=named_flag,
+            breaks_when_flag_is_on=breaks_when_flag_is_on,
         )
         for offset in range(span_minutes, 0, -1)
     ]
     minutes.append(
-        _generate_minute(timeline, current_minute, elapsed_seconds=elapsed_in_current)
+        _generate_minute(
+            timeline,
+            current_minute,
+            elapsed_seconds=elapsed_in_current,
+            flag=named_flag,
+            breaks_when_flag_is_on=breaks_when_flag_is_on,
+        )
     )
 
     return minutes
 
 
 def _generate_minute(
-    timeline: FlagTimeline, minute: datetime, elapsed_seconds: int
+    timeline: FlagTimeline,
+    minute: datetime,
+    elapsed_seconds: int,
+    flag: str,
+    breaks_when_flag_is_on: bool,
 ) -> GeneratedMinute:
     minute_id = minute.strftime(TIMESTAMP_FORMAT)
     entropy = random.Random(minute_id)
@@ -174,7 +196,12 @@ def _generate_minute(
         for _ in range(_SAMPLE_SIZE)
     ]
     failures = [served.failure for served in outcomes if served.failure is not None]
-    evaluated_on = sum(1 for served in outcomes if served.flag_is_on)
+    served_the_broken_path = sum(1 for served in outcomes if served.flag_is_on)
+    evaluated_on = (
+        served_the_broken_path
+        if breaks_when_flag_is_on
+        else len(outcomes) - served_the_broken_path
+    )
 
     return GeneratedMinute(
         minute_id=minute_id,
@@ -186,7 +213,7 @@ def _generate_minute(
         p50_ms=_BASELINE_P50_MS + entropy.randint(-_LATENCY_WOBBLE_MS, _LATENCY_WOBBLE_MS),
         p95_ms=_BASELINE_P95_MS + entropy.randint(-_LATENCY_WOBBLE_MS, _LATENCY_WOBBLE_MS),
         request_volume=_REPORTED_VOLUME_PER_MINUTE,
-        log_lines=_log_lines_for(minute_id, failures, len(outcomes), evaluated_on),
+        log_lines=_log_lines_for(minute_id, failures, len(outcomes), evaluated_on, flag),
     )
 
 
@@ -207,23 +234,29 @@ class _ServedPage:
 def _serve_one_account_page(
     entropy: random.Random, share_of_minute_flagged: float
 ) -> _ServedPage:
-    """Serves one account page for real, returning how it went.
+    """Puts one request through the shop and records how it went.
 
-    The flag is not consulted per request here - `share_of_minute_flagged`
-    already carries how much of this minute it was on for, so a minute the flag
-    was on for half of routes half as much traffic to the canary as one it was
-    on throughout. That is the whole mechanism by which a mid-minute revert
-    shows up as a falling error rate.
+    The two decisions above the call are the ones a real request would arrive
+    with already made - which cohort the flag evaluated to for this shopper, and
+    whether they fall inside the rollout's canary share. The shop itself is
+    handed the answer, exactly as `io_shop.account_page` is handed it in
+    production; nothing about the page's behaviour is simulated here.
+
+    The flag is not consulted per request - `share_of_minute_flagged` already
+    carries how much of this minute it was on for, so a minute the flag was on
+    for half of routes half as much traffic to the canary as one it was on
+    throughout. That is the whole mechanism by which a mid-minute revert shows
+    up as a falling error rate.
     """
     flag_is_on = entropy.random() < share_of_minute_flagged
     use_monthly_summary = flag_is_on and entropy.random() < CANARY_SHARE
 
-    try:
-        render_spend_summary(
-            _an_account(entropy), use_monthly_summary=use_monthly_summary
-        )
-    except Exception as error:  # noqa: BLE001 - the boundary records anything
-        return _ServedPage(flag_is_on, f"{type(error).__name__}: {error}")
+    page = serve_account_page(
+        _an_account(entropy), use_monthly_summary=use_monthly_summary
+    )
+
+    if page.failure is not None:
+        return _ServedPage(flag_is_on, page.failure)
 
     if entropy.random() < _BASELINE_ERROR_RATE + entropy.uniform(
         -_BASELINE_ERROR_RATE_WOBBLE, _BASELINE_ERROR_RATE_WOBBLE
@@ -266,9 +299,9 @@ def _an_account(entropy: random.Random) -> Account:
 
 
 def _log_lines_for(
-    minute_id: str, failures: list[str], sample_size: int, evaluated_on: int
+    minute_id: str, failures: list[str], sample_size: int, evaluated_on: int, flag: str
 ) -> tuple[str, ...]:
-    evaluation = _flag_evaluation_line(minute_id, sample_size, evaluated_on)
+    evaluation = _flag_evaluation_line(minute_id, sample_size, evaluated_on, flag)
 
     if not failures:
         return (
@@ -289,7 +322,9 @@ def _log_lines_for(
     return (evaluation, *quoted, aggregate)
 
 
-def _flag_evaluation_line(minute_id: str, sample_size: int, evaluated_on: int) -> str:
+def _flag_evaluation_line(
+    minute_id: str, sample_size: int, evaluated_on: int, flag: str
+) -> str:
     """What the flag evaluated to over this minute's traffic.
 
     An observation, not a conclusion: it reports the value the routing decision
@@ -302,7 +337,6 @@ def _flag_evaluation_line(minute_id: str, sample_size: int, evaluated_on: int) -
     moved partway through, which is exactly the minute a reader most wants to
     see both halves of.
     """
-    flag = get_unleash_settings().flag
     evaluated_off = sample_size - evaluated_on
 
     if evaluated_on == 0:

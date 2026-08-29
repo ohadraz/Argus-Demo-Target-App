@@ -31,6 +31,13 @@ class UnleashSettings(BaseSettings):
     # toggle and there is no wrong one to revert.
     environment: str = Field(default="production")
     flag: str = Field(default="monthly-spend-feature")
+    # The other direction's flag. This one guards the *safe* path, so the shop
+    # is healthy while it is on and breaks when somebody switches it off - a
+    # kill switch withdrawn, which is as ordinary a cause of an incident as a
+    # new feature switched on. A separate flag rather than the same one read
+    # backwards, because one flag cannot honestly be both a new feature and the
+    # fallback that protects against it.
+    fallback_flag: str = Field(default="legacy-checkout-fallback")
     admin_token: str = Field(default="*:*.argus-demo-admin-token")
     frontend_token: str = Field(default="default:production.argus-demo-frontend-token")
 

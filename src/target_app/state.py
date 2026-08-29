@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 from target_app.flags import FlagClient
 from target_app.generator import FlagTimeline
-from target_app.scenarios import Scenario, utc_now
+from target_app.scenarios import FALLBACK_FLAG, Scenario, utc_now
 from target_app.settings import get_scenario_settings
 
 """What is currently staged, and keeping it honest against the live flag.
@@ -59,9 +59,17 @@ class ScenarioState:
     what stamps it.
     """
 
-    def __init__(self, flags: FlagClient) -> None:
+    def __init__(self, flags: FlagClient, fallback_flags: FlagClient) -> None:
         self._flags = flags
+        self._fallback_flags = fallback_flags
         self._active: ActiveScenario | None = None
+
+    def _flags_for(self, scenario: Scenario) -> FlagClient:
+        return (
+            self._fallback_flags
+            if scenario.flag_role == FALLBACK_FLAG
+            else self._flags
+        )
 
     @property
     def active(self) -> ActiveScenario | None:
@@ -79,7 +87,13 @@ class ScenarioState:
             self._active = ActiveScenario(scenario=scenario, seeded_at=now)
             return
 
-        self._flags.enable()
+        # Put the flag into its healthy state first, then into the breaking
+        # one. The second call is the change that stages the incident, and the
+        # first is what guarantees there *is* a second: a flag already sitting
+        # in the breaking state would otherwise be switched to where it already
+        # was, and an agent looking for what changed would find nothing.
+        self._set_flag_for(scenario, scenario.healthy_flag_state)
+        self._set_flag_for(scenario, not scenario.healthy_flag_state)
         self._active = ActiveScenario(
             scenario=scenario,
             seeded_at=now,
@@ -95,14 +109,40 @@ class ScenarioState:
     def reset(self) -> None:
         """Clears the active scenario and any condition it left running.
 
-        The flag goes off even if no scenario is active, and even if this
-        service does not believe it turned it on. A flag left on by an
-        abandoned run is exactly the state a reset is for, and refusing to
-        clear it because the in-memory record disagrees would leave the next
-        reader looking at an incident nobody started.
+        Both flags are put back to the state in which the shop is well, even if
+        no scenario is active and even if this service does not believe it
+        changed either. A flag left in its breaking state by an abandoned run is
+        exactly what a reset is for, and refusing to clear it because the
+        in-memory record disagrees would leave the next reader looking at an
+        incident nobody started.
+
+        Only the staged scenario's own flag is touched, and only to put it back
+        where that scenario found it. Every flag change is evidence to whoever
+        is investigating - the provider records it, and an agent identifies a
+        culprit by asking what recently changed - so housekeeping on a flag no
+        scenario staged would plant a second suspect beside the real one.
+
+        With nothing staged there is still the feature flag to clear, because
+        that is the state an abandoned run leaves behind. Clearing a flag that
+        is already clear is free: the provider records a toggle only where
+        something actually moved.
         """
+        active = self._active
         self._active = None
-        self._flags.disable()
+
+        if active is None:
+            self._flags.disable()
+            return
+
+        self._set_flag_for(active.scenario, active.scenario.healthy_flag_state)
+
+    def _set_flag_for(self, scenario: Scenario, enabled: bool) -> None:
+        client = self._flags_for(scenario)
+
+        if enabled:
+            client.enable()
+        else:
+            client.disable()
 
     def phase(self) -> str:
         """Where the active scenario has got to.
@@ -172,9 +212,24 @@ class ScenarioState:
         if active.timeline.turned_off_at is not None:
             return active.timeline
 
-        if self._flags.is_enabled():
+        # A scenario whose fault is not the flag's doing never ends, however the
+        # flag moves. Reverting it is then a real action against a real cause
+        # that was not the cause - which an agent should discover from the
+        # metrics rather than be told.
+        if not active.scenario.recovers_when_flag_reverts:
+            return active.timeline
+
+        if self._is_in_the_breaking_state(active.scenario):
             return active.timeline
 
         ended = replace(active.timeline, turned_off_at=utc_now())
         self._active = replace(active, timeline=ended)
         return ended
+
+    def _is_in_the_breaking_state(self, scenario: Scenario) -> bool:
+        """Whether the flag still sits where it broke the shop.
+
+        Asked as "is it still broken" rather than "is it on", because on is the
+        breaking state for one scenario and the healthy state for another.
+        """
+        return self._flags_for(scenario).is_enabled() is not scenario.healthy_flag_state

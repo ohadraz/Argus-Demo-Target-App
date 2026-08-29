@@ -14,7 +14,10 @@ from pydantic import BaseModel
 from target_app import console
 from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.generator import GeneratedMinute, generate
+from target_app.monitoring import AlertNotDelivered, fire_alert
 from target_app.scenarios import (
+    FALLBACK_FLAG,
+    FEATURE_FLAG_TOGGLE,
     SCENARIOS,
     TIMESTAMP_FORMAT,
     Scenario,
@@ -30,7 +33,15 @@ from target_app.state import ScenarioState
 GENERATED_SPAN_MINUTES = 90
 
 flags = FlagClient()
-state = ScenarioState(flags)
+# The second flag guards the safe path, so the shop is well while it is on.
+# Its own client rather than a parameter on the first, because a `FlagClient`
+# is scoped to one flag by design - two flags are two clients.
+fallback_flags = FlagClient(
+    settings=get_unleash_settings().model_copy(
+        update={"flag": get_unleash_settings().fallback_flag}
+    )
+)
+state = ScenarioState(flags, fallback_flags)
 
 
 @asynccontextmanager
@@ -46,6 +57,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     flags.wait_until_reachable()
     flags.ensure_only_one_environment()
     flags.ensure_flag_exists()
+    fallback_flags.ensure_flag_exists()
+    # Created, deliberately not switched on. On is this flag's healthy state,
+    # so turning it on here would look right - and it would be a *flag change*,
+    # recorded in the provider's history a few seconds before the first
+    # incident. An agent that identifies a culprit by asking which flags
+    # recently changed would then find two, refuse to guess between them, and
+    # escalate every incident this service stages. The scenario that uses this
+    # flag switches it on itself, as the first half of switching it off.
     yield
 
 
@@ -69,6 +88,13 @@ class ScenarioStatus(BaseModel):
     active_scenario: str | None
 
 
+class AlertRaised(BaseModel):
+    # Whatever the receiver called the incident this alert opened, if it named
+    # one at all. `None` rather than an error when it did not: the alert was
+    # delivered, and what the other side chose to answer with is its business.
+    incident_id: str | None
+
+
 class ScenarioSummary(BaseModel):
     id: str
     title: str
@@ -82,11 +108,13 @@ class ScenarioCatalog(BaseModel):
     flag: str
     flag_is_on: bool
     phase: str
-    # The minute the incident stopped, once it has. A consumer marks it rather
-    # than inferring it: the drop is visible in the numbers, but which minute
-    # *caused* the drop is a fact this service holds and a reader would only be
-    # guessing at.
-    recovered_at: str | None
+    # The minute somebody put the flag back, once somebody has. Named for the
+    # action rather than for the recovery, because that is what it is: this
+    # service knows exactly when the flag moved, while when the shop *looked*
+    # well again is a judgement about numbers anyone reading them can make for
+    # themselves. The two are a minute apart, and conflating them puts a
+    # recovery mark on a minute that is still half broken.
+    action_at: str | None
 
 
 class MetricBucket(BaseModel):
@@ -170,11 +198,11 @@ def scenario_catalog() -> ScenarioCatalog:
         flag=get_unleash_settings().flag,
         flag_is_on=_flag_is_on(),
         phase=state.phase(),
-        recovered_at=_recovered_at(),
+        action_at=_action_at(),
     )
 
 
-def _recovered_at() -> str | None:
+def _action_at() -> str | None:
     window = state.generated_window()
 
     if window is None or window[0].turned_off_at is None:
@@ -206,6 +234,24 @@ def reset_scenario() -> ScenarioStatus:
         raise HTTPException(status_code=502, detail=str(error)) from error
 
     return ScenarioStatus(active_scenario=state.active_scenario_id)
+
+
+@app.post("/monitoring/alert", response_model=AlertRaised)
+def raise_alert() -> AlertRaised:
+    """Fires the alert the shop's monitoring would fire, at whatever is
+    listening for it (see `target_app.monitoring`).
+
+    Which alert that is comes from the staged scenario rather than from the
+    caller: the rule that trips is a property of what is wrong with the service,
+    and a console that could choose it would be choosing the incident's
+    symptoms.
+    """
+    try:
+        delivered = fire_alert(state.active_scenario_id)
+    except AlertNotDelivered as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+    return AlertRaised(incident_id=delivered.get("incident_id"))
 
 
 @app.get("/scenario/status", response_model=ScenarioStatus)
@@ -316,7 +362,21 @@ def _generated_minutes() -> list[GeneratedMinute]:
         return []
 
     timeline, up_to = window
-    return generate(timeline, up_to, GENERATED_SPAN_MINUTES)
+    active = state.active
+    scenario = active.scenario if active else SCENARIOS[FEATURE_FLAG_TOGGLE]
+    settings = get_unleash_settings()
+
+    return generate(
+        timeline,
+        up_to,
+        GENERATED_SPAN_MINUTES,
+        flag=(
+            settings.fallback_flag
+            if scenario.flag_role == FALLBACK_FLAG
+            else settings.flag
+        ),
+        breaks_when_flag_is_on=scenario.breaks_when_flag_is_on,
+    )
 
 
 def _authored_log_lines(scenario: Scenario, seeded_at: datetime | None) -> list[str]:

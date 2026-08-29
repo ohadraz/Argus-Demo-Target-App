@@ -50,6 +50,13 @@ class ScenarioMinute:
     deploy: ScenarioDeploy | None = None
 
 
+# Which flag stages a generated scenario. `FEATURE` is the new feature that
+# breaks when it is switched on; `FALLBACK` is the safe path that breaks when
+# it is switched off.
+FEATURE_FLAG = "feature"
+FALLBACK_FLAG = "fallback"
+
+
 @dataclass(frozen=True)
 class Scenario:
     """What a scenario is, from the outside.
@@ -57,20 +64,45 @@ class Scenario:
     `minutes` is empty for a generated scenario, and that emptiness is what
     selects the mechanism: there is nothing authored to serve, so the generator
     is asked instead.
+
+    The three fields after it describe a generated scenario's live condition,
+    and exist so that "a flag change caused this" can be staged in either
+    direction and with either outcome:
+
+    - `flag_role` says which flag stages it.
+    - `breaks_when_flag_is_on` says which way that flag has to move to break
+      the shop. False means the incident *starts* when the flag goes off,
+      which is what a withdrawn kill switch looks like.
+    - `recovers_when_flag_reverts` says whether putting the flag back ends the
+      incident. False stages a coincidence: a flag really did change and the
+      logs really do show it, but something else is breaking the shop, so
+      reverting the flag changes nothing. That is the case an agent must be
+      able to be *wrong* about and notice.
     """
 
     id: str
     title: str
     description: str
     minutes: tuple[ScenarioMinute, ...] = ()
+    flag_role: str = FEATURE_FLAG
+    breaks_when_flag_is_on: bool = True
+    recovers_when_flag_reverts: bool = True
 
     @property
     def is_generated(self) -> bool:
         return not self.minutes
 
+    @property
+    def healthy_flag_state(self) -> bool:
+        """The flag state in which the shop is well - the state a scenario is
+        staged *away* from, and the one a reset returns to."""
+        return not self.breaks_when_flag_is_on
+
 
 FEATURE_FLAG_TOGGLE = "feature-flag-toggle"
 BAD_DEPLOYMENT = "bad-deployment"
+FALLBACK_DISABLED = "fallback-disabled"
+FLAG_TOGGLE_RED_HERRING = "flag-toggle-red-herring"
 
 SCENARIOS: dict[str, Scenario] = {
     FEATURE_FLAG_TOGGLE: Scenario(
@@ -87,6 +119,35 @@ SCENARIOS: dict[str, Scenario] = {
             "The error rate settles at roughly a third, while latency stays "
             "flat."
         ),
+    ),
+    FALLBACK_DISABLED: Scenario(
+        id=FALLBACK_DISABLED,
+        title="Fallback flag switched off",
+        description=(
+            "The same monthly-spend bug, guarded the other way round. "
+            "'legacy-checkout-fallback' keeps account pages on the old, safe "
+            "renderer, and it has been on for months - nobody thinks of it as a "
+            "change. Switching it off exposes the monthly-spend path to the "
+            "canary's traffic, and pages start failing for every shopper who "
+            "has bought nothing this month. The incident began when a flag was "
+            "turned *off*, so an agent that can only turn flags off cannot end "
+            "it: the fix is to switch this one back on."
+        ),
+        flag_role=FALLBACK_FLAG,
+        breaks_when_flag_is_on=False,
+    ),
+    FLAG_TOGGLE_RED_HERRING: Scenario(
+        id=FLAG_TOGGLE_RED_HERRING,
+        title="Feature flag toggled on, and innocent",
+        description=(
+            "'monthly-spend-feature' really was switched on, the logs really do "
+            "show it, and it really is not what is breaking the shop - a "
+            "coincidence, which is what most correlated changes in a real "
+            "incident turn out to be. Turning the flag back off changes "
+            "nothing, so a mitigation taken on it is refuted rather than "
+            "confirmed, and the flag has to be put back where it was found."
+        ),
+        recovers_when_flag_reverts=False,
     ),
     BAD_DEPLOYMENT: Scenario(
         id=BAD_DEPLOYMENT,

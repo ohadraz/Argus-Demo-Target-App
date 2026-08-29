@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import pytest
-from target_app.spend_summary import (
-    Account,
-    Purchase,
+from io_shop.accounts import Account, Purchase
+from io_shop.spend_summary import (
     average_spend_per_item,
     average_spend_per_item_this_month,
     render_spend_summary,

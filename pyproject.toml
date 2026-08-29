@@ -20,7 +20,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/target_app"]
+packages = ["src/io_shop", "src/target_app"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

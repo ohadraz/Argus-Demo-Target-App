@@ -83,15 +83,38 @@ PAGE = """<!doctype html>
 
   /* While a scenario is live the staging controls recede and Apply is barred:
      the audience should be able to see at a glance that something is in
-     progress, and nobody should end it by reaching for the next scenario. */
-  fieldset.busy { opacity: .55; }
-  fieldset.busy legend::after { content: ' - in progress';
-                                color: var(--bad); opacity: .9; }
+     progress, and nobody should end it by reaching for the next scenario.
 
-  /* The minute the flag went off. Everything below this line is the shop
-     recovering. */
+     The controls recede; the legend does not. Dimming the whole fieldset took
+     the badge saying *why* they were unavailable down with them, which is the
+     one part that has to stay legible from across a room. */
+  fieldset.busy > *:not(legend) { opacity: .45; }
+  fieldset.busy legend::after { content: 'in progress'; margin-left: 10px;
+                                padding: 3px 10px; border-radius: 999px;
+                                background: var(--bad); color: #fff;
+                                font-weight: 600; letter-spacing: .12em;
+                                animation: throb 1.6s ease-in-out infinite; }
+  /* Motion, because a still badge on a page that repaints every two seconds
+     reads as part of the furniture. */
+  @keyframes throb { 50% { opacity: .5; } }
+  @media (prefers-reduced-motion: reduce) {
+    fieldset.busy legend::after { animation: none; }
+  }
+
+  /* Two different facts, two different lines.
+
+     The action is the minute the flag went off. It is deliberately not green:
+     that minute is half broken and half fixed - it carries the errors from
+     before the toggle - and a green line above a red number reads as a promise
+     the row underneath it breaks. */
+  tr.acted td { border-top: 2px solid var(--teal); }
+  tr.acted td:first-child::after { content: ' - action taken - flag off';
+                                   color: var(--teal); font-size: 11px; }
+
+  /* Recovery is the first whole minute the shop looked well again, which is
+     the claim green is entitled to make. */
   tr.recovered td { border-top: 2px solid var(--good); }
-  tr.recovered td:first-child::after { content: ' - flag off';
+  tr.recovered td:first-child::after { content: ' - recovered';
                                        color: var(--good); font-size: 11px; }
   .scroll { max-height: 380px; overflow: auto;
             border: 1px solid rgba(128,128,128,.22); border-radius: 10px; }
@@ -142,10 +165,11 @@ PAGE = """<!doctype html>
 
 <script>
 const POLL_MS = 2000;
-// Where the shop's monitoring sends its alerts. Held by the page rather than by
-// the service, so the shop's own code carries no reference to the tool watching
-// it - and posted from the browser for the same reason.
-const ALERT_ENDPOINT = 'http://localhost:8000/webhooks/alerts';
+// Asks the shop's monitoring to fire, which is as far as a page gets to be
+// involved: the webhook itself goes server to server, from the monitoring stack
+// to whatever is watching. A browser posting it would be sending an alert from
+// the one place a real alert never comes from.
+const ALERT_ENDPOINT = '/monitoring/alert';
 // Anything at or above this reads as an incident rather than as the noise a
 // healthy service always makes. Presentation only - nothing decides anything
 // on it.
@@ -157,7 +181,7 @@ const ELEVATED_ERROR_RATE = 0.05;
 const IN_PROGRESS = ['running', 'recovering'];
 
 let chosen = null;
-let recoveredAt = null;
+let actionAt = null;
 
 async function json(url, options) {
   const response = await fetch(url, options);
@@ -172,7 +196,7 @@ function renderCatalog(catalog) {
 
   const phase = catalog.phase;
   const busy = IN_PROGRESS.includes(phase);
-  recoveredAt = catalog.recovered_at;
+  actionAt = catalog.action_at;
 
   document.getElementById('staging').classList.toggle('busy', busy);
   document.getElementById('apply').disabled = busy;
@@ -196,17 +220,34 @@ function renderCatalog(catalog) {
   host.addEventListener('change', event => { chosen = event.target.value; });
 }
 
+// The first whole minute after the action in which the shop looked well again.
+// Read off the numbers rather than asked of the service, because that is what
+// it is - a judgement about what the metrics show, made from the same threshold
+// that colours them. The minute of the action itself is never it: it carries
+// the errors from before the toggle, and is the reason the two marks are
+// separate at all.
+function firstRecoveredMinute(buckets) {
+  if (!actionAt) return null;
+  const found = buckets.find(bucket => bucket.bucket_id > actionAt &&
+                                       bucket.error_rate < ELEVATED_ERROR_RATE);
+  return found ? found.bucket_id : null;
+}
+
 function renderMetrics(buckets) {
   // Every bucket, not a recent slice. The window is what an investigation
   // reads, so it is what an audience should be able to scroll back through -
   // the calm minutes before the incident are half of what makes the incident
   // legible.
+  const recoveredAt = firstRecoveredMinute(buckets);
+
   document.getElementById('metrics').innerHTML = buckets
     .map(bucket => {
       const rate = (100 * bucket.error_rate).toFixed(1) + '%';
       const cell = bucket.error_rate >= ELEVATED_ERROR_RATE
         ? '<td class="bad">' + rate + '</td>' : '<td>' + rate + '</td>';
-      const marker = bucket.bucket_id === recoveredAt ? ' class="recovered"' : '';
+      const marker =
+        bucket.bucket_id === actionAt ? ' class="acted"' :
+        bucket.bucket_id === recoveredAt ? ' class="recovered"' : '';
       return '<tr' + marker + '><td>' + bucket.bucket_id + '</td>' + cell +
              '<td>' + bucket.p50_ms + '</td><td>' + bucket.p95_ms + '</td>' +
              '<td>' + bucket.request_volume + '</td></tr>';
