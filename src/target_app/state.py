@@ -87,6 +87,11 @@ class ScenarioState:
             self._active = ActiveScenario(scenario=scenario, seeded_at=now)
             return
 
+        # The scenario's own flag, created here rather than at startup: a
+        # scenario provisions the condition it stages, and one that is never
+        # staged leaves the provider carrying nothing to explain. Idempotent, so
+        # the ordinary case of a flag already there costs a read.
+        self._flags_for(scenario).ensure_flag_exists()
         # Put the flag into its healthy state first, then into the breaking
         # one. The second call is the change that stages the incident, and the
         # first is what guarantees there *is* a second: a flag already sitting

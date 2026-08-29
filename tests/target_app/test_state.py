@@ -245,6 +245,32 @@ def test_seeding_the_fallback_scenario_switches_its_own_flag_off() -> None:
     flags.enable.assert_not_called()
 
 
+def test_seeding_the_fallback_scenario_creates_the_flag_it_stages() -> None:
+    # The fallback flag is not created at startup, because a provider listing a
+    # flag no staged scenario touches is a question to answer mid-demo. The
+    # scenario that stages it is what brings it into existence.
+    dont_care_flags = a_flag_client_reporting(False)
+    fallback_flags = a_flag_client_reporting(True)
+    state = a_scenario_state(dont_care_flags, fallback_flags)
+
+    state.seed(SCENARIOS[FALLBACK_DISABLED])
+
+    fallback_flags.ensure_flag_exists.assert_called_once()
+    dont_care_flags.ensure_flag_exists.assert_not_called()
+
+
+def test_seeding_an_authored_scenario_creates_no_flag() -> None:
+    # `bad-deployment` stages a deploy. It has no flag to bring into existence,
+    # and creating one would leave the provider holding a flag nothing explains.
+    flags = a_flag_client_reporting(False)
+    fallback_flags = a_flag_client_reporting(True)
+
+    a_scenario_state(flags, fallback_flags).seed(SCENARIOS[BAD_DEPLOYMENT])
+
+    flags.ensure_flag_exists.assert_not_called()
+    fallback_flags.ensure_flag_exists.assert_not_called()
+
+
 def test_the_fallback_incident_ends_when_its_flag_goes_back_on() -> None:
     # Recovery is the flag returning to the state the shop is well in, which
     # for this flag is on. A service that only understood "off means better"

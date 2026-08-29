@@ -57,14 +57,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     flags.wait_until_reachable()
     flags.ensure_only_one_environment()
     flags.ensure_flag_exists()
-    fallback_flags.ensure_flag_exists()
-    # Created, deliberately not switched on. On is this flag's healthy state,
-    # so turning it on here would look right - and it would be a *flag change*,
-    # recorded in the provider's history a few seconds before the first
-    # incident. An agent that identifies a culprit by asking which flags
-    # recently changed would then find two, refuse to guess between them, and
-    # escalate every incident this service stages. The scenario that uses this
-    # flag switches it on itself, as the first half of switching it off.
+    # Only the flag this service itself reads. The fallback flag belongs to one
+    # scenario rather than to the shop, and a provider listing a flag no staged
+    # scenario touches is a question to answer in the middle of a demo. It is
+    # created when that scenario is staged - see `ScenarioState.seed`.
     yield
 
 
