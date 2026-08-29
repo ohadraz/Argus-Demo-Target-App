@@ -73,12 +73,20 @@ PAGE = """<!doctype html>
   .off { color: var(--good); }
   .note { opacity: .6; font-size: 12px; }
 
-  table { border-collapse: collapse; width: 100%;
+  /* Fixed layout, so the columns are placed by the header rather than by the
+     widest cell under them. Auto layout re-measures on every render, and the
+     minute a marker appears in the first cell every number in the table steps
+     sideways - a whole panel moving to report one row's news. Fixed also means
+     a marker longer than its column simply runs past it, changing nothing. */
+  table { border-collapse: collapse; width: 100%; table-layout: fixed;
           font-variant-numeric: tabular-nums; }
   th, td { text-align: right; padding: 4px 10px;
            border-bottom: 1px solid rgba(128,128,128,.13); }
   th { font-weight: 500; opacity: .6; font-size: 12px; }
-  th:first-child, td:first-child { text-align: left; }
+  /* Wide enough for a timestamp and the longer of the two markers beside it;
+     the four numeric columns divide what is left. */
+  th:first-child, td:first-child { text-align: left; width: 38%;
+                                   white-space: nowrap; }
   .bad { color: var(--bad); font-weight: 600; }
 
   /* While a scenario is live the staging controls recede and Apply is barred:
@@ -103,13 +111,18 @@ PAGE = """<!doctype html>
 
   /* Two different facts, two different lines.
 
-     The action is the minute the flag went off. It is deliberately not green:
+     The action is the minute the flag moved. It is deliberately not green:
      that minute is half broken and half fixed - it carries the errors from
      before the toggle - and a green line above a red number reads as a promise
-     the row underneath it breaks. */
+     the row underneath it breaks.
+
+     Its wording says which way the flag went, and the page is told rather than
+     assuming: this shop stages incidents in both directions, and half its
+     scenarios end by switching a flag *on*. Written into the row by the script
+     for that reason, where the recovery marker - one fact, one wording - can
+     stay in the stylesheet. */
   tr.acted td { border-top: 2px solid var(--teal); }
-  tr.acted td:first-child::after { content: ' - action taken - flag off';
-                                   color: var(--teal); font-size: 11px; }
+  tr.acted td:first-child .marker { color: var(--teal); font-size: 11px; }
 
   /* Recovery is the first whole minute the shop looked well again, which is
      the claim green is entitled to make. */
@@ -179,9 +192,14 @@ const ELEVATED_ERROR_RATE = 0.05;
 // staging panel recedes; Reset stays live, because it is the way out of a
 // scenario that nothing else is going to end.
 const IN_PROGRESS = ['running', 'recovering'];
+// The phase in which the window has stopped advancing. Its last bucket is the
+// last one there will ever be, which is what makes it readable as a whole.
+const COMPLETE = 'complete';
 
 let chosen = null;
 let actionAt = null;
+let actionEnabled = null;
+let windowIsFrozen = false;
 
 async function json(url, options) {
   const response = await fetch(url, options);
@@ -191,18 +209,22 @@ async function json(url, options) {
 
 function renderCatalog(catalog) {
   const flag = document.getElementById('flag');
-  flag.textContent = catalog.flag + (catalog.flag_is_on ? ' is ON' : ' is off');
+  setTextIfChanged(flag, catalog.flag + (catalog.flag_is_on ? ' is on' : ' is off'));
   flag.className = 'pill ' + (catalog.flag_is_on ? 'on' : 'off');
 
   const phase = catalog.phase;
   const busy = IN_PROGRESS.includes(phase);
   actionAt = catalog.action_at;
+  actionEnabled = catalog.action_enabled;
+  windowIsFrozen = phase === COMPLETE;
 
   document.getElementById('staging').classList.toggle('busy', busy);
   document.getElementById('apply').disabled = busy;
 
-  document.getElementById('active').textContent =
-    catalog.active_scenario ? catalog.active_scenario + ' - ' + phase : 'nothing staged';
+  setTextIfChanged(
+    document.getElementById('active'),
+    catalog.active_scenario ? catalog.active_scenario + ' - ' + phase : 'nothing staged'
+  );
 
   const host = document.getElementById('scenarios');
   if (host.dataset.rendered) return;
@@ -226,11 +248,32 @@ function renderCatalog(catalog) {
 // that colours them. The minute of the action itself is never it: it carries
 // the errors from before the toggle, and is the reason the two marks are
 // separate at all.
+//
+// *Whole* minute is the operative word, and the last bucket is never one while
+// the scenario is live - it covers only the seconds of the current minute that
+// have happened, so seconds after a revert it reads near zero and would claim a
+// recovery the shop has not yet demonstrated.
+//
+// Once the window freezes that objection is gone. The last bucket stops being
+// the minute in progress and becomes the last minute there is: it lies wholly
+// after the revert, and it is sampled at the same fixed number of requests as
+// every row above it. Short in wall-clock time, but not short of evidence - and
+// excluding it would mean a settling period of one minute, which is what the
+// demo runs, never showing the recovery it exists to show. It also lines this
+// mark up with the panel clearing, which waits on the same event.
 function firstRecoveredMinute(buckets) {
   if (!actionAt) return null;
-  const found = buckets.find(bucket => bucket.bucket_id > actionAt &&
-                                       bucket.error_rate < ELEVATED_ERROR_RATE);
+  const completed = windowIsFrozen ? buckets : buckets.slice(0, -1);
+  const found = completed.find(bucket => bucket.bucket_id > actionAt &&
+                                         bucket.error_rate < ELEVATED_ERROR_RATE);
   return found ? found.bucket_id : null;
+}
+
+// What the action did, in the words the row shows. Both directions are real
+// here: the feature flag is put back by switching it off, the withdrawn
+// fallback by switching it back on.
+function actionMarkerText() {
+  return ' - action taken - flag ' + (actionEnabled ? 'on' : 'off');
 }
 
 function renderMetrics(buckets) {
@@ -240,19 +283,36 @@ function renderMetrics(buckets) {
   // legible.
   const recoveredAt = firstRecoveredMinute(buckets);
 
-  document.getElementById('metrics').innerHTML = buckets
+  replaceIfChanged(document.getElementById('metrics'), buckets
     .map(bucket => {
       const rate = (100 * bucket.error_rate).toFixed(1) + '%';
       const cell = bucket.error_rate >= ELEVATED_ERROR_RATE
         ? '<td class="bad">' + rate + '</td>' : '<td>' + rate + '</td>';
+      const acted = bucket.bucket_id === actionAt;
       const marker =
-        bucket.bucket_id === actionAt ? ' class="acted"' :
+        acted ? ' class="acted"' :
         bucket.bucket_id === recoveredAt ? ' class="recovered"' : '';
-      return '<tr' + marker + '><td>' + bucket.bucket_id + '</td>' + cell +
+      const note = acted ? '<span class="marker">' + actionMarkerText() + '</span>' : '';
+      return '<tr' + marker + '><td>' + bucket.bucket_id + note + '</td>' + cell +
              '<td>' + bucket.p50_ms + '</td><td>' + bucket.p95_ms + '</td>' +
              '<td>' + bucket.request_volume + '</td></tr>';
     })
-    .join('');
+    .join(''));
+}
+
+// Writing markup that is already on screen costs a repaint and buys nothing.
+// Everything here is polled every couple of seconds, and most of what comes
+// back is identical - a finished scenario's window never changes again, and a
+// live one changes in its last row - so the page would otherwise flicker
+// steadily while standing still.
+function replaceIfChanged(element, markup) {
+  if (element.innerHTML === markup) return;
+  element.innerHTML = markup;
+}
+
+function setTextIfChanged(element, text) {
+  if (element.textContent === text) return;
+  element.textContent = text;
 }
 
 // How close to the bottom counts as "following the newest minute". Anyone who
@@ -280,8 +340,10 @@ async function refresh() {
                   () => renderMetrics(buckets));
     const lines = await json('/logs');
     keepFollowing(document.getElementById('logs-scroll'), () => {
-      document.getElementById('logs').textContent =
-        lines.join('\\n') || '(nothing staged - press Apply to stage one)';
+      setTextIfChanged(
+        document.getElementById('logs'),
+        lines.join('\\n') || '(nothing staged - press Apply to stage one)'
+      );
     });
   } catch (error) {
     document.getElementById('logs').textContent = 'refresh failed: ' + error.message;

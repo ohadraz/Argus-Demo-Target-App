@@ -115,6 +115,12 @@ class ScenarioCatalog(BaseModel):
     # themselves. The two are a minute apart, and conflating them puts a
     # recovery mark on a minute that is still half broken.
     action_at: str | None
+    # Which way that action moved the flag. It is not always off: this shop
+    # stages incidents in both directions, and the scenario whose fault is a
+    # withdrawn kill switch is ended by switching the flag back *on*. A page
+    # that assumed one direction would describe half its own scenarios
+    # backwards.
+    action_enabled: bool | None
 
 
 class MetricBucket(BaseModel):
@@ -183,6 +189,11 @@ def scenario_catalog() -> ScenarioCatalog:
     left running by an earlier session is otherwise invisible: the in-memory
     active-scenario record clears on restart while the flag, which lives
     somewhere else entirely, does not.
+
+    *Which* flag is a property of the staged scenario, not of the service: two
+    of them stage their incident with the fallback flag rather than the feature
+    flag, and reporting the feature flag regardless would show a reader the
+    state of something no scenario was touching.
     """
     return ScenarioCatalog(
         scenarios=[
@@ -193,13 +204,45 @@ def scenario_catalog() -> ScenarioCatalog:
                 is_generated=scenario.is_generated,
             )
             for scenario in SCENARIOS.values()
+            if scenario.offered_in_console
         ],
         active_scenario=state.active_scenario_id,
-        flag=get_unleash_settings().flag,
+        flag=_the_staged_flag(),
         flag_is_on=_flag_is_on(),
         phase=state.phase(),
         action_at=_action_at(),
+        action_enabled=_action_enabled(),
     )
+
+
+def _the_staged_flag() -> str:
+    """The flag the active scenario stages its incident with.
+
+    Falls back to the feature flag when nothing is staged - it is the shop's
+    ordinary flag, and a console with nothing running has to name something.
+    """
+    settings = get_unleash_settings()
+    active = state.active
+
+    if active is not None and active.scenario.flag_role == FALLBACK_FLAG:
+        return settings.fallback_flag
+
+    return settings.flag
+
+
+def _action_enabled() -> bool | None:
+    """The state the flag was put into by whoever ended the incident.
+
+    Which is the scenario's healthy state, by definition: ending the incident
+    means putting the flag back where the shop is well. For the feature flag
+    that is off, for the withdrawn fallback it is on.
+    """
+    active = state.active
+
+    if active is None or _action_at() is None:
+        return None
+
+    return active.scenario.healthy_flag_state
 
 
 def _action_at() -> str | None:
@@ -409,14 +452,22 @@ def _authored_metrics(scenario: Scenario, seeded_at: datetime | None) -> list[Me
 
 
 def _flag_is_on() -> bool:
-    """Whether the flag reads on, answering `False` if the provider cannot say.
+    """Whether the staged scenario's flag reads on, answering `False` if the
+    provider cannot say.
 
     The only place in this service where an unreachable provider is not an
     error. This feeds a status line on a page, and a page that fails to render
     because a checkbox could not be filled in is worse than one that renders
     with the checkbox clear.
     """
+    active = state.active
+    client = (
+        fallback_flags
+        if active is not None and active.scenario.flag_role == FALLBACK_FLAG
+        else flags
+    )
+
     try:
-        return flags.is_enabled()
+        return client.is_enabled()
     except FlagProviderUnavailable:
         return False

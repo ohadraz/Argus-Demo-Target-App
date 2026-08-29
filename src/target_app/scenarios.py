@@ -78,6 +78,10 @@ class Scenario:
       logs really do show it, but something else is breaking the shop, so
       reverting the flag changes nothing. That is the case an agent must be
       able to be *wrong* about and notice.
+
+    `offered_in_console` is presentation only. A scenario kept for the capability
+    it pins down is not automatically one worth showing an audience; hiding it
+    leaves it seedable by id, which is how the e2e suite stages it.
     """
 
     id: str
@@ -87,6 +91,7 @@ class Scenario:
     flag_role: str = FEATURE_FLAG
     breaks_when_flag_is_on: bool = True
     recovers_when_flag_reverts: bool = True
+    offered_in_console: bool = True
 
     @property
     def is_generated(self) -> bool:
@@ -135,10 +140,11 @@ SCENARIOS: dict[str, Scenario] = {
         ),
         flag_role=FALLBACK_FLAG,
         breaks_when_flag_is_on=False,
+        offered_in_console=False,
     ),
     FLAG_TOGGLE_RED_HERRING: Scenario(
         id=FLAG_TOGGLE_RED_HERRING,
-        title="Feature flag toggled on, and innocent",
+        title="Innocent feature flag toggle",
         description=(
             "'monthly-spend-feature' really was switched on, the logs really do "
             "show it, and it really is not what is breaking the shop - a "
