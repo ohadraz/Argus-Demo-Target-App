@@ -30,6 +30,7 @@ PAGE = """<!doctype html>
     --gold: #e9c46a;
     --bad:  #c0392b;
     --good: #27865a;
+    --amber: #d08214;
     --line: rgba(42,157,143,.28);
   }
   body { font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; margin: 0;
@@ -62,6 +63,13 @@ PAGE = """<!doctype html>
   button:hover { background: var(--teal); color: #fff; }
   button.ghost { border-color: rgba(128,128,128,.5); }
   button.ghost:hover { background: rgba(128,128,128,.18); color: inherit; }
+  /* A disabled button still matches :hover, so without this the one control
+     that is barred lights up solid teal under the pointer - the strongest
+     "press me" the page has - and reads as the only thing worth clicking. The
+     cursor and the dimming say the same thing three ways, because this is the
+     click that would restage an incident somebody is in the middle of. */
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button:disabled:hover { background: transparent; color: inherit; }
 
   input[type=url] { font: inherit; padding: 7px 9px; border-radius: 7px;
                     width: 24em; border: 1px solid rgba(128,128,128,.45);
@@ -69,8 +77,25 @@ PAGE = """<!doctype html>
   .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
   .pill { display: inline-block; padding: 3px 11px; border-radius: 999px;
           font-size: 12px; border: 1px solid currentColor; }
-  .on  { color: var(--bad); }
-  .off { color: var(--good); }
+  /* Red where the flag currently sits in the position that breaks the shop.
+     Not "this flag is on": one of these rests on and one rests off, so
+     red-means-on was an accusation against whichever flag happened to be a
+     feature flag, and drew the fallback in the all-clear colour at the very
+     moment it was breaking the shop.
+
+     One colour, not two. A flag that is breaking nothing gets no colour,
+     because there is nothing to say about it - and green would be an all-clear
+     the page is not entitled to give: a scenario with no flag in it at all
+     would have shown a row of green badges over a shop that is on fire.
+     Whether the *shop* is well is the metrics' answer, and it is right below.
+
+     A decoy is therefore never red, in either position. That is the honest
+     reading and it is the scenario's whole point: a flag really did move, and
+     moving it back changes nothing. */
+  .breaking { color: var(--bad); }
+  .idle { opacity: .55; }
+  /* Nor is anything claimed when the provider could not be read at all. */
+  .unknown { opacity: .55; font-style: italic; }
   .note { opacity: .6; font-size: 12px; }
 
   /* Fixed layout, so the columns are placed by the header rather than by the
@@ -83,8 +108,8 @@ PAGE = """<!doctype html>
   th, td { text-align: right; padding: 4px 10px;
            border-bottom: 1px solid rgba(128,128,128,.13); }
   th { font-weight: 500; opacity: .6; font-size: 12px; }
-  /* Wide enough for a timestamp and the longer of the two markers beside it;
-     the four numeric columns divide what is left. */
+  /* Wide enough for a timestamp and for the markers that sit under it; the
+     four numeric columns divide what is left. */
   th:first-child, td:first-child { text-align: left; width: 38%;
                                    white-space: nowrap; }
   .bad { color: var(--bad); font-weight: 600; }
@@ -93,10 +118,26 @@ PAGE = """<!doctype html>
      the audience should be able to see at a glance that something is in
      progress, and nobody should end it by reaching for the next scenario.
 
-     The controls recede; the legend does not. Dimming the whole fieldset took
-     the badge saying *why* they were unavailable down with them, which is the
-     one part that has to stay legible from across a room. */
-  fieldset.busy > *:not(legend) { opacity: .45; }
+     The *controls* recede - the scenario list and the two buttons, nothing
+     else. Everything beside them in that row is a reading rather than a
+     control: which flags are on, which scenario is running, whether the alert
+     was accepted. Those are the things a watcher is there to read, and they are
+     never more worth reading than while something is in progress. So is the
+     legend, which says why the controls are unavailable.
+
+     Named rather than excluded, because opacity composites: a dimmed row cannot
+     have a child restored to full strength, so the only way to keep a badge
+     legible is to never dim what contains it.
+
+     The buttons are not named here at all - a button dims by being disabled,
+     just above. Reset is not disabled while a scenario runs and must not look
+     as though it were: stopping a run is what it is *for*, and the middle of
+     one is when somebody most needs it. */
+  fieldset.busy #scenarios { opacity: .45; }
+  /* The receding is the announcement; this is the answer to a click on one of
+     the things that receded. Without it a disabled radio still shows a pointer
+     and reads as merely decorative. */
+  fieldset.busy .scenario { cursor: not-allowed; }
   fieldset.busy legend::after { content: 'in progress'; margin-left: 10px;
                                 padding: 3px 10px; border-radius: 999px;
                                 background: var(--bad); color: #fff;
@@ -122,7 +163,15 @@ PAGE = """<!doctype html>
      for that reason, where the recovery marker - one fact, one wording - can
      stay in the stylesheet. */
   tr.acted td { border-top: 2px solid var(--teal); }
-  tr.acted td:first-child .marker { color: var(--teal); font-size: 11px; }
+  /* One line per action, under the minute rather than beside it. A minute in
+     which two flags moved - which is exactly the minute worth reading - ran its
+     markers on into the error rate and covered the number they were about. */
+  td:first-child .marker { display: block; font-size: 11px; }
+  .marker.tried { color: var(--teal); }
+  /* Amber, because putting a flag back is neither the fault nor the fix: it is
+     an attempt withdrawn. Green would claim a recovery and red would blame the
+     agent for the ordinary case of having been wrong once. */
+  .marker.undone { color: var(--amber); }
 
   /* Recovery is the first whole minute the shop looked well again, which is
      the claim green is entitled to make. */
@@ -132,9 +181,14 @@ PAGE = """<!doctype html>
   .scroll { max-height: 380px; overflow: auto;
             border: 1px solid rgba(128,128,128,.22); border-radius: 10px; }
   /* The metrics header stays put while the window is scrolled back through -
-     a column of numbers whose headings have scrolled away is unreadable. */
-  thead th { position: sticky; top: 0; backdrop-filter: blur(6px);
-             background: rgba(127,127,127,.10); }
+     a column of numbers whose headings have scrolled away is unreadable.
+
+     Opaque, and that is the whole requirement: a translucent header let every
+     row scroll through it, and a heading with a timestamp printed across it is
+     less readable than no heading at all. `Canvas` is the page's own background
+     under whichever of light and dark the reader is in, so one declaration
+     covers both - a fixed colour would be a hole in the other theme. */
+  thead th { position: sticky; top: 0; background: Canvas; }
   pre { margin: 0; padding: 11px 13px; font: 12px/1.65 ui-monospace, monospace;
         white-space: pre-wrap; }
 </style>
@@ -159,7 +213,7 @@ PAGE = """<!doctype html>
   <div class="row" style="margin-top:14px">
     <button id="apply">Apply scenario</button>
     <button id="reset" class="ghost">Reset</button>
-    <span id="flag" class="pill">…</span>
+    <span id="flags"></span>
     <span id="active" class="note"></span>
     <span id="fired" class="note"></span>
   </div>
@@ -197,9 +251,11 @@ const IN_PROGRESS = ['running', 'recovering'];
 const COMPLETE = 'complete';
 
 let chosen = null;
-let actionAt = null;
-let actionEnabled = null;
+let actions = [];
 let windowIsFrozen = false;
+// The last catalog polled, kept so a click on a scenario can redraw its badges
+// without waiting for the next one.
+let lastCatalog = null;
 
 async function json(url, options) {
   const response = await fetch(url, options);
@@ -207,15 +263,57 @@ async function json(url, options) {
   return response.json();
 }
 
+// Badges for the flags the *selected* scenario puts in play, and nothing else.
+//
+// Before a selection there is nothing to say, so nothing is shown: the shop has
+// two flags and most scenarios use one, and a badge for a flag that is never
+// going to move invites an audience to watch the wrong thing.
+//
+// The position comes from the shop's live reading and the meaning from the
+// scenario, which is the only way round that works: the same flag is the fault
+// in one scenario and a bystander in the next, so "what does ON mean here" is a
+// question no flag can answer about itself.
+function renderScenarioFlags(catalog) {
+  const selected = document.querySelector('input[name="scenario"]:checked');
+  const scenario = selected
+    ? catalog.scenarios.find(entry => entry.id === selected.value)
+    : null;
+  const position = {};
+  catalog.flags.forEach(flag => { position[flag.name] = flag.is_on; });
+
+  replaceIfChanged(document.getElementById('flags'), !scenario ? '' : scenario.flags
+    .map(flag => flagBadge(flag, position[flag.name]))
+    .join(' '));
+}
+
+// ON and OFF in capitals, because colour no longer carries them. It says
+// whether the shop is broken *by this flag being where it is*, which leaves the
+// position itself with nothing but the word to announce it - and the position
+// is the thing a watcher checks at a glance while an agent is working.
+function flagBadge(flag, isOn) {
+  if (isOn === null || isOn === undefined) {
+    return '<span class="pill unknown" title="the flag provider could not be ' +
+           'read">' + flag.name + ' UNKNOWN</span>';
+  }
+
+  const breaking = flag.breaks_when_on !== null && isOn === flag.breaks_when_on;
+
+  return '<span class="pill ' + (breaking ? 'breaking' : 'idle') + '" title="' +
+         (breaking
+           ? 'the shop is broken while this flag sits here'
+           : flag.breaks_when_on === null
+             ? 'in this scenario no position of this flag breaks the shop'
+             : 'this flag is not where it breaks the shop') +
+         '">' + flag.name + (isOn ? ' ON' : ' OFF') + '</span>';
+}
+
 function renderCatalog(catalog) {
-  const flag = document.getElementById('flag');
-  setTextIfChanged(flag, catalog.flag + (catalog.flag_is_on ? ' is on' : ' is off'));
-  flag.className = 'pill ' + (catalog.flag_is_on ? 'on' : 'off');
+  lastCatalog = catalog;
+  renderScenarioFlags(catalog);
 
   const phase = catalog.phase;
   const busy = IN_PROGRESS.includes(phase);
-  actionAt = catalog.action_at;
-  actionEnabled = catalog.action_enabled;
+  actions = catalog.actions;
   windowIsFrozen = phase === COMPLETE;
 
   document.getElementById('staging').classList.toggle('busy', busy);
@@ -227,19 +325,41 @@ function renderCatalog(catalog) {
   );
 
   const host = document.getElementById('scenarios');
-  if (host.dataset.rendered) return;
-  host.dataset.rendered = '1';
 
-  for (const scenario of catalog.scenarios) {
-    const label = document.createElement('label');
-    label.className = 'scenario';
-    label.innerHTML =
-      '<input type="radio" name="scenario" value="' + scenario.id + '">' +
-      '<strong>' + scenario.title + '</strong>' +
-      '<span class="desc">' + scenario.description + '</span>';
-    host.appendChild(label);
+  if (!host.dataset.rendered) {
+    host.dataset.rendered = '1';
+
+    for (const scenario of catalog.scenarios) {
+      const label = document.createElement('label');
+      label.className = 'scenario';
+      label.innerHTML =
+        '<input type="radio" name="scenario" value="' + scenario.id + '">' +
+        '<strong>' + scenario.title + '</strong>' +
+        '<span class="desc">' + scenario.description + '</span>';
+      host.appendChild(label);
+    }
+    host.addEventListener('change', event => {
+      chosen = event.target.value;
+      showTheSelectedScenariosFlags();
+    });
   }
-  host.addEventListener('change', event => { chosen = event.target.value; });
+
+  // The radios follow Apply rather than sitting live beside it. A control that
+  // answers a click and then changes nothing is worse than one that refuses:
+  // picking a different scenario mid-run looks like it staged something, and
+  // the next thing the watcher reads is telemetry from the scenario they think
+  // they just left. Re-applied on every refresh, not only at render, because
+  // the panel is built once and the phase changes underneath it.
+  for (const radio of host.querySelectorAll('input[name="scenario"]')) {
+    radio.disabled = busy;
+  }
+}
+
+// Selecting a scenario redraws its badges at once rather than at the next poll.
+// Two seconds is short, but it is long enough for a click to feel unanswered,
+// and this is the one control whose whole job is to say what it is about to do.
+function showTheSelectedScenariosFlags() {
+  if (lastCatalog !== null) renderScenarioFlags(lastCatalog);
 }
 
 // The first whole minute after the action in which the shop looked well again.
@@ -261,19 +381,45 @@ function renderCatalog(catalog) {
 // excluding it would mean a settling period of one minute, which is what the
 // demo runs, never showing the recovery it exists to show. It also lines this
 // mark up with the panel clearing, which waits on the same event.
+// Measured from the *last* action, not the first. An agent working an
+// ambiguous incident changes a flag, finds the shop still broken, puts it back
+// and tries another - so a recovery counted from the first move would mark the
+// minutes after a failed attempt as a recovery that had not happened.
 function firstRecoveredMinute(buckets) {
-  if (!actionAt) return null;
+  if (!actions.length) return null;
+  const lastActionAt = actions[actions.length - 1].at;
   const completed = windowIsFrozen ? buckets : buckets.slice(0, -1);
-  const found = completed.find(bucket => bucket.bucket_id > actionAt &&
+  const found = completed.find(bucket => bucket.bucket_id > lastActionAt &&
                                          bucket.error_rate < ELEVATED_ERROR_RATE);
   return found ? found.bucket_id : null;
 }
 
-// What the action did, in the words the row shows. Both directions are real
-// here: the feature flag is put back by switching it off, the withdrawn
-// fallback by switching it back on.
-function actionMarkerText() {
-  return ' - action taken - flag ' + (actionEnabled ? 'on' : 'off');
+// Whether a change puts a flag back rather than tries something with it.
+//
+// Nobody tells this page why a flag moved - the reasoning is Argus's, and this
+// is the shop's screen - but the reason is not needed to tell these two apart.
+// A change that returns a flag to the value it held before this incident's
+// earlier change to the same flag is an undo, and that is readable from the
+// list of changes alone. It is what "it tried that, and it did not help" looks
+// like from outside, and it is the half of the story a single wording hid.
+function isPutBack(action, index) {
+  const earlier = actions.slice(0, index).filter(other => other.flag === action.flag);
+  return earlier.length > 0 && earlier[earlier.length - 1].enabled !== action.enabled;
+}
+
+// What was done in that minute, one line per change. Both directions are real
+// here: a feature flag is put back by switching it off, a withdrawn fallback by
+// switching it back on - and the flag is named, because when two of them moved,
+// "a flag" is the one thing a reader cannot work out.
+function actionMarkers(minute) {
+  return actions
+    .map((action, index) => ({action: action, putBack: isPutBack(action, index)}))
+    .filter(entry => entry.action.at === minute)
+    .map(entry =>
+      '<span class="marker ' + (entry.putBack ? 'undone' : 'tried') + '">' +
+      (entry.putBack ? 'put back' : 'action taken') + ' - ' + entry.action.flag +
+      ' ' + (entry.action.enabled ? 'on' : 'off') + '</span>')
+    .join('');
 }
 
 function renderMetrics(buckets) {
@@ -288,12 +434,11 @@ function renderMetrics(buckets) {
       const rate = (100 * bucket.error_rate).toFixed(1) + '%';
       const cell = bucket.error_rate >= ELEVATED_ERROR_RATE
         ? '<td class="bad">' + rate + '</td>' : '<td>' + rate + '</td>';
-      const acted = bucket.bucket_id === actionAt;
+      const notes = actionMarkers(bucket.bucket_id);
       const marker =
-        acted ? ' class="acted"' :
+        notes ? ' class="acted"' :
         bucket.bucket_id === recoveredAt ? ' class="recovered"' : '';
-      const note = acted ? '<span class="marker">' + actionMarkerText() + '</span>' : '';
-      return '<tr' + marker + '><td>' + bucket.bucket_id + note + '</td>' + cell +
+      return '<tr' + marker + '><td>' + bucket.bucket_id + notes + '</td>' + cell +
              '<td>' + bucket.p50_ms + '</td><td>' + bucket.p95_ms + '</td>' +
              '<td>' + bucket.request_volume + '</td></tr>';
     })

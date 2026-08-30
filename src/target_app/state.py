@@ -3,9 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
-from target_app.flags import FlagClient
+from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.generator import FlagTimeline
-from target_app.scenarios import FALLBACK_FLAG, Scenario, utc_now
+from target_app.scenarios import (
+    FALLBACK_FLAG,
+    FEATURE_FLAG,
+    Scenario,
+    description_for,
+    quiet_state_for,
+    utc_now,
+)
 from target_app.settings import get_scenario_settings
 
 """What is currently staged, and keeping it honest against the live flag.
@@ -29,6 +36,41 @@ def _settled_at(turned_off_at: datetime) -> datetime:
     return turned_off_at + timedelta(minutes=get_scenario_settings().settle_minutes)
 
 
+def _the_decoys_quiet_state(scenario: Scenario) -> bool:
+    """The state the decoy sits in when nothing is going on.
+
+    The same rule every flag follows, applied to the decoy's own role. The
+    decoy is then moved *away* from it, which is what makes it look, to anyone
+    reading what changed, exactly like the change that broke the shop.
+    """
+    return quiet_state_for(scenario.decoy_flag_role)
+
+
+def _set(client: FlagClient, enabled: bool) -> None:
+    if enabled:
+        client.enable()
+    else:
+        client.disable()
+
+
+@dataclass(frozen=True)
+class FlagMoment:
+    """One flag change this service noticed after the scenario was staged.
+
+    Everything a watcher is trying to follow is here: when, which flag, and
+    which way. Staging's own changes are not moments - they are the incident,
+    not an answer to it - so the list holds exactly what somebody *did about*
+    the incident, in the order they did it.
+
+    Noticed rather than reported: nobody tells this service that a flag moved,
+    and the whole point of the demo is that anybody may move one.
+    """
+
+    at: datetime
+    flag: str
+    enabled: bool
+
+
 @dataclass(frozen=True)
 class ActiveScenario:
     """The scenario now running, and whatever that scenario needs to serve.
@@ -42,6 +84,10 @@ class ActiveScenario:
     scenario: Scenario
     seeded_at: datetime | None = None
     timeline: FlagTimeline | None = None
+    # The decoy's own history, for a scenario that stages one. Separate from
+    # `timeline` because the two diverge the moment somebody reverts the decoy:
+    # that revert is real and belongs in the logs, and it ends nothing.
+    decoy_timeline: FlagTimeline | None = None
 
 
 class ScenarioState:
@@ -63,11 +109,29 @@ class ScenarioState:
         self._flags = flags
         self._fallback_flags = fallback_flags
         self._active: ActiveScenario | None = None
+        self._moments: list[FlagMoment] = []
+        self._last_seen: dict[str, bool] = {}
 
     def _flags_for(self, scenario: Scenario) -> FlagClient:
         return (
             self._fallback_flags
             if scenario.flag_role == FALLBACK_FLAG
+            else self._flags
+        )
+
+    def _decoy_flags_for(self, scenario: Scenario) -> FlagClient | None:
+        """The client for the scenario's decoy flag, if it stages one.
+
+        The decoy is always the flag the staged one is not - there are two in
+        this shop, and a decoy that was the same flag would be the change it is
+        supposed to be mistaken for.
+        """
+        if scenario.decoy_flag_role is None:
+            return None
+
+        return (
+            self._fallback_flags
+            if scenario.decoy_flag_role == FALLBACK_FLAG
             else self._flags
         )
 
@@ -80,10 +144,35 @@ class ScenarioState:
         return self._active.scenario.id if self._active else None
 
     def seed(self, scenario: Scenario) -> None:
-        """Stages a scenario, establishing whatever live condition it needs."""
+        """Stages a scenario, establishing whatever live condition it needs.
+
+        Starts by putting the shop back together, so staging always begins from
+        a calm world. Here rather than in the console, because the button is not
+        the only way in - the e2e suite seeds by id straight through the API -
+        and a guard the page performs is a guard every other caller skips.
+
+        The residue this clears is usually not the previous scenario's *staged*
+        flag, which is why it is easy to miss: the ambiguous scenario can finish
+        with its decoy still switched on, having been reverted and put back by
+        an agent that found it innocent. Staging the deployment scenario next
+        touches no flags at all, so nothing would correct it, and the
+        investigation would open on a shop carrying a flag change from an
+        incident that is over.
+
+        Free where there is nothing to clear: the provider records a toggle only
+        where something moved, so a seed onto an already-calm shop adds nothing
+        to the history that the next investigation reads - and it makes the
+        healthy-state-first step below a no-op, leaving the change that stages
+        the incident as the only one recorded.
+        """
+        self._put_the_flags_back_where_they_rest()
+        # After the clearing, not before: it can take a moment for the provider
+        # to agree a flag has moved, and an onset anchored ahead of that would
+        # backdate the incident to before the world it starts from.
         now = utc_now()
 
         if not scenario.is_generated:
+            self._remember_where_the_flags_are_now()
             self._active = ActiveScenario(scenario=scenario, seeded_at=now)
             return
 
@@ -91,7 +180,9 @@ class ScenarioState:
         # scenario provisions the condition it stages, and one that is never
         # staged leaves the provider carrying nothing to explain. Idempotent, so
         # the ordinary case of a flag already there costs a read.
-        self._flags_for(scenario).ensure_flag_exists()
+        self._flags_for(scenario).ensure_flag_exists(
+            description_for(scenario.flag_role)
+        )
         # Put the flag into its healthy state first, then into the breaking
         # one. The second call is the change that stages the incident, and the
         # first is what guarantees there *is* a second: a flag already sitting
@@ -99,17 +190,133 @@ class ScenarioState:
         # was, and an agent looking for what changed would find nothing.
         self._set_flag_for(scenario, scenario.healthy_flag_state)
         self._set_flag_for(scenario, not scenario.healthy_flag_state)
+        # Staged the same way and in the same breath, so the provider records
+        # both changes at the same moment. A decoy that arrived a minute later
+        # would be distinguishable by its timestamp alone, and the incident
+        # would stop being the ambiguous one it is meant to be.
+        self._stage_the_decoy(scenario)
+        # After staging, never before: the changes that stage an incident are
+        # the incident, and recording them as moments would show the audience
+        # the scenario answering itself.
+        self._remember_where_the_flags_are_now()
+        # Backdated so a diagnosable incident exists the instant this returns.
+        # The alternative is an audience watching a flat graph for five minutes
+        # before anything is worth alerting on.
+        onset = now - timedelta(minutes=get_scenario_settings().onset_backdate_minutes)
         self._active = ActiveScenario(
             scenario=scenario,
             seeded_at=now,
-            # Backdated so a diagnosable incident exists the instant this
-            # returns. The alternative is an audience watching a flat graph for
-            # five minutes before anything is worth alerting on.
-            timeline=FlagTimeline(
-                turned_on_at=now
-                - timedelta(minutes=get_scenario_settings().onset_backdate_minutes)
+            timeline=FlagTimeline(turned_on_at=onset),
+            decoy_timeline=(
+                FlagTimeline(turned_on_at=onset)
+                if scenario.decoy_flag_role is not None
+                else None
             ),
         )
+
+    def _stage_the_decoy(self, scenario: Scenario) -> None:
+        """Moves the decoy flag, if the scenario has one, the way its role moves.
+
+        Through the healthy state first, for the same reason the staged flag
+        goes that way round: a flag already sitting where the scenario wants it
+        records no change, and a decoy nothing recorded changing is not a
+        suspect at all.
+        """
+        client = self._decoy_flags_for(scenario)
+
+        if client is None:
+            return
+
+        client.ensure_flag_exists(description_for(scenario.decoy_flag_role))
+        _set(client, _the_decoys_quiet_state(scenario))
+        _set(client, not _the_decoys_quiet_state(scenario))
+
+    def _put_the_flags_back_where_they_rest(self) -> None:
+        """Both flags to their resting positions - the feature off, the fallback
+        on - whatever this service believes it staged.
+
+        Whatever it believes, because the belief is the part that goes missing.
+        A service restarted mid-incident has no record of what it moved, and the
+        flag left the wrong way round is as likely to be the fallback as the
+        feature.
+
+        A flag that cannot be moved is skipped rather than fatal. It may not be
+        there at all: flags live in a provider anyone can reach, and a test
+        suite clearing up between cases archives the ones it did not want -
+        after which the provider refuses to toggle them. A flag that is absent
+        is not a flag left in a breaking state, so there is nothing here to put
+        right, and refusing to stage the next scenario over it would make this
+        tidying step the reason nothing can be staged at all.
+
+        A provider that is genuinely down still stops the caller: staging a
+        scenario moves its own flag straight after this, and that call is not
+        forgiving. What is skipped here is only the housekeeping.
+        """
+        for client, role in (
+            (self._flags, FEATURE_FLAG),
+            (self._fallback_flags, FALLBACK_FLAG),
+        ):
+            try:
+                _set(client, quiet_state_for(role))
+            except FlagProviderUnavailable:
+                continue
+
+    def _remember_where_the_flags_are_now(self) -> None:
+        """Takes the baseline the next look is compared against.
+
+        A flag that cannot be read is left out rather than guessed at: the first
+        successful read then becomes the baseline, and the alternative - assuming
+        a state - would report a change that never happened.
+        """
+        self._moments = []
+        self._last_seen = {}
+
+        for client in (self._flags, self._fallback_flags):
+            try:
+                self._last_seen[client.name] = client.is_enabled()
+            except Exception:
+                continue
+
+    @property
+    def moments(self) -> list[FlagMoment]:
+        """Every flag change noticed since the scenario was staged, in order."""
+        return list(self._moments)
+
+    def observe_the_flags(self) -> list[FlagMoment]:
+        """Reads both flags and records any that have moved since the last look.
+
+        On the read path, like every other reconciliation here, and for the same
+        reason: nobody announces a flag change to this service, so the only
+        moment it can find out is the moment somebody asks it something.
+
+        Both flags every time, not only the staged one. An agent working an
+        ambiguous incident will change a flag that turns out to be innocent and
+        then change it back, and those two moments are the most interesting
+        things on the page - they are the whole of what "it tried something,
+        and it did not help" looks like from outside.
+
+        A provider that cannot be read is not an error here. This feeds a
+        display, and a page that fails to render because a flag could not be
+        polled is worse than one that renders a moment late.
+        """
+        if self._active is None:
+            return []
+
+        for client in (self._flags, self._fallback_flags):
+            try:
+                enabled = client.is_enabled()
+            except Exception:
+                continue
+
+            if self._last_seen.get(client.name) == enabled:
+                continue
+
+            self._last_seen[client.name] = enabled
+            self._moments.append(
+                FlagMoment(at=utc_now(), flag=client.name, enabled=enabled)
+            )
+
+        return self.moments
 
     def reset(self) -> None:
         """Clears the active scenario and any condition it left running.
@@ -127,27 +334,35 @@ class ScenarioState:
         culprit by asking what recently changed - so housekeeping on a flag no
         scenario staged would plant a second suspect beside the real one.
 
-        With nothing staged there is still the feature flag to clear, because
-        that is the state an abandoned run leaves behind. Clearing a flag that
-        is already clear is free: the provider records a toggle only where
-        something actually moved.
+        With nothing staged there is no investigation to plant a suspect in
+        front of, and both flags are put back where they rest - not just the
+        feature flag. An abandoned run is exactly how a flag ends up moved with
+        no scenario to remember it: the service restarts mid-incident, `_active`
+        is gone, and the flag that is left switched the wrong way is as likely
+        to be the fallback as the feature. Clearing only one of them left the
+        shop broken and nothing claiming to be breaking it.
+
+        Clearing a flag that is already clear is free: the provider records a
+        toggle only where something actually moved, so a reset on a quiet shop
+        adds nothing to the history that the next investigation will read.
         """
         active = self._active
         self._active = None
+        self._moments = []
+        self._last_seen = {}
 
         if active is None:
-            self._flags.disable()
+            self._put_the_flags_back_where_they_rest()
             return
 
         self._set_flag_for(active.scenario, active.scenario.healthy_flag_state)
+        decoy = self._decoy_flags_for(active.scenario)
+
+        if decoy is not None:
+            _set(decoy, _the_decoys_quiet_state(active.scenario))
 
     def _set_flag_for(self, scenario: Scenario, enabled: bool) -> None:
-        client = self._flags_for(scenario)
-
-        if enabled:
-            client.enable()
-        else:
-            client.disable()
+        _set(self._flags_for(scenario), enabled)
 
     def phase(self) -> str:
         """Where the active scenario has got to.
@@ -230,6 +445,35 @@ class ScenarioState:
         ended = replace(active.timeline, turned_off_at=utc_now())
         self._active = replace(active, timeline=ended)
         return ended
+
+    def decoy_timeline_now(self) -> FlagTimeline | None:
+        """The decoy flag's history, reconciled against the provider.
+
+        Reconciled on the read path exactly as the staged flag is, and for the
+        opposite reason: nothing about the incident changes when the decoy
+        moves, so nothing else would ever notice that it had. What it changes is
+        the log line, and a fixture whose logs still report a flag as on after
+        an agent switched it off would be lying in the one channel that agent
+        reads to find out what it just did.
+        """
+        active = self._active
+
+        if active is None or active.decoy_timeline is None:
+            return None
+
+        if active.decoy_timeline.turned_off_at is not None:
+            return active.decoy_timeline
+
+        client = self._decoy_flags_for(active.scenario)
+
+        if client is None or client.is_enabled() is not _the_decoys_quiet_state(
+            active.scenario
+        ):
+            return active.decoy_timeline
+
+        reverted = replace(active.decoy_timeline, turned_off_at=utc_now())
+        self._active = replace(active, decoy_timeline=reverted)
+        return reverted
 
     def _is_in_the_breaking_state(self, scenario: Scenario) -> bool:
         """Whether the flag still sits where it broke the shop.

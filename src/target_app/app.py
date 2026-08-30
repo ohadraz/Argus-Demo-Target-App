@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import datetime
-
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -17,11 +16,14 @@ from target_app.generator import GeneratedMinute, generate
 from target_app.monitoring import AlertNotDelivered, fire_alert
 from target_app.scenarios import (
     FALLBACK_FLAG,
+    FEATURE_FLAG,
     FEATURE_FLAG_TOGGLE,
     SCENARIOS,
     TIMESTAMP_FORMAT,
     Scenario,
     bucket_id,
+    description_for,
+    quiet_state_for,
     scenario_span_minutes,
 )
 from target_app.settings import get_unleash_settings
@@ -46,22 +48,55 @@ state = ScenarioState(flags, fallback_flags)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
-    """Makes sure the flag this service reads exists, and is unambiguous, before
-    serving.
+    """Makes sure the shop's flags exist, rest where they belong, and are
+    unambiguous, before serving.
 
     Waits for the provider rather than assuming it: compose ordering already
     holds this container back until the provider is healthy, but a service
     started by hand has no such promise, and crash-looping against a provider
     that is thirty seconds from ready helps nobody.
+
+    Both flags, because the shop has two and the console shows both. Leaving
+    the second to be created by the one scenario that stages it meant a
+    provider that had never heard of it, and a page reporting an absent flag as
+    an off one - the two are indistinguishable through an evaluation endpoint,
+    which lists only what is on.
     """
     flags.wait_until_reachable()
     flags.ensure_only_one_environment()
-    flags.ensure_flag_exists()
-    # Only the flag this service itself reads. The fallback flag belongs to one
-    # scenario rather than to the shop, and a provider listing a flag no staged
-    # scenario touches is a question to answer in the middle of a demo. It is
-    # created when that scenario is staged - see `ScenarioState.seed`.
+
+    for client, role in ((flags, FEATURE_FLAG), (fallback_flags, FALLBACK_FLAG)):
+        _bring_into_being(client, role)
+
     yield
+
+
+def _bring_into_being(client: FlagClient, flag_role: str) -> None:
+    """Creates a flag if it is missing, and only then puts it where it rests.
+
+    Only then, and that is the whole care of it. A new flag is created off,
+    which is where a feature flag rests but the opposite of where a fallback
+    does, so the fallback needs a nudge it cannot be given unconditionally: a
+    service restarting in the middle of a staged incident would otherwise
+    switch the flag back and end the incident it restarted into.
+
+    Creating a flag records `feature-created`, which is not a toggle and is not
+    read as a change by anything watching this provider. The nudge that follows
+    *is* a toggle, and it is the reason the environment seeds this flag's row
+    directly - see the Target Environment's compose file. Where that seeding
+    has run this branch never fires; where it has not, one recorded toggle at
+    startup beats a flag sitting in a state the shop's own story says it has
+    not been in for months.
+    """
+    if client.ensure_flag_exists(description_for(flag_role)):
+        _set_to(client, quiet_state_for(flag_role))
+
+
+def _set_to(client: FlagClient, enabled: bool) -> None:
+    if enabled:
+        client.enable()
+    else:
+        client.disable()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -91,32 +126,83 @@ class AlertRaised(BaseModel):
     incident_id: str | None
 
 
+class ScenarioFlag(BaseModel):
+    """A flag a scenario puts in play, and what its position means there.
+
+    `breaks_when_on` is the position in which this flag breaks the shop, and it
+    is `None` for a flag that breaks it in neither - a decoy, or the flag in the
+    scenario where a real toggle turns out to be a coincidence. That is not a
+    detail: a flag with no breaking position is the whole point of those
+    scenarios, and a page that gave every flag in play a guilty position would
+    be showing an audience an incident with no ambiguity in it.
+
+    Meaning is per scenario rather than per flag, because it is. The same flag
+    is the fault in one scenario and a bystander in the next.
+    """
+
+    name: str
+    breaks_when_on: bool | None
+
+
 class ScenarioSummary(BaseModel):
     id: str
     title: str
     description: str
     is_generated: bool
+    # Only the flags this scenario puts in play. The shop has two, and most
+    # scenarios use one - a badge for a flag the selected scenario never touches
+    # invites a reader to watch something that is not going to move.
+    flags: list[ScenarioFlag]
+
+
+class FlagState(BaseModel):
+    """One of the shop's flags, and what it currently reads.
+
+    `None` when the provider could not be reached. Not `False`: an unreachable
+    provider and a flag that is off are opposite facts, and a page that reports
+    the first as the second draws a flag as sitting somewhere it may not be -
+    which, for the one flag whose off position breaks the shop, is an incident
+    invented out of an outage.
+    """
+
+    name: str
+    is_on: bool | None
+
+
+class ActionMoment(BaseModel):
+    """One flag change somebody made after the incident was staged.
+
+    `at` is when the flag moved, which this service knows exactly - not when
+    the shop *looked* well again, which is a judgement about numbers anyone
+    reading them can make for themselves. The two are a minute apart, and
+    conflating them puts a recovery mark on a minute that is still half broken.
+
+    `enabled` is which way it moved, and it is not always off: this shop stages
+    incidents in both directions, and the one whose fault is a withdrawn kill
+    switch is ended by switching a flag back *on*. A page that assumed one
+    direction would describe half its own scenarios backwards.
+    """
+
+    at: str
+    flag: str
+    enabled: bool
 
 
 class ScenarioCatalog(BaseModel):
     scenarios: list[ScenarioSummary]
     active_scenario: str | None
-    flag: str
-    flag_is_on: bool
+    # Every flag the shop has, not only the staged scenario's own. A scenario
+    # can move two of them - one that matters and one that does not - and a
+    # reader watching a single badge would see half of what an agent is
+    # reacting to, which is the half that makes the incident ambiguous.
+    flags: list[FlagState]
     phase: str
-    # The minute somebody put the flag back, once somebody has. Named for the
-    # action rather than for the recovery, because that is what it is: this
-    # service knows exactly when the flag moved, while when the shop *looked*
-    # well again is a judgement about numbers anyone reading them can make for
-    # themselves. The two are a minute apart, and conflating them puts a
-    # recovery mark on a minute that is still half broken.
-    action_at: str | None
-    # Which way that action moved the flag. It is not always off: this shop
-    # stages incidents in both directions, and the scenario whose fault is a
-    # withdrawn kill switch is ended by switching the flag back *on*. A page
-    # that assumed one direction would describe half its own scenarios
-    # backwards.
-    action_enabled: bool | None
+    # Every action taken since staging, in order. A list rather than one
+    # moment, because being wrong once is the ordinary case: an agent reverts
+    # the flag it suspects, finds the shop still broken, puts it back and tries
+    # another. Those three moments are the story, and showing only the last of
+    # them would show an audience a lucky guess.
+    actions: list[ActionMoment]
 
 
 class MetricBucket(BaseModel):
@@ -198,58 +284,89 @@ def scenario_catalog() -> ScenarioCatalog:
                 title=scenario.title,
                 description=scenario.description,
                 is_generated=scenario.is_generated,
+                flags=_the_flags_in_play_for(scenario),
             )
             for scenario in SCENARIOS.values()
             if scenario.offered_in_console
         ],
         active_scenario=state.active_scenario_id,
-        flag=_the_staged_flag(),
-        flag_is_on=_flag_is_on(),
+        flags=_the_shops_flags(),
         phase=state.phase(),
-        action_at=_action_at(),
-        action_enabled=_action_enabled(),
+        actions=_the_actions_taken(),
     )
 
 
-def _the_staged_flag() -> str:
-    """The flag the active scenario stages its incident with.
+def _the_shops_flags() -> list[FlagState]:
+    """Both of the shop's flags and what each reads, whatever is staged.
 
-    Falls back to the feature flag when nothing is staged - it is the shop's
-    ordinary flag, and a console with nothing running has to name something.
+    Always both, and always in the same order, so a badge does not move about
+    the page as scenarios come and go. An unreachable provider reports `False`
+    rather than failing: this feeds a status line, and a page that will not
+    render because a checkbox could not be filled in is worse than one that
+    renders with the checkbox clear.
     """
-    settings = get_unleash_settings()
-    active = state.active
-
-    if active is not None and active.scenario.flag_role == FALLBACK_FLAG:
-        return settings.fallback_flag
-
-    return settings.flag
+    return [_the_state_of(client) for client in (flags, fallback_flags)]
 
 
-def _action_enabled() -> bool | None:
-    """The state the flag was put into by whoever ended the incident.
+def _the_flags_in_play_for(scenario: Scenario) -> list[ScenarioFlag]:
+    """The flags a scenario moves, and where each one breaks the shop.
 
-    Which is the scenario's healthy state, by definition: ending the incident
-    means putting the flag back where the shop is well. For the feature flag
-    that is off, for the withdrawn fallback it is on.
+    An authored scenario moves none: its telemetry is a fixed list of minutes
+    with no live condition behind it, and offering a flag to watch would be
+    offering a control that does nothing.
+
+    A breaking position is claimed only where reverting the flag really does
+    end the incident. Two scenarios stage a flag that moved and did not matter
+    - a decoy, and a toggle that turns out to be a coincidence - and in both,
+    no position of that flag breaks anything. That is what makes them the cases
+    an agent has to be *wrong* about, and a page that painted every flag in play
+    as guilty would quietly delete the difference.
+
+    Ordered by the shop's own flags rather than by role, so the culprit is not
+    given away by which badge comes first.
     """
-    active = state.active
+    if not scenario.is_generated:
+        return []
 
-    if active is None or _action_at() is None:
-        return None
+    breaking_position = {
+        scenario.flag_role: (
+            scenario.breaks_when_flag_is_on
+            if scenario.recovers_when_flag_reverts
+            else None
+        )
+    }
+    if scenario.decoy_flag_role is not None:
+        breaking_position[scenario.decoy_flag_role] = None
 
-    return active.scenario.healthy_flag_state
+    return [
+        ScenarioFlag(name=name, breaks_when_on=breaking_position[role])
+        for role, name in ((FEATURE_FLAG, flags.name), (FALLBACK_FLAG, fallback_flags.name))
+        if role in breaking_position
+    ]
 
 
-def _action_at() -> str | None:
-    window = state.generated_window()
+def _the_state_of(client: FlagClient) -> FlagState:
+    try:
+        return FlagState(name=client.name, is_on=client.is_enabled())
+    except FlagProviderUnavailable:
+        return FlagState(name=client.name, is_on=None)
 
-    if window is None or window[0].turned_off_at is None:
-        return None
 
-    return window[0].turned_off_at.replace(second=0, microsecond=0).strftime(
-        TIMESTAMP_FORMAT
-    )
+def _the_actions_taken() -> list[ActionMoment]:
+    """Every flag change made since staging, oldest first.
+
+    Read from the provider on the way past, which is the only way this service
+    finds anything out about flags: nobody announces a change to it, and the
+    party making them is usually not this service at all.
+    """
+    return [
+        ActionMoment(
+            at=moment.at.replace(second=0, microsecond=0).strftime(TIMESTAMP_FORMAT),
+            flag=moment.flag,
+            enabled=moment.enabled,
+        )
+        for moment in state.observe_the_flags()
+    ]
 
 
 @app.post("/scenario/seed", response_model=ScenarioStatus)
@@ -415,6 +532,22 @@ def _generated_minutes() -> list[GeneratedMinute]:
             else settings.flag
         ),
         breaks_when_flag_is_on=scenario.breaks_when_flag_is_on,
+        decoy_flag=_the_decoy_flag(scenario),
+        decoy_timeline=state.decoy_timeline_now(),
+    )
+
+
+def _the_decoy_flag(scenario: Scenario) -> str | None:
+    """The name of the second flag this scenario moved, if it moved one."""
+    if scenario.decoy_flag_role is None:
+        return None
+
+    settings = get_unleash_settings()
+
+    return (
+        settings.fallback_flag
+        if scenario.decoy_flag_role == FALLBACK_FLAG
+        else settings.flag
     )
 
 
@@ -447,23 +580,3 @@ def _authored_metrics(scenario: Scenario, seeded_at: datetime | None) -> list[Me
     ]
 
 
-def _flag_is_on() -> bool:
-    """Whether the staged scenario's flag reads on, answering `False` if the
-    provider cannot say.
-
-    The only place in this service where an unreachable provider is not an
-    error. This feeds a status line on a page, and a page that fails to render
-    because a checkbox could not be filled in is worse than one that renders
-    with the checkbox clear.
-    """
-    active = state.active
-    client = (
-        fallback_flags
-        if active is not None and active.scenario.flag_role == FALLBACK_FLAG
-        else flags
-    )
-
-    try:
-        return client.is_enabled()
-    except FlagProviderUnavailable:
-        return False

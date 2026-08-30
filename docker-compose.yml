@@ -70,6 +70,70 @@ services:
       retries: 30
       start_period: 5s
 
+  # Argus writes flags under its own name rather than the shop's. Both are admin
+  # credentials, and this provider records an event's author as the *username on
+  # the token that made it* - so a single shared token makes Argus's own revert
+  # indistinguishable from a human's, and an agent that re-reads what recently
+  # changed finds its own action sitting there as a candidate cause.
+  #
+  # Through psql because the admin API will not create an admin token on this
+  # version: `POST /api/admin/api-tokens` accepts only client, backend and
+  # frontend types. The row is honoured immediately, with no restart.
+  #
+  # The username here is the string Argus filters its own changes by, and Argus
+  # holds that string separately - `UNLEASH_ACTOR` in its own repo. The two are
+  # compared exactly, so they move together or not at all.
+  argus-token-seed:
+    image: postgres:16
+    depends_on:
+      unleash:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: "unleash"
+    command: >
+      psql -h unleash-db -U unleash -d unleash -v ON_ERROR_STOP=1
+      -c "INSERT INTO api_tokens (secret, username, type, token_name)
+           VALUES ('*:*.argus-agent-token', 'Argus', 'admin', 'Argus')
+           ON CONFLICT (secret) DO NOTHING"
+    restart: "no"
+
+  # Seeds the fallback flag already switched on, which is where the shop's story
+  # says it has sat for months.
+  #
+  # Through psql, and that is the point rather than a convenience. This
+  # provider's event log is an audit log: switching a flag on through its API
+  # records `feature-environment-enabled`, and that is precisely the event an
+  # agent reads when it asks what changed recently. A flag that had to be
+  # switched on at startup would therefore arrive carrying a fresh change of its
+  # own, contradicting the one thing every scenario using it asserts - that
+  # nobody has touched it. Writing the row directly records nothing.
+  #
+  # It also makes the incident honest at the other end. This provider does not
+  # record a toggle that changes nothing, so a scenario putting the flag into
+  # its healthy state before breaking it now writes no event at all, and the
+  # only fallback change in the log is the one that staged the incident.
+  #
+  # `production` is the environment the Target Service keeps, and it exists in a
+  # new project by default - so this moves with `UNLEASH_ENVIRONMENT` below.
+  fallback-flag-seed:
+    image: postgres:16
+    depends_on:
+      unleash:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: "unleash"
+    command: >
+      psql -h unleash-db -U unleash -d unleash -v ON_ERROR_STOP=1
+      -c "INSERT INTO features (name, description, type, project)
+           VALUES ('legacy-checkout-fallback',
+                   'Keeps account pages on the old, safe renderer - on for months, and the shop''s fault is exposed when it is withdrawn',
+                   'release', 'default')
+           ON CONFLICT (name) DO NOTHING"
+      -c "INSERT INTO feature_environments (environment, feature_name, enabled)
+           VALUES ('production', 'legacy-checkout-fallback', true)
+           ON CONFLICT (environment, feature_name) DO NOTHING"
+    restart: "no"
+
   target-service:
     build:
       context: .
@@ -80,6 +144,18 @@ services:
       # common case.
       unleash:
         condition: service_healthy
+      # Not because the shop needs Argus's credential - it never uses it - but
+      # because a one-shot that merely exists is a container `docker compose up
+      # --wait` sees exit and calls a failed startup. Declared as a completion
+      # this service waits on, it becomes a step in bringing the environment up
+      # rather than a container that died.
+      argus-token-seed:
+        condition: service_completed_successfully
+      # So the flag is already resting on by the time this service looks. Left
+      # to race, the shop would find it missing and switch it on itself, which
+      # is the recorded toggle the seed exists to avoid.
+      fallback-flag-seed:
+        condition: service_completed_successfully
     environment:
       UNLEASH_BASE_URL: "http://unleash:4242"
       UNLEASH_PROJECT: "default"

@@ -117,6 +117,38 @@ def test_the_minute_in_progress_falls_as_the_seconds_after_a_revert_accumulate()
     assert later[-1].error_rate < just_after[-1].error_rate
 
 
+def test_a_minute_no_seconds_of_which_have_happened_is_not_reported() -> None:
+    # At the instant a minute turns over, nothing in it has been served yet, so
+    # the only honest thing to report about it is nothing. A row for it comes
+    # back at 0.0% and corrects itself on the next read - a calm minute
+    # announced about a shop that is on fire, in the row a watcher is most
+    # likely to be looking at.
+    exactly_on_the_minute = SOME_NOW.replace(second=0, microsecond=0)
+
+    minutes = generate(
+        a_flag_on_since(10, now=exactly_on_the_minute),
+        exactly_on_the_minute,
+        SOME_SPAN_MINUTES,
+    )
+
+    the_minute_before = exactly_on_the_minute - timedelta(minutes=1)
+    assert minutes[-1].minute_id == the_minute_before.strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert minutes[-1].error_rate > CLEARLY_DEGRADED
+
+
+def test_a_minute_one_second_old_already_reports_the_rate_it_will_keep() -> None:
+    # Why one elapsed second is enough to publish and none is not. The sample
+    # is a fixed size and the rate is a share of it, so a barely-started minute
+    # is not a smaller reading of the same minute - it is the same reading.
+    minute_started = SOME_NOW.replace(second=0, microsecond=0)
+    timeline = a_flag_on_since(10, now=minute_started)
+
+    a_second_in = generate(timeline, minute_started + timedelta(seconds=1), SOME_SPAN_MINUTES)
+    half_way = generate(timeline, minute_started + timedelta(seconds=30), SOME_SPAN_MINUTES)
+
+    assert a_second_in[-1] == half_way[-1]
+
+
 def test_a_minute_the_flag_was_on_for_part_of_lands_between_the_two() -> None:
     # The onset minute. Reading it as fully degraded would move the apparent
     # onset a minute early; reading it as calm would move it a minute late.
@@ -199,3 +231,78 @@ def test_the_window_covers_every_minute_asked_for() -> None:
     minutes_asked_for_plus_the_one_in_progress = SOME_SPAN_MINUTES + 1
     assert len(minutes) == minutes_asked_for_plus_the_one_in_progress
     assert len({minute.minute_id for minute in minutes}) == len(minutes)
+
+
+def test_a_scenario_with_a_decoy_reports_both_flags_in_the_same_minute() -> None:
+    # The whole point of a decoy: two flags moved together, and the logs say so
+    # without saying which one matters. A reader that saw only one of them
+    # would have no ambiguity to resolve.
+    some_decoy = "monthly-spend-feature"
+    minutes = generate(
+        a_flag_on_since(10),
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="legacy-checkout-fallback",
+        breaks_when_flag_is_on=False,
+        decoy_flag=some_decoy,
+        decoy_timeline=a_flag_on_since(10),
+    )
+
+    lines = minute_at(5, minutes).log_lines
+
+    assert any("legacy-checkout-fallback=" in line for line in lines)
+    assert any(f"{some_decoy}=" in line for line in lines)
+
+
+def test_a_scenario_with_no_decoy_reports_one_flag() -> None:
+    minutes = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES, flag="a-flag")
+
+    evaluations = [line for line in minute_at(5, minutes).log_lines if "a-flag=" in line]
+
+    assert len(evaluations) == 1
+
+
+def test_a_reverted_decoy_reads_off_from_the_minute_it_was_reverted() -> None:
+    # An agent that switches the decoy off reads the logs afterwards to find
+    # out what it just did. Reporting the flag as still on would be the fixture
+    # contradicting the provider.
+    some_decoy = "monthly-spend-feature"
+    reverted = FlagTimeline(
+        turned_on_at=SOME_NOW - timedelta(minutes=10),
+        turned_off_at=SOME_NOW - timedelta(minutes=3),
+    )
+    minutes = generate(
+        a_flag_on_since(10),
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="legacy-checkout-fallback",
+        breaks_when_flag_is_on=False,
+        decoy_flag=some_decoy,
+        decoy_timeline=reverted,
+    )
+
+    before = [line for line in minute_at(5, minutes).log_lines if some_decoy in line]
+    after = [line for line in minute_at(1, minutes).log_lines if some_decoy in line]
+
+    assert f"{some_decoy}=on" in before[0]
+    assert f"{some_decoy}=off" in after[0]
+
+
+def test_reverting_the_decoy_does_not_end_the_incident() -> None:
+    # The decoy decides nothing. That is what an agent is supposed to discover
+    # from the metrics rather than be told, so the metrics have to stay bad.
+    reverted = FlagTimeline(
+        turned_on_at=SOME_NOW - timedelta(minutes=10),
+        turned_off_at=SOME_NOW - timedelta(minutes=3),
+    )
+    minutes = generate(
+        a_flag_on_since(10),
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="legacy-checkout-fallback",
+        breaks_when_flag_is_on=False,
+        decoy_flag="monthly-spend-feature",
+        decoy_timeline=reverted,
+    )
+
+    assert minute_at(1, minutes).error_rate > CLEARLY_DEGRADED

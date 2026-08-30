@@ -4,10 +4,11 @@ from dataclasses import replace
 from datetime import timedelta
 from unittest.mock import Mock
 
-from target_app.flags import FlagClient
+from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.generator import utc_now
 from target_app.scenarios import (
     BAD_DEPLOYMENT,
+    COMPETING_FLAG_CHANGES,
     FALLBACK_DISABLED,
     FEATURE_FLAG_TOGGLE,
     FLAG_TOGGLE_RED_HERRING,
@@ -47,6 +48,21 @@ def a_scenario_state(flags: Mock, fallback_flags: Mock | None = None) -> Scenari
     return ScenarioState(flags, fallback_flags or a_flag_client_reporting(True))
 
 
+def where_it_was_left(client: Mock) -> bool:
+    """The position the last call put this flag in.
+
+    Asserted on rather than counting calls, because a real provider ignores a
+    toggle that changes nothing and a `Mock` cannot. A count measures how many
+    times this service asked, which is not a fact about the shop; where the flag
+    ended up is.
+    """
+    moves = [call for call in client.method_calls if call[0] in ("enable", "disable")]
+
+    assert moves, "nothing ever moved this flag"
+
+    return moves[-1][0] == "enable"
+
+
 def test_seeding_a_generated_scenario_turns_the_flag_on() -> None:
     flags = a_flag_client_reporting(True)
 
@@ -55,14 +71,32 @@ def test_seeding_a_generated_scenario_turns_the_flag_on() -> None:
     flags.enable.assert_called_once()
 
 
-def test_seeding_an_authored_scenario_leaves_the_flag_alone() -> None:
-    # `bad-deployment` stages a deploy, not a flag. Touching the flag here
-    # would put a second, unrelated incident into the same window.
+def test_seeding_an_authored_scenario_stages_no_flag_incident() -> None:
+    # `bad-deployment` stages a deploy, not a flag. Switching one on here would
+    # put a second, unrelated incident into the same window.
     flags = a_flag_client_reporting(False)
 
     a_scenario_state(flags).seed(SCENARIOS[BAD_DEPLOYMENT])
 
     flags.enable.assert_not_called()
+
+
+def test_seeding_starts_from_a_shop_nobody_has_left_broken() -> None:
+    # The guard against staging one scenario on top of the last one's residue,
+    # and it lives here rather than in the console because the button is not the
+    # only way in.
+    #
+    # The residue is usually not the previous scenario's staged flag, which is
+    # what makes it easy to miss: the ambiguous scenario can finish with its
+    # decoy still switched on, having been reverted and put back by an agent
+    # that found it innocent. The deployment scenario staged next touches no
+    # flags at all, so nothing would correct it, and the investigation would
+    # open on a shop carrying a change from an incident that was already over.
+    left_switched_on_by_an_earlier_run = a_flag_client_reporting(True)
+
+    a_scenario_state(left_switched_on_by_an_earlier_run).seed(SCENARIOS[BAD_DEPLOYMENT])
+
+    assert where_it_was_left(left_switched_on_by_an_earlier_run) is False
 
 
 def test_seeding_backdates_the_onset_so_an_incident_already_exists() -> None:
@@ -152,6 +186,36 @@ def test_resetting_clears_a_flag_left_on_by_someone_else() -> None:
     flags.disable.assert_called_once()
 
 
+def test_resetting_clears_a_fallback_left_off_by_someone_else() -> None:
+    # The other half of an abandoned run, and the half that used to be missed.
+    # A service restarted mid-incident has no memory of what it staged, so the
+    # flag left the wrong way round is as likely to be the fallback as the
+    # feature - and a reset that cleared only one of them left the shop broken
+    # with nothing claiming to be breaking it.
+    fallback_flags = a_flag_client_reporting(False)
+
+    a_scenario_state(a_flag_client_reporting(True), fallback_flags).reset()
+
+    fallback_flags.enable.assert_called_once()
+
+
+def test_staging_survives_a_flag_the_provider_will_not_move() -> None:
+    # The clearing that precedes staging is housekeeping, and housekeeping must
+    # not be the reason nothing can be staged. Flags live in a provider anyone
+    # can reach: a suite tidying up between cases archives the ones it did not
+    # want, and the provider then refuses to toggle them. A flag that is not
+    # there is not a flag left in a breaking state, so there is nothing to put
+    # right - and the scenario being staged has its own flag to move.
+    beyond_reach = a_flag_client_reporting(False)
+    beyond_reach.enable.side_effect = FlagProviderUnavailable("archived")
+    beyond_reach.disable.side_effect = FlagProviderUnavailable("archived")
+    flags = a_flag_client_reporting(False)
+
+    a_scenario_state(flags, beyond_reach).seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
+
+    flags.enable.assert_called_once()
+
+
 def test_a_live_incident_reports_itself_as_running() -> None:
     flags = a_flag_client_reporting(True)
     state = a_scenario_state(flags)
@@ -233,16 +297,16 @@ def test_an_authored_scenario_has_no_timeline_to_reconcile() -> None:
 def test_seeding_the_fallback_scenario_switches_its_own_flag_off() -> None:
     # The other direction: this incident begins when a flag goes off, so
     # staging it means switching one off rather than on - and the feature flag,
-    # which has nothing to do with this scenario, is left alone.
+    # which has nothing to do with this scenario, is left where it rests rather
+    # than dragged into the incident.
     flags = a_flag_client_reporting(False)
     fallback_flags = a_flag_client_reporting(True)
     state = a_scenario_state(flags, fallback_flags)
 
     state.seed(SCENARIOS[FALLBACK_DISABLED])
 
-    fallback_flags.disable.assert_called_once()
-    flags.disable.assert_not_called()
-    flags.enable.assert_not_called()
+    assert where_it_was_left(fallback_flags) is False
+    assert where_it_was_left(flags) is False
 
 
 def test_seeding_the_fallback_scenario_creates_the_flag_it_stages() -> None:
@@ -321,14 +385,18 @@ def test_resetting_puts_the_staged_scenario_s_own_flag_back() -> None:
 
     state.reset()
 
-    assert fallback_flags.enable.call_count == 2  # staging it, then putting it back
+    assert where_it_was_left(fallback_flags) is True
 
 
 def test_resetting_leaves_alone_a_flag_no_scenario_staged() -> None:
     # Every flag change is evidence to whoever investigates the next incident.
-    # Tidying a flag this scenario never touched would plant a second suspect
+    # Moving a flag this scenario never staged would plant a second suspect
     # beside the real one, and an agent that cannot tell which flag an incident
     # is about escalates instead of acting.
+    #
+    # Never moved *away* from where it rests is the claim, not never called:
+    # staging begins by putting both flags back, and asking a flag to go where
+    # it already is changes nothing and is recorded nowhere.
     flags = a_flag_client_reporting(True)
     fallback_flags = a_flag_client_reporting(True)
     state = a_scenario_state(flags, fallback_flags)
@@ -336,5 +404,61 @@ def test_resetting_leaves_alone_a_flag_no_scenario_staged() -> None:
 
     state.reset()
 
-    fallback_flags.enable.assert_not_called()
     fallback_flags.disable.assert_not_called()
+
+
+def test_seeding_a_scenario_with_a_decoy_moves_both_flags() -> None:
+    # Both changes have to reach the provider, because the provider's record of
+    # what changed is the only place an investigator can find two suspects.
+    flags = a_flag_client_reporting(False)
+    fallback_flags = a_flag_client_reporting(True)
+    state = a_scenario_state(flags, fallback_flags)
+
+    state.seed(SCENARIOS[COMPETING_FLAG_CHANGES])
+
+    fallback_flags.disable.assert_called()
+    flags.enable.assert_called()
+
+
+def test_resetting_puts_the_decoy_back_where_it_was_found() -> None:
+    flags = a_flag_client_reporting(True)
+    fallback_flags = a_flag_client_reporting(False)
+    state = a_scenario_state(flags, fallback_flags)
+    state.seed(SCENARIOS[COMPETING_FLAG_CHANGES])
+
+    state.reset()
+
+    assert where_it_was_left(flags) is False
+
+
+def test_a_reverted_decoy_is_stamped_on_the_next_read() -> None:
+    # Nothing tells this service the decoy moved - the same reconciliation the
+    # staged flag gets, for the flag whose movement changes nothing else.
+    flags = a_flag_client_reporting(True)
+    fallback_flags = a_flag_client_reporting(False)
+    state = a_scenario_state(flags, fallback_flags)
+    state.seed(SCENARIOS[COMPETING_FLAG_CHANGES])
+
+    flags.is_enabled.return_value = False
+
+    assert state.decoy_timeline_now().turned_off_at is not None
+
+
+def test_reverting_the_decoy_leaves_the_incident_running() -> None:
+    flags = a_flag_client_reporting(True)
+    fallback_flags = a_flag_client_reporting(False)
+    state = a_scenario_state(flags, fallback_flags)
+    state.seed(SCENARIOS[COMPETING_FLAG_CHANGES])
+
+    flags.is_enabled.return_value = False
+
+    assert state.timeline_now().turned_off_at is None
+    assert state.phase() == RUNNING
+
+
+def test_a_scenario_with_no_decoy_has_no_decoy_timeline() -> None:
+    state = a_scenario_state(a_flag_client_reporting(True))
+
+    state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
+
+    assert state.decoy_timeline_now() is None

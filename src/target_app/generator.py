@@ -132,9 +132,11 @@ def generate(timeline: FlagTimeline,
              now: datetime,
              span_minutes: int,
              flag: str | None = None,
-             breaks_when_flag_is_on: bool = True) -> list[GeneratedMinute]:
+             breaks_when_flag_is_on: bool = True,
+             decoy_flag: str | None = None,
+             decoy_timeline: FlagTimeline | None = None) -> list[GeneratedMinute]:
     """Every minute from `span_minutes` ago up to and including the one in
-    progress.
+    progress, once any of it has happened.
 
     The last entry is partial by construction - it covers only the seconds of
     the current minute that have actually happened. That is what real monitoring
@@ -148,6 +150,13 @@ def generate(timeline: FlagTimeline,
     which is the same fault either way; it decides only what the logs report the
     flag as reading, and reporting that backwards would put a lie in the one
     channel a reader has for telling which way the flag moved.
+
+    `decoy_flag` is a second flag whose value is reported beside the first and
+    which decides nothing. It has its own timeline because it has its own
+    history: it moved when the incident began, and it moves again the moment
+    somebody reverts it - which, being a coincidence rather than a cause,
+    changes no metric at all. A reader that saw the decoy frozen after being
+    reverted would be reading a log that disagrees with the provider.
     """
     current_minute = now.replace(second=0, microsecond=0)
     elapsed_in_current = int((now - current_minute).total_seconds())
@@ -160,18 +169,30 @@ def generate(timeline: FlagTimeline,
             elapsed_seconds=_SECONDS_PER_MINUTE,
             flag=named_flag,
             breaks_when_flag_is_on=breaks_when_flag_is_on,
+            decoy_flag=decoy_flag,
+            decoy_timeline=decoy_timeline,
         )
         for offset in range(span_minutes, 0, -1)
     ]
-    minutes.append(
-        _generate_minute(
-            timeline,
-            current_minute,
-            elapsed_seconds=elapsed_in_current,
-            flag=named_flag,
-            breaks_when_flag_is_on=breaks_when_flag_is_on,
+    # Not while zero whole seconds of it have happened. Nothing has been served
+    # yet, so the share below is 0.0 by its own guard, and the minute would be
+    # reported as calm to a shop that is on fire - a row that appears at 0.0%
+    # and corrects itself on the next poll. One elapsed second is enough: the
+    # sample is a fixed size and the rate is a share of it, so a barely-started
+    # minute reports the same number a whole one does. A zero-second minute is
+    # not a partial reading, it is no reading.
+    if elapsed_in_current > 0:
+        minutes.append(
+            _generate_minute(
+                timeline,
+                current_minute,
+                elapsed_seconds=elapsed_in_current,
+                flag=named_flag,
+                breaks_when_flag_is_on=breaks_when_flag_is_on,
+                decoy_flag=decoy_flag,
+                decoy_timeline=decoy_timeline,
+            )
         )
-    )
 
     return minutes
 
@@ -182,6 +203,8 @@ def _generate_minute(
     elapsed_seconds: int,
     flag: str,
     breaks_when_flag_is_on: bool,
+    decoy_flag: str | None = None,
+    decoy_timeline: FlagTimeline | None = None,
 ) -> GeneratedMinute:
     minute_id = minute.strftime(TIMESTAMP_FORMAT)
     entropy = random.Random(minute_id)
@@ -213,7 +236,43 @@ def _generate_minute(
         p50_ms=_BASELINE_P50_MS + entropy.randint(-_LATENCY_WOBBLE_MS, _LATENCY_WOBBLE_MS),
         p95_ms=_BASELINE_P95_MS + entropy.randint(-_LATENCY_WOBBLE_MS, _LATENCY_WOBBLE_MS),
         request_volume=_REPORTED_VOLUME_PER_MINUTE,
-        log_lines=_log_lines_for(minute_id, failures, len(outcomes), evaluated_on, flag),
+        log_lines=_log_lines_for(
+            minute_id,
+            failures,
+            len(outcomes),
+            evaluated_on,
+            flag,
+            decoy=_decoy_evaluation_line(
+                minute_id, minute, elapsed_seconds, len(outcomes),
+                decoy_flag, decoy_timeline,
+            ),
+        ),
+    )
+
+
+def _decoy_evaluation_line(
+    minute_id: str,
+    minute: datetime,
+    elapsed_seconds: int,
+    sample_size: int,
+    decoy_flag: str | None,
+    decoy_timeline: FlagTimeline | None,
+) -> str | None:
+    """The decoy flag's value over this minute, or `None` when there is no decoy.
+
+    Reported exactly as the staged flag's value is - the same line, from the
+    same kind of measurement - because a reader has no way to tell which of two
+    changes is the cause, and a decoy that announced itself in the logs would
+    be answering the question the incident is asking.
+    """
+    if decoy_flag is None or decoy_timeline is None:
+        return None
+
+    seconds_on = decoy_timeline.seconds_on_within(minute, elapsed_seconds)
+    share_on = seconds_on / elapsed_seconds if elapsed_seconds > 0 else 0.0
+
+    return _flag_evaluation_line(
+        minute_id, sample_size, round(share_on * sample_size), decoy_flag
     )
 
 
@@ -299,13 +358,21 @@ def _an_account(entropy: random.Random) -> Account:
 
 
 def _log_lines_for(
-    minute_id: str, failures: list[str], sample_size: int, evaluated_on: int, flag: str
+    minute_id: str,
+    failures: list[str],
+    sample_size: int,
+    evaluated_on: int,
+    flag: str,
+    decoy: str | None = None,
 ) -> tuple[str, ...]:
-    evaluation = _flag_evaluation_line(minute_id, sample_size, evaluated_on, flag)
+    evaluations = (
+        _flag_evaluation_line(minute_id, sample_size, evaluated_on, flag),
+        *((decoy,) if decoy is not None else ()),
+    )
 
     if not failures:
         return (
-            evaluation,
+            *evaluations,
             f"{minute_id} INFO io-shop: account pages rendered normally",
         )
 
@@ -319,7 +386,7 @@ def _log_lines_for(
         f"over the last minute"
     )
 
-    return (evaluation, *quoted, aggregate)
+    return (*evaluations, *quoted, aggregate)
 
 
 def _flag_evaluation_line(

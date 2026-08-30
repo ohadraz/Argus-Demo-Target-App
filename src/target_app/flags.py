@@ -62,6 +62,16 @@ class FlagClient:
         self._client = client or httpx.Client(timeout=5.0)
         self._evaluation_lag_allowance_seconds = evaluation_lag_allowance_seconds
 
+    @property
+    def name(self) -> str:
+        """Which flag this client speaks for.
+
+        Public because a caller holding two clients has to be able to say which
+        one a change was about - "a flag moved" is not a fact anybody watching
+        an incident can use when two of them are suspects.
+        """
+        return self._settings.flag
+
     def is_enabled(self) -> bool:
         """Whether the flag currently evaluates true, asked at the moment of
         the call.
@@ -148,9 +158,9 @@ class FlagClient:
                 f"/environments/{environment}"
             )
 
-    def ensure_flag_exists(self) -> None:
+    def ensure_flag_exists(self, description: str) -> bool:
         """Creates the flag and its rollout strategy if they are not there
-        already, leaving an existing flag alone.
+        already, leaving an existing flag alone. Answers whether it created it.
 
         Both halves are conditional, and for different reasons. Creating a flag
         that already exists is refused by the provider. Adding a strategy that
@@ -160,18 +170,42 @@ class FlagClient:
         Idempotent by construction rather than by exception handling: a service
         that starts, crashes and starts again should reach the same provider
         state as one that started once.
+
+        The answer matters because some flags do not rest where a new flag
+        starts. A flag this service just brought into being can be moved to
+        where it belongs; one that was already there is somebody else's
+        business, and may be sitting mid-incident.
+
+        The description is the caller's because this shop has two flags with
+        two different stories, and a client scoped to one flag has no way to
+        tell which. Both are read by a human in the provider's own console
+        during a demo, so the wrong one is a wrong answer on screen.
         """
         existing = self._find_flag()
+        created = existing is None
 
         if existing is None:
-            self._post(
+            # An archived flag still owns its name: the provider answers 404 to
+            # a lookup and 409 to the creation that follows, which is how a
+            # service that only knew how to create one ends up unable to start
+            # over a flag that is right there. Archiving is what tidying up
+            # looks like here - a test suite clearing the provider between
+            # cases does exactly this - so it is an ordinary state to meet, and
+            # reviving is the honest answer: the shop's own flags are not
+            # optional, and a revived flag is the same flag.
+            response = self._post_allowing(
                 f"/api/admin/projects/{self._settings.project}/features",
+                allowed_statuses=(httpx.codes.CONFLICT,),
                 json={
                     "name": self._settings.flag,
                     "type": "release",
-                    "description": "Average spend per item this month - the demo's seeded fault",
+                    "description": description,
                 },
             )
+
+            if response.status_code == httpx.codes.CONFLICT:
+                self._post(f"/api/admin/archive/revive/{self._settings.flag}")
+
             existing = self._find_flag()
 
         if not self._has_rollout_strategy(existing):
@@ -185,6 +219,8 @@ class FlagClient:
                     },
                 },
             )
+
+        return created
 
     def wait_until_reachable(self, timeout_seconds: float = 60.0) -> None:
         """Blocks until the provider answers, or gives up and raises.

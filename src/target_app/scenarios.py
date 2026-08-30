@@ -57,6 +57,39 @@ FEATURE_FLAG = "feature"
 FALLBACK_FLAG = "fallback"
 
 
+def quiet_state_for(flag_role: str | None) -> bool:
+    """The state a flag in this role sits in when nothing is going on.
+
+    A feature flag is quiet when it is off; a fallback, which has been on for
+    months and which nobody thinks of as a change, is quiet when it is on. It
+    is a property of the flag's role rather than of any scenario - the shop
+    knows where its own flags rest whether or not anything is staged.
+
+    Quiet is deliberately weaker than well. A flag away from its quiet state is
+    a flag somebody moved, which is a reason to look at it and not a verdict on
+    it: the ambiguous scenario stages two of them at once, exactly one of which
+    is breaking anything. What the shop is entitled to say is which flags have
+    moved; whether that is the fault is the reader's judgement.
+    """
+    return flag_role == FALLBACK_FLAG
+
+
+def description_for(flag_role: str | None) -> str:
+    """What the flag is for, in the words the provider's own console shows.
+
+    Two flags with two stories, and both are read by a human standing in front
+    of Unleash during a demo. Kept here beside the role rather than in the flag
+    client, which is scoped to one flag and has no way to know which it holds.
+    """
+    if flag_role == FALLBACK_FLAG:
+        return (
+            "Keeps account pages on the old, safe renderer - on for months, "
+            "and the shop's fault is exposed when it is withdrawn"
+        )
+
+    return "Average spend per item this month - the demo's seeded fault"
+
+
 @dataclass(frozen=True)
 class Scenario:
     """What a scenario is, from the outside.
@@ -79,6 +112,15 @@ class Scenario:
       reverting the flag changes nothing. That is the case an agent must be
       able to be *wrong* about and notice.
 
+    `decoy_flag_role` names a *second* flag that moves at the same instant and
+    has nothing to do with the fault. It exists so an incident can be genuinely
+    ambiguous rather than merely wrong: with two flags changed in the same
+    minute, both touching the failing page, the evidence supports two
+    explanations and choosing between them is a judgement instead of a lookup.
+    Reverting the decoy changes no telemetry at all, so an agent that tries it
+    learns the ordinary lesson of an incident - that the first correlated change
+    was not the cause - and still has somewhere to go next.
+
     `offered_in_console` is presentation only. A scenario kept for the capability
     it pins down is not automatically one worth showing an audience; hiding it
     leaves it seedable by id, which is how the e2e suite stages it.
@@ -91,6 +133,7 @@ class Scenario:
     flag_role: str = FEATURE_FLAG
     breaks_when_flag_is_on: bool = True
     recovers_when_flag_reverts: bool = True
+    decoy_flag_role: str | None = None
     offered_in_console: bool = True
 
     @property
@@ -108,6 +151,7 @@ FEATURE_FLAG_TOGGLE = "feature-flag-toggle"
 BAD_DEPLOYMENT = "bad-deployment"
 FALLBACK_DISABLED = "fallback-disabled"
 FLAG_TOGGLE_RED_HERRING = "flag-toggle-red-herring"
+COMPETING_FLAG_CHANGES = "competing-flag-changes"
 
 SCENARIOS: dict[str, Scenario] = {
     FEATURE_FLAG_TOGGLE: Scenario(
@@ -154,6 +198,24 @@ SCENARIOS: dict[str, Scenario] = {
             "confirmed, and the flag has to be put back where it was found."
         ),
         recovers_when_flag_reverts=False,
+    ),
+    COMPETING_FLAG_CHANGES: Scenario(
+        id=COMPETING_FLAG_CHANGES,
+        title="Two flags changed at once",
+        description=(
+            "Two flags moved in the same minute, and both touch the account "
+            "page. 'legacy-checkout-fallback' was switched off, exposing the "
+            "monthly-spend path to the canary's traffic - that is what is "
+            "breaking the shop. 'monthly-spend-feature' was switched on in the "
+            "same minute by someone else entirely, and is a coincidence. The "
+            "evidence supports both readings, so the first thing tried may well "
+            "be the wrong one: reverting the feature flag changes nothing and "
+            "has to be undone, and only switching the fallback back on ends the "
+            "incident."
+        ),
+        flag_role=FALLBACK_FLAG,
+        breaks_when_flag_is_on=False,
+        decoy_flag_role=FEATURE_FLAG,
     ),
     BAD_DEPLOYMENT: Scenario(
         id=BAD_DEPLOYMENT,

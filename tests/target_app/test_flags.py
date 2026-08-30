@@ -19,6 +19,8 @@ healthy container.
 
 SOME_FLAG = "monthly-spend-feature"
 SOME_ENVIRONMENT = "production"
+# Shown in the provider's console and nowhere these tests look.
+DONT_CARE_DESCRIPTION = "what this flag is for"
 
 
 def a_settings() -> UnleashSettings:
@@ -110,16 +112,50 @@ def test_bootstrapping_creates_a_missing_flag_and_gives_it_a_strategy() -> None:
     transport.get.side_effect = [httpx.Response(404), a_flag_carrying_strategies(0)]
     transport.post.return_value = httpx.Response(200, json={})
 
-    FlagClient(settings=a_settings(), client=transport).ensure_flag_exists()
+    FlagClient(settings=a_settings(), client=transport).ensure_flag_exists(DONT_CARE_DESCRIPTION)
 
     assert any(path.endswith("/features") for path in posted_paths(transport))
     assert any(path.endswith("/strategies") for path in posted_paths(transport))
 
 
+def test_bootstrapping_revives_a_flag_that_was_archived() -> None:
+    # An archived flag still owns its name: the provider answers 404 to the
+    # lookup and 409 to the creation that follows. A service that only knew how
+    # to create one is then unable to start over a flag that is right there -
+    # and archiving is ordinary here, being what a suite clearing the provider
+    # between cases does.
+    transport = Mock(spec=httpx.Client)
+    transport.get.side_effect = [httpx.Response(404), a_flag_carrying_strategies(1)]
+    transport.post.side_effect = [
+        httpx.Response(409, json={"name": "NameExistsError"}),
+        httpx.Response(200, json={}),
+    ]
+
+    FlagClient(settings=a_settings(), client=transport).ensure_flag_exists(
+        DONT_CARE_DESCRIPTION
+    )
+
+    assert any("/archive/revive/" in path for path in posted_paths(transport))
+
+
+def test_a_flag_the_provider_refuses_to_create_is_not_swallowed() -> None:
+    # Only the name clash is an ordinary state to meet. Every other refusal is
+    # a provider saying something is wrong, and a bootstrap that carried on
+    # would leave the service serving a flag it never established.
+    transport = Mock(spec=httpx.Client)
+    transport.get.return_value = httpx.Response(404)
+    transport.post.return_value = httpx.Response(500, text="upstream boom")
+
+    with pytest.raises(FlagProviderUnavailable):
+        FlagClient(settings=a_settings(), client=transport).ensure_flag_exists(
+            DONT_CARE_DESCRIPTION
+        )
+
+
 def test_bootstrapping_leaves_an_established_flag_alone() -> None:
     transport = a_transport_answering(a_flag_carrying_strategies(1))
 
-    FlagClient(settings=a_settings(), client=transport).ensure_flag_exists()
+    FlagClient(settings=a_settings(), client=transport).ensure_flag_exists(DONT_CARE_DESCRIPTION)
 
     transport.post.assert_not_called()
 
@@ -130,7 +166,7 @@ def test_bootstrapping_twice_does_not_stack_a_second_strategy() -> None:
     # that has restarted twice carrying three identical strategies.
     transport = a_transport_answering(a_flag_carrying_strategies(1))
 
-    FlagClient(settings=a_settings(), client=transport).ensure_flag_exists()
+    FlagClient(settings=a_settings(), client=transport).ensure_flag_exists(DONT_CARE_DESCRIPTION)
 
     assert not any(path.endswith("/strategies") for path in posted_paths(transport))
 
@@ -141,7 +177,7 @@ def test_bootstrapping_repairs_a_flag_that_has_no_strategy() -> None:
     # unrepaired, mitigation would revert a flag that was never really on.
     transport = a_transport_answering(a_flag_carrying_strategies(0))
 
-    FlagClient(settings=a_settings(), client=transport).ensure_flag_exists()
+    FlagClient(settings=a_settings(), client=transport).ensure_flag_exists(DONT_CARE_DESCRIPTION)
 
     assert any(path.endswith("/strategies") for path in posted_paths(transport))
     assert not any(path.endswith("/features") for path in posted_paths(transport))
