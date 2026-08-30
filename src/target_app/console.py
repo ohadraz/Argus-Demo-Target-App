@@ -28,6 +28,11 @@ PAGE = """<!doctype html>
        of its own beside this one, and two consoles in a demo that disagree
        about their ground look like two unrelated tools. */
     color-scheme: dark;
+    /* The page's own ground, written down rather than left to the `Canvas`
+       system colour. `Canvas` reads as transparent wherever a browser has not
+       resolved it against a painted ancestor, and a sticky table heading that
+       is transparent has rows scrolling straight through the words on it. */
+    --ground: #0f0f11;
     --teal: #2a9d8f;
     --deep: #123a3d;
     --gold: #e9c46a;
@@ -37,7 +42,7 @@ PAGE = """<!doctype html>
     --line: rgba(42,157,143,.28);
   }
   body { font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; margin: 0;
-         padding: 0 24px 48px; max-width: 1100px; }
+         padding: 0 24px 48px; max-width: 1100px; background: var(--ground); }
 
   header { display: flex; align-items: center; gap: 22px; padding: 18px 0 22px;
            border-bottom: 1px solid var(--line); margin-bottom: 24px; }
@@ -105,12 +110,22 @@ PAGE = """<!doctype html>
      widest cell under them. Auto layout re-measures on every render, and the
      minute a marker appears in the first cell every number in the table steps
      sideways - a whole panel moving to report one row's news. Fixed also means
-     a marker longer than its column simply runs past it, changing nothing. */
-  table { border-collapse: collapse; width: 100%; table-layout: fixed;
-          font-variant-numeric: tabular-nums; }
+     a marker longer than its column simply runs past it, changing nothing.
+
+     Borders separate rather than collapsed, and that is not cosmetic: with
+     collapsed borders the sticky heading's own background is painted with the
+     table's border layer rather than above the cells, so rows scroll straight
+     through the headings whatever stacking order the heading is given. Zero
+     spacing keeps the collapsed look. */
+  table { border-collapse: separate; border-spacing: 0; width: 100%;
+          table-layout: fixed; font-variant-numeric: tabular-nums; }
   th, td { text-align: right; padding: 4px 10px;
            border-bottom: 1px solid rgba(128,128,128,.13); }
-  th { font-weight: 500; opacity: .6; font-size: 12px; }
+  /* Quieter by colour, never by opacity. `opacity` fades an element together
+     with its background, so a heading dimmed that way is a heading the rows
+     scroll visibly through - which no stacking order can fix, because the
+     heading is genuinely translucent. */
+  th { font-weight: 500; color: rgba(200,205,210,.62); font-size: 12px; }
   /* Wide enough for a timestamp and for the markers that sit under it; the
      four numeric columns divide what is left. */
   th:first-child, td:first-child { text-align: left; width: 38%;
@@ -186,12 +201,17 @@ PAGE = """<!doctype html>
   /* The metrics header stays put while the window is scrolled back through -
      a column of numbers whose headings have scrolled away is unreadable.
 
-     Opaque, and that is the whole requirement: a translucent header let every
-     row scroll through it, and a heading with a timestamp printed across it is
-     less readable than no heading at all. `Canvas` is the page's own background
-     under whichever of light and dark the reader is in, so one declaration
-     covers both - a fixed colour would be a hole in the other theme. */
-  thead th { position: sticky; top: 0; background: Canvas; }
+     Opaque, and that is the whole requirement: a translucent heading lets
+     every row scroll through it, and a heading with a timestamp printed across
+     it is less readable than no heading at all. A written-down colour rather
+     than `Canvas`, which is only as opaque as whatever a browser resolves it
+     against - the page declares one theme, so it can state its own ground.
+
+     `z-index` because a sticky heading is not automatically above what scrolls
+     past it: without a stacking order the rows are painted over the top of it,
+     which looks like a transparency bug and is not one. */
+  thead th { position: sticky; top: 0; z-index: 3; background: var(--ground);
+             box-shadow: 0 1px 0 var(--line); }
   pre { margin: 0; padding: 11px 13px; font: 12px/1.65 ui-monospace, monospace;
         white-space: pre-wrap; }
 </style>
@@ -512,7 +532,7 @@ async function raiseAlert() {
         service: 'io-shop',
         severity: 'critical',
       },
-      annotations: {summary: 'error rate above threshold for 5m'},
+      annotations: {summary: 'Error rate above threshold for 5m'},
       startsAt: new Date().toISOString(),
     }],
   };

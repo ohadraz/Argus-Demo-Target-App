@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from target_app import console
 from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.generator import GeneratedMinute, generate
+from target_app.history import FlagHistoryUnavailable
 from target_app.monitoring import AlertNotDelivered, fire_alert
 from target_app.scenarios import (
     FALLBACK_FLAG,
@@ -386,7 +387,7 @@ def seed_scenario(body: SeedRequest) -> ScenarioStatus:
 def reset_scenario() -> ScenarioStatus:
     try:
         state.reset()
-    except FlagProviderUnavailable as error:
+    except (FlagProviderUnavailable, FlagHistoryUnavailable) as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
 
     return ScenarioStatus(active_scenario=state.active_scenario_id)

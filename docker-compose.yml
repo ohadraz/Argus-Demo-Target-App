@@ -166,6 +166,11 @@ services:
       # that started the incident.
       UNLEASH_ADMIN_TOKEN: "*:*.argus-demo-admin-token"
       UNLEASH_FRONTEND_TOKEN: "default:production.argus-demo-frontend-token"
+      # The provider's own database, which a reset clears the flag history
+      # in - see `target_app.history`. Unleash offers no way to do it
+      # through the API, and a reset that left the last run's toggles in
+      # the log would hand the next investigation suspects nobody staged.
+      UNLEASH_DATABASE_URL: "postgresql://unleash:unleash@unleash-db:5432/unleash"
       # Where this service's monitoring posts the alerts it raises. Whatever
       # watches the shop runs on the host rather than in this network - from in
       # here, the host is `host.docker.internal`, not `localhost`. Nothing

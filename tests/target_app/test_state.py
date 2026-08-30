@@ -38,14 +38,26 @@ def a_flag_client_reporting(enabled: bool) -> Mock:
     return flags
 
 
-def a_scenario_state(flags: Mock, fallback_flags: Mock | None = None) -> ScenarioState:
+def a_scenario_state(
+    flags: Mock,
+    fallback_flags: Mock | None = None,
+    forget_the_flag_history: Mock | None = None,
+) -> ScenarioState:
     """A state object whose second flag nobody is looking at.
 
     Most cases here stage the feature flag, and the fallback flag only has to
     exist for them - so it is defaulted rather than restated, and named
     explicitly by the cases that are actually about it.
+
+    Clearing the flag history is stubbed for the same reason, and for one more:
+    the real one reaches the provider's own database, so a reset here would go
+    looking for a database no unit test has.
     """
-    return ScenarioState(flags, fallback_flags or a_flag_client_reporting(True))
+    return ScenarioState(
+        flags,
+        fallback_flags or a_flag_client_reporting(True),
+        forget_the_flag_history or Mock(),
+    )
 
 
 def where_it_was_left(client: Mock) -> bool:
@@ -173,6 +185,25 @@ def test_resetting_clears_the_scenario_and_the_flag() -> None:
 
     assert state.active_scenario_id is None
     assert flags.disable.call_count == disables_before_the_reset + 1
+
+
+def test_resetting_clears_what_the_provider_recorded_about_both_flags() -> None:
+    # The half of a reset that putting the flags back does not do. The
+    # provider's log is what an investigation reads when it asks what recently
+    # changed, so toggles left in it from the run just finished - and the
+    # put-backs the reset itself just made - become suspects in the next
+    # incident that nobody staged.
+    forget_the_flag_history = Mock()
+    flags = a_flag_client_reporting(True)
+    flags.name = "monthly-spend-feature"
+    fallback_flags = a_flag_client_reporting(True)
+    fallback_flags.name = "legacy-checkout-fallback"
+
+    a_scenario_state(flags, fallback_flags, forget_the_flag_history).reset()
+
+    forget_the_flag_history.assert_called_once_with(
+        ["monthly-spend-feature", "legacy-checkout-fallback"]
+    )
 
 
 def test_resetting_clears_a_flag_left_on_by_someone_else() -> None:

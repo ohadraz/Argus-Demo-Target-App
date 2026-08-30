@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.generator import FlagTimeline
+from target_app.history import forget_the_changes_to
 from target_app.scenarios import (
     FALLBACK_FLAG,
     FEATURE_FLAG,
@@ -44,6 +46,11 @@ def _the_decoys_quiet_state(scenario: Scenario) -> bool:
     reading what changed, exactly like the change that broke the shop.
     """
     return quiet_state_for(scenario.decoy_flag_role)
+
+
+# Clearing the flag provider's recorded history, injected so that a test can
+# watch a reset ask for it without a provider database to ask.
+HistoryEraser = Callable[[Sequence[str]], None]
 
 
 def _set(client: FlagClient, enabled: bool) -> None:
@@ -105,9 +112,15 @@ class ScenarioState:
     what stamps it.
     """
 
-    def __init__(self, flags: FlagClient, fallback_flags: FlagClient) -> None:
+    def __init__(
+        self,
+        flags: FlagClient,
+        fallback_flags: FlagClient,
+        forget_the_flag_history: HistoryEraser = forget_the_changes_to,
+    ) -> None:
         self._flags = flags
         self._fallback_flags = fallback_flags
+        self._forget_the_flag_history = forget_the_flag_history
         self._active: ActiveScenario | None = None
         self._moments: list[FlagMoment] = []
         self._last_seen: dict[str, bool] = {}
@@ -345,6 +358,14 @@ class ScenarioState:
         Clearing a flag that is already clear is free: the provider records a
         toggle only where something actually moved, so a reset on a quiet shop
         adds nothing to the history that the next investigation will read.
+
+        Then the recorded history of both flags goes, which is the half of a
+        reset that putting the flags back does not do. The provider's log is
+        what an investigation reads when it asks what recently changed, so a
+        log still holding the last run's toggles - and the put-backs this
+        method has just made - hands the next incident suspects that belong to
+        a demo nobody is watching any more. Last, so that everything this reset
+        itself recorded is inside what it clears.
         """
         active = self._active
         self._active = None
@@ -353,6 +374,7 @@ class ScenarioState:
 
         if active is None:
             self._put_the_flags_back_where_they_rest()
+            self._forget_what_the_flags_did()
             return
 
         self._set_flag_for(active.scenario, active.scenario.healthy_flag_state)
@@ -360,6 +382,18 @@ class ScenarioState:
 
         if decoy is not None:
             _set(decoy, _the_decoys_quiet_state(active.scenario))
+
+        self._forget_what_the_flags_did()
+
+    def _forget_what_the_flags_did(self) -> None:
+        """Clears both flags' recorded history, whichever one was staged.
+
+        Both, for the reason the flags themselves are both put back: a run
+        abandoned by a restart left changes behind under a flag this service no
+        longer remembers staging, and a history cleared by halves is a history
+        the next investigation still finds something in.
+        """
+        self._forget_the_flag_history([self._flags.name, self._fallback_flags.name])
 
     def _set_flag_for(self, scenario: Scenario, enabled: bool) -> None:
         _set(self._flags_for(scenario), enabled)

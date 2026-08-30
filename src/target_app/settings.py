@@ -40,6 +40,13 @@ class UnleashSettings(BaseSettings):
     fallback_flag: str = Field(default="legacy-checkout-fallback")
     admin_token: str = Field(default="*:*.argus-demo-admin-token")
     frontend_token: str = Field(default="default:production.argus-demo-frontend-token")
+    # The provider's own database, which a reset clears the flag history in -
+    # see `target_app.history` for why that is not done through the API. The
+    # default is the port `docker-compose.yml` publishes it on, so a service
+    # run outside the stack against a local provider needs nothing set.
+    database_url: str = Field(
+        default="postgresql://unleash:unleash@localhost:5433/unleash"
+    )
 
 
 class ScenarioSettings(BaseSettings):

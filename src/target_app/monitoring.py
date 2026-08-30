@@ -92,7 +92,7 @@ def an_alert_for(scenario_id: str | None, at: datetime) -> dict[str, Any]:
                     "service": SERVICE_NAME,
                     "severity": "critical",
                 },
-                "annotations": {"summary": "error rate above threshold for 5m"},
+                "annotations": {"summary": "Error rate above threshold for 5m"},
                 "startsAt": at.strftime(TIMESTAMP_FORMAT),
             }
         ],
