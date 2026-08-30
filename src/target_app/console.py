@@ -24,7 +24,10 @@ PAGE = """<!doctype html>
 <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
 <style>
   :root {
-    color-scheme: light dark;
+    /* Dark, whatever the browser prefers. The shop is watched from a screen
+       of its own beside this one, and two consoles in a demo that disagree
+       about their ground look like two unrelated tools. */
+    color-scheme: dark;
     --teal: #2a9d8f;
     --deep: #123a3d;
     --gold: #e9c46a;
