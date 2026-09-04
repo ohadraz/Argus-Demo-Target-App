@@ -184,6 +184,14 @@ services:
       # it, and two more minutes of watching a flat graph cost more than the
       # extra certainty buys.
       SCENARIO_SETTLE_MINUTES: 1
+      # A second listener, on TLS, for clients that will not speak anything
+      # else - PagerDuty's SDK refuses a base URL that is not `https://`. Same
+      # process as the plain one, because everything this service knows about a
+      # staged scenario lives in its memory. The certificate is self-signed and
+      # minted at startup, so whatever reads this port is told not to verify
+      # it; a deployed environment leaves this unset and gets one plain
+      # listener behind the platform's own TLS.
+      TLS_PORT: 8443
     extra_hosts:
       # Linux daemons do not resolve `host.docker.internal` on their own; Docker
       # Desktop does. Declaring it costs nothing where it is already there and
@@ -191,6 +199,7 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       - "8080:8000"
+      - "8443:8443"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 2s

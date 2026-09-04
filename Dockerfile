@@ -10,5 +10,6 @@ COPY src/ src/
 RUN uv sync --frozen --no-dev
 
 EXPOSE 8000
+EXPOSE 8443
 
-CMD ["uv", "run", "uvicorn", "target_app.app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uv", "run", "python", "-m", "target_app.serve"]
