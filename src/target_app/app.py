@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -15,6 +15,7 @@ from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.generator import GeneratedMinute, generate
 from target_app.history import FlagHistoryUnavailable
 from target_app.monitoring import AlertNotDelivered, fire_alert
+from target_app.payments import charges_between
 from target_app.scenarios import (
     FALLBACK_FLAG,
     FEATURE_FLAG,
@@ -453,6 +454,51 @@ def metrics() -> list[MetricBucket]:
         ]
 
     return _authored_metrics(active.scenario, active.seeded_at)
+
+
+# Stripe's own list envelope, field names included - `object`, `has_more`, and
+# a `url` naming the resource. Deliberately not this service's house style, for
+# the reason the Argo CD models above give: the adapter reading this is the
+# same code that reads the real provider.
+class StripeList(BaseModel):
+    object: str = "list"
+    data: list[dict]
+    has_more: bool
+    url: str = "/v1/charges"
+
+
+@app.get("/stripe/v1/charges", response_model=StripeList)
+def stripe_charges(
+    created_gte: int = Query(0, alias="created[gte]"),
+    created_lte: int = Query(0, alias="created[lte]"),
+    limit: int = Query(100),
+    starting_after: str | None = Query(None),
+) -> StripeList:
+    """Stands in for Stripe's `GET /v1/charges`.
+
+    The window arrives as the SDK sends it - `created[gte]` and `created[lte]`,
+    unix seconds - and paging works as the SDK expects, because the client
+    pages to the end of a window and a stand-in that answered everything in one
+    page would leave that path untested until a real account was in front of
+    it.
+
+    Takings come from the same minutes `/metrics` reports, so an incident that
+    breaks the shop shows up in the money. A window with no scenario seeded is
+    a shop that took nothing, which is a real answer and not an error.
+    """
+    window_start = datetime.fromtimestamp(created_gte, tz=UTC)
+    window_end = datetime.fromtimestamp(created_lte or created_gte, tz=UTC)
+
+    charges = charges_between(metrics(), window_start, window_end)
+
+    if starting_after is not None:
+        seen = [index for index, charge in enumerate(charges)
+                if charge["id"] == starting_after]
+        charges = charges[seen[0] + 1:] if seen else []
+
+    page = charges[:limit]
+
+    return StripeList(data=page, has_more=len(charges) > len(page))
 
 
 @app.get("/argocd/{application}", response_model=ArgoCdApplication)
