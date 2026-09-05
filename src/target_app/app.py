@@ -17,6 +17,7 @@ from target_app.generator import GeneratedMinute, generate
 from target_app.history import FlagHistoryUnavailable
 from target_app.monitoring import AlertNotDelivered, fire_alert
 from target_app.oncall import a_user, an_incident
+from target_app.people import pay_grades_and_bands
 from target_app.payments import charges_between
 from target_app.scenarios import (
     FALLBACK_FLAG,
@@ -525,6 +526,18 @@ def pagerduty_incident(incident_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="no incident is running")
 
     return {"incident": incident}
+
+
+@app.get("/bamboohr/api/v1/pay-grades-and-bands/job-titles")
+def bamboohr_pay_grades_and_bands() -> dict[str, Any]:
+    """Stands in for BambooHR's `GET /pay-grades-and-bands/job-titles`.
+
+    No parameters and no filtering, exactly as the real endpoint has none: it
+    answers levels-with-titles, and a caller wanting one title's band inverts
+    what comes back. Nothing here is scenario-dependent - what a title is worth
+    is a fact about the shop, not about the incident it is having.
+    """
+    return pay_grades_and_bands()
 
 
 @app.get("/pagerduty/users/{user_id}")
