@@ -35,7 +35,24 @@ COMPLETE = "complete"
 
 
 def _settled_at(turned_off_at: datetime) -> datetime:
-    return turned_off_at + timedelta(minutes=get_scenario_settings().settle_minutes)
+    """When the window stops advancing, having shown the recovery hold.
+
+    Counted from the first *whole* minute after the revert rather than from the
+    revert itself. A revert lands mid-minute, so the minute it happened in is
+    part broken and part clean, and a settling period measured from the instant
+    ends mid-minute too - which leaves the first clean bucket partial, and
+    leaves it missing altogether when the revert lands on a minute boundary,
+    since a minute with no elapsed seconds is no reading rather than a quiet
+    one. That bucket is the one a mitigation reads its verdict off, and a window
+    that sometimes omits it refutes an action that worked.
+    """
+    first_clean_minute = (
+        turned_off_at.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    )
+
+    return first_clean_minute + timedelta(
+        minutes=get_scenario_settings().settle_minutes
+    )
 
 
 def _the_decoys_quiet_state(scenario: Scenario) -> bool:

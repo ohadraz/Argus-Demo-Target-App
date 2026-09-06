@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import Mock
 
 from target_app.flags import FlagClient, FlagProviderUnavailable
-from target_app.generator import utc_now
+from target_app.generator import TIMESTAMP_FORMAT, generate, utc_now
 from target_app.scenarios import (
     BAD_DEPLOYMENT,
     COMPETING_FLAG_CHANGES,
@@ -58,6 +58,15 @@ def a_scenario_state(
         fallback_flags or a_flag_client_reporting(True),
         forget_the_flag_history or Mock(),
     )
+
+
+def the_first_whole_minute_after(moment: datetime) -> datetime:
+    """The first minute that is entirely after `moment`.
+
+    The minute a revert lands in is part broken and part clean, so it is the one
+    after it that carries the recovery on its own.
+    """
+    return moment.replace(second=0, microsecond=0) + timedelta(minutes=1)
 
 
 def where_it_was_left(client: Mock) -> bool:
@@ -314,7 +323,60 @@ def test_a_settled_incident_stops_advancing() -> None:
 
     assert state.phase() == COMPLETE
     _, up_to = state.generated_window()
-    assert up_to == long_ago + settle
+    assert up_to == the_first_whole_minute_after(long_ago) + settle
+
+
+def test_a_revert_on_a_minute_boundary_still_leaves_its_clean_minute_behind() -> None:
+    # The bucket a mitigation reads its verdict off. Measured from the revert
+    # itself, the settling period ends on the same boundary it began on, and the
+    # minute that would carry the recovery has nought elapsed seconds - which is
+    # no reading rather than a quiet one, so the window freezes without it and an
+    # action that worked is refuted for want of a measurement.
+    state = a_scenario_state(a_flag_client_reporting(True))
+    state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
+
+    settle = timedelta(minutes=get_scenario_settings().settle_minutes)
+    on_the_boundary = (utc_now() - settle - timedelta(minutes=2)).replace(
+        second=0, microsecond=0
+    )
+    state._active = replace(
+        state.active,
+        timeline=replace(
+            state.active.timeline,
+            turned_on_at=on_the_boundary - timedelta(minutes=5),
+            turned_off_at=on_the_boundary,
+        ),
+    )
+
+    timeline, up_to = state.generated_window()
+    a_span_reaching_either_side_of_the_revert = 10
+    minutes = {
+        minute.minute_id: minute
+        for minute in generate(
+            timeline, up_to, a_span_reaching_either_side_of_the_revert
+        )
+    }
+
+    settled_for = get_scenario_settings().settle_minutes
+    the_clean_minutes = [
+        (the_first_whole_minute_after(on_the_boundary) + timedelta(minutes=offset))
+        .strftime(TIMESTAMP_FORMAT)
+        for offset in range(settled_for)
+    ]
+    the_broken_minute = (on_the_boundary - timedelta(minutes=1)).strftime(
+        TIMESTAMP_FORMAT
+    )
+
+    # Counted, not merely looked for. A settling period measured from the revert
+    # instant keeps the earlier clean minutes and loses only the last one - which
+    # at a settle of a single minute is the only one there ever was.
+    assert sorted(
+        minute_id for minute_id in minutes if minute_id >= the_clean_minutes[0]
+    ) == the_clean_minutes
+    assert (
+        minutes[the_clean_minutes[0]].error_rate
+        < minutes[the_broken_minute].error_rate
+    )
 
 
 def test_an_authored_scenario_has_no_timeline_to_reconcile() -> None:
