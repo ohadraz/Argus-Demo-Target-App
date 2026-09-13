@@ -19,6 +19,7 @@ from target_app.monitoring import AlertNotDelivered, fire_alert
 from target_app.oncall import a_user, an_incident
 from target_app.people import pay_grades_and_bands
 from target_app.payments import charges_between
+from target_app.rates import UnknownBase, rates_quoted_against
 from target_app.scenarios import (
     FALLBACK_FLAG,
     FEATURE_FLAG,
@@ -538,6 +539,23 @@ def bamboohr_pay_grades_and_bands() -> dict[str, Any]:
     is a fact about the shop, not about the incident it is having.
     """
     return pay_grades_and_bands()
+
+
+@app.get("/frankfurter/v1/latest")
+def frankfurter_latest(base: str = Query("EUR")) -> dict[str, Any]:
+    """Stands in for Frankfurter's `GET /v1/latest`.
+
+    Defaults to the euro because the provider does: the table is the ECB's, and
+    a caller that names no base gets it in the currency it was published in.
+
+    A base nothing is quoted against is a 404, as it is there - the one failure
+    of this endpoint a consumer can provoke, and the one its "the rates could
+    not be read" path is waiting for.
+    """
+    try:
+        return rates_quoted_against(base)
+    except UnknownBase as unknown:
+        raise HTTPException(status_code=404, detail=str(unknown)) from unknown
 
 
 @app.get("/pagerduty/users/{user_id}")
