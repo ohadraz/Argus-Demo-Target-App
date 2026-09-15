@@ -37,6 +37,26 @@ def test_a_page_that_renders_carries_the_figure_and_no_failure() -> None:
     assert page.failure is None
 
 
+def test_the_page_serves_a_shopper_idle_this_month_with_the_rollout_on() -> None:
+    # End to end through the boundary: the request that drove the error rate to
+    # ~30% when `monthly-spend-feature` went on now renders a figure.
+    account = an_account_idle_this_month(1000, 3000)
+
+    page = serve_account_page(account, use_monthly_summary=True)
+
+    assert page.figure_cents == 0
+    assert page.failure is None
+
+
+def test_the_page_serves_a_brand_new_shopper_with_the_rollout_on() -> None:
+    page = serve_account_page(
+        an_account_that_never_bought_anything(), use_monthly_summary=True
+    )
+
+    assert page.figure_cents == 0
+    assert page.failure is None
+
+
 def test_a_page_that_breaks_is_reported_rather_than_raised() -> None:
     page = serve_account_page(
         an_account_that_never_bought_anything(), use_monthly_summary=False

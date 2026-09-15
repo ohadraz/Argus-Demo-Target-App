@@ -48,10 +48,35 @@ def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
     assert average_spend_per_item_this_month(an_active_shopper) == 3000
 
 
+def test_the_monthly_average_is_zero_for_a_shopper_idle_this_month() -> None:
+    # The incident: the flag went on and every shopper who had simply not bought
+    # anything yet this month divided by an empty month. Spending nothing this
+    # month is a figure of zero, not an error.
+    account = an_account_with_no_purchases_this_month(1000, 2000, 3000)
+
+    assert average_spend_per_item_this_month(account) == 0
+
+
+def test_the_monthly_average_is_zero_for_a_shopper_who_never_bought_anything() -> None:
+    a_shopper_who_never_bought_anything = Account(
+        purchases=(), total_cents=0, total_this_month_cents=0
+    )
+
+    assert average_spend_per_item_this_month(a_shopper_who_never_bought_anything) == 0
+
+
 def test_the_page_takes_the_stable_summary_when_the_rollout_is_off() -> None:
     account = an_account_with_no_purchases_this_month(1000, 3000)
 
     assert render_spend_summary(account, use_monthly_summary=False) == 2000
+
+
+def test_the_page_renders_with_the_rollout_on_for_a_shopper_idle_this_month() -> None:
+    # The same request that broke at 21:29, now served rather than raised, so
+    # the flag is safe to turn back on.
+    account = an_account_with_no_purchases_this_month(1000, 3000)
+
+    assert render_spend_summary(account, use_monthly_summary=True) == 0
 
 
 def test_the_page_lets_a_failure_reach_its_caller() -> None:
