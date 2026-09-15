@@ -4,25 +4,17 @@ from io_shop.accounts import Account
 
 """What a shopper has spent, and what that averages to.
 
-**This is where the bug is.** The account page is getting a new figure - average
-spend per item *this month* - and it ships behind the `monthly-spend-feature`
-flag. The new version divides by the number of items bought this month, and most
-shoppers bought none, so it raises `ZeroDivisionError` for most of the traffic it
-is shown to.
-
-The defect is left here deliberately: it is the fault every seeded incident is
-caused by, and the one a code fix has to find. It is real code, really executed -
-the shop's error rate counts exceptions that were genuinely raised.
+Two figures with the same shape. The lifetime average has been on the account
+page for years; the monthly one is new, narrows it to the current month, and
+ships behind the `monthly-spend-feature` flag while the rollout runs.
 """
 
 
 def average_spend_per_item(account: Account) -> int:
     """Average spend per item across everything this account has ever bought.
 
-    The version that has been live for years. Its divisor is empty only for an
-    account that has never bought anything at all, which is rare enough that
-    nobody ever hit it - which is exactly why the same mistake went unnoticed
-    when the figure was narrowed to a month.
+    Live for years. Its divisor is empty only for an account that has never
+    bought anything at all, which no real shopper is.
     """
     return account.total_cents // len(account.purchases)
 

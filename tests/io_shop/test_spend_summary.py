@@ -8,12 +8,10 @@ from io_shop.spend_summary import (
     render_spend_summary,
 )
 
-"""Io's account-page arithmetic, including the fault the demo is built around.
+"""Io's account-page arithmetic - the lifetime figure and the monthly one.
 
-The monthly test is the odd one here: it asserts that code is broken, and it has
-to, because that break is the incident. If it ever starts passing, either
-someone fixed the bug - in which case the scenario built on it stages nothing -
-or the account being summarised no longer looks like most real accounts.
+The monthly figure is newer and ships behind a rollout flag, so the cases below
+cover the shape the page has had for years plus the one the flag adds.
 """
 
 
@@ -34,20 +32,9 @@ def test_the_lifetime_average_spreads_the_total_over_every_purchase() -> None:
     assert average_spend_per_item(account) == 2000
 
 
-def test_the_monthly_average_divides_by_zero_for_a_shopper_idle_this_month() -> None:
-    # The seeded fault. The figure is scoped to the current month, and most
-    # shoppers bought nothing in the current month - so the divisor is zero for
-    # most of the traffic, not for an unlucky few.
-    account = an_account_with_no_purchases_this_month(1000, 2000, 3000)
-
-    with pytest.raises(ZeroDivisionError):
-        average_spend_per_item_this_month(account)
-
-
 def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
-    # Pins what is actually wrong. The arithmetic is fine; the set it averages
-    # over is empty for most of the people it is shown to. A fix that made this
-    # case wrong would be fixing the wrong thing.
+    # The ordinary case for the monthly figure: a shopper who has bought
+    # something this month, averaged over what they bought this month.
     an_active_shopper = Account(
         purchases=(
             Purchase(price_cents=4000, in_current_month=True),
@@ -67,10 +54,14 @@ def test_the_page_takes_the_stable_summary_when_the_rollout_is_off() -> None:
     assert render_spend_summary(account, use_monthly_summary=False) == 2000
 
 
-def test_the_page_lets_the_monthly_failure_reach_its_caller() -> None:
+def test_the_page_lets_a_failure_reach_its_caller() -> None:
     # Swallowing it here would render a wrong number instead of an error, and
     # there would be no error rate for anyone to alert on.
-    account = an_account_with_no_purchases_this_month(1000, 3000)
+    a_shopper_who_never_bought_anything = Account(
+        purchases=(), total_cents=0, total_this_month_cents=0
+    )
 
     with pytest.raises(ZeroDivisionError):
-        render_spend_summary(account, use_monthly_summary=True)
+        render_spend_summary(
+            a_shopper_who_never_bought_anything, use_monthly_summary=False
+        )
