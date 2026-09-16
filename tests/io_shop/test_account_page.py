@@ -40,6 +40,17 @@ def test_a_page_that_renders_carries_the_figure_and_no_failure() -> None:
     assert page.failure is None
 
 
+def test_the_page_serves_with_the_rollout_on_for_a_shopper_idle_this_month() -> None:
+    # The render that failed when `monthly-spend-feature` was ramped on: a
+    # shopper with history but nothing bought this month. It must serve.
+    account = an_account_idle_this_month(1000, 3000)
+
+    page = serve_account_page(account, use_monthly_summary=True)
+
+    assert page.figure_cents == 0
+    assert page.failure is None
+
+
 def test_a_page_that_breaks_is_reported_rather_than_raised() -> None:
     page = serve_account_page(
         an_account_that_never_bought_anything(), use_monthly_summary=False
