@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+from io_shop import spend_summary
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
 
@@ -53,4 +56,33 @@ def test_a_failure_keeps_the_errors_own_words() -> None:
         an_account_that_never_bought_anything(), use_monthly_summary=False
     )
 
-    assert page.failure == "ZeroDivisionError: division by zero"
+    assert page.failure is not None
+    assert page.failure.startswith("ZeroDivisionError: division by zero")
+
+
+def test_a_failure_names_the_line_it_was_raised_on() -> None:
+    # The innermost frame, not the boundary's own: every failure in the shop is
+    # caught in the same place, so the boundary's line describes all of them and
+    # locates none. This is the one that divided by zero.
+    page = serve_account_page(
+        an_account_that_never_bought_anything(), use_monthly_summary=False
+    )
+
+    assert page.failure is not None
+    assert "at src/io_shop/spend_summary.py:" in page.failure
+
+
+def test_the_line_a_failure_names_is_the_one_that_raised_it() -> None:
+    # The number, not just the file. A frame reported off by a few lines sends a
+    # reader to code that is fine and reads as authoritatively as a right one.
+    source = (
+        Path(spend_summary.__file__).read_text(encoding="utf-8").splitlines()
+    )
+    page = serve_account_page(
+        an_account_that_never_bought_anything(), use_monthly_summary=False
+    )
+
+    assert page.failure is not None
+    named = int(page.failure.rsplit(":", 1)[1])
+
+    assert "//" in source[named - 1]

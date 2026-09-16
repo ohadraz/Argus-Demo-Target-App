@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import traceback
 from dataclasses import dataclass
+from pathlib import PurePath
 
 from io_shop.accounts import Account
 from io_shop.spend_summary import render_spend_summary
@@ -20,9 +22,11 @@ rate somebody can alert on.
 class RenderedPage:
     """How serving one account page went.
 
-    Exactly one of the two is set. `failure` carries the error's own words,
-    because those words are what reaches the log and what a reader diagnoses
-    from - a generic "request failed" would describe every incident equally.
+    Exactly one of the two is set. `failure` carries the error's own words and
+    the line they were raised on, because those are what reach the log and what
+    a reader diagnoses from - a generic "request failed" would describe every
+    incident equally, and the error's words alone name a fault without naming
+    where it lives.
     """
 
     figure_cents: int | None
@@ -47,5 +51,48 @@ def serve_account_page(account: Account, use_monthly_summary: bool) -> RenderedP
         )
     except Exception as error:  # noqa: BLE001 - the boundary records anything
         return RenderedPage(
-            figure_cents=None, failure=f"{type(error).__name__}: {error}"
+            figure_cents=None,
+            failure=f"{type(error).__name__}: {error} at {_where_it_was_raised(error)}",
         )
+
+
+def _where_it_was_raised(error: BaseException) -> str:
+    """The innermost frame, as `path/to/file.py:line`.
+
+    The innermost rather than the boundary's own, because the boundary is where
+    every failure is caught and is therefore the same answer for all of them.
+    What a reader wants is the line that actually divided by zero.
+
+    Said as a repository path rather than the absolute one the interpreter
+    reports, so that the log names a file somebody can open. The frame's path is
+    wherever this happens to be installed - a container's site-packages, an
+    editable checkout - and none of those spellings exist in the repository.
+    """
+    frames = traceback.extract_tb(error.__traceback__)
+
+    if not frames:
+        return "an unknown line"
+
+    innermost = frames[-1]
+
+    return f"{_as_a_repository_path(innermost.filename)}:{innermost.lineno}"
+
+
+def _as_a_repository_path(filename: str) -> str:
+    """The file as the repository spells it, if it can be recognised.
+
+    Cut at the package directory and put back under `src/`, which is where this
+    shop keeps its source. Anything unrecognisable is reported whole rather than
+    guessed at - a wrong path in a log is worse than a long one, because it
+    sends a reader to a file that does not exist and looks authoritative doing
+    it.
+    """
+    parts = PurePath(filename).parts
+
+    if _PACKAGE not in parts:
+        return filename
+
+    return "/".join(("src", *parts[parts.index(_PACKAGE):]))
+
+
+_PACKAGE = "io_shop"
