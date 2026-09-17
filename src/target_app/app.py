@@ -413,6 +413,10 @@ def raise_alert() -> AlertRaised:
     except AlertNotDelivered as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
 
+    # After it was delivered, because an alert nobody received paged nobody -
+    # and the on-call provider counts every responder's minutes from this.
+    state.somebody_was_paged()
+
     return AlertRaised(incident_id=delivered.get("incident_id"))
 
 
@@ -517,11 +521,16 @@ def pagerduty_incident(incident_id: str) -> dict[str, Any]:
     own id for it is the only one it has. A real account would need a mapping
     between the two, which is a deployment's problem and not a fixture's.
 
-    With no scenario seeded there is no incident to have been paged for, and
-    saying so as a 404 is what the SDK turns into the error the adapter
-    already answers "could not say" to.
+    With no scenario seeded - or one nobody has alerted on - there is no
+    incident to have been paged for, and saying so as a 404 is what the SDK
+    turns into the error the adapter already answers "could not say" to.
     """
-    incident = an_incident(incident_id, metrics())
+    active = state.active
+    incident = an_incident(
+        incident_id,
+        metrics(),
+        active.alerted_at if active is not None else None
+    )
 
     if incident is None:
         raise HTTPException(status_code=404, detail="no incident is running")

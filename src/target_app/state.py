@@ -107,6 +107,12 @@ class ActiveScenario:
 
     scenario: Scenario
     seeded_at: datetime | None = None
+    # When the shop's monitoring paged somebody about this, which is a
+    # different moment from when it broke and the only one a responder could
+    # have acted on. `None` until an alert is actually fired: a scenario staged
+    # and never alerted on is an incident nobody was paged for, and the on-call
+    # provider holds nothing about it.
+    alerted_at: datetime | None = None
     timeline: FlagTimeline | None = None
     # The decoy's own history, for a scenario that stages one. Separate from
     # `timeline` because the two diverge the moment somebody reverts the decoy:
@@ -172,6 +178,24 @@ class ScenarioState:
     @property
     def active_scenario_id(self) -> str | None:
         return self._active.scenario.id if self._active else None
+
+    def somebody_was_paged(self) -> None:
+        """Records that the monitoring has just fired an alert about this.
+
+        The moment person-minutes are counted from. Nobody can respond to an
+        incident before they are told about it, so the on-call provider's
+        acknowledgements are placed relative to this rather than to the minute
+        the shop actually broke - which is usually several minutes earlier and
+        was, by definition, unattended.
+
+        The first page stands. A scenario alerted on twice is the same incident
+        reported twice, and moving the clock forward would shorten everybody's
+        night retrospectively.
+        """
+        if self._active is None or self._active.alerted_at is not None:
+            return
+
+        self._active = replace(self._active, alerted_at=utc_now())
 
     def seed(self, scenario: Scenario) -> None:
         """Stages a scenario, establishing whatever live condition it needs.

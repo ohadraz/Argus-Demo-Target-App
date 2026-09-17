@@ -10,10 +10,12 @@ on the incident and the job title on the person, and a stand-in that answered
 both in a single payload would let an adapter be written that never makes the
 second request - and then meet a real account that requires it.
 
-The response is derived from the same minutes `/metrics` reports, so the
-incident somebody was paged for is the incident the telemetry describes. The
-acknowledgements are authored: this service knows when its own incident began,
-and the demo needs somebody to have picked it up a few minutes later.
+The incident is bounded by two different things, and that is deliberate. It
+begins when the shop's monitoring paged somebody, because that is the first
+moment anyone could have responded; it ends at the last minute `/metrics`
+reports as troubled, because that is when the shop was well again. The
+acknowledgements are authored - the demo needs somebody to have picked it up -
+and they are placed after the page, never after the breakage.
 """
 
 from __future__ import annotations
@@ -40,37 +42,81 @@ RESPONDERS: dict[str, dict[str, str]] = {
     }
 }
 
-# How long each of them took to acknowledge. Different, so a reader can see
-# that the minutes are counted from each person's own moment; and both a few
-# minutes in, because the gap between an alert firing and somebody picking it
-# up is the thing this endpoint exists to make measurable.
+# How long after the page each of them took to pick it up. From the page and
+# not from the onset: the shop is usually broken for some minutes before
+# monitoring says so, and nobody can respond to something they have not been
+# told about. Different from each other, so a reader can see that the minutes
+# are counted from each person's own moment; and both close behind the page,
+# because an incident that is over in minutes is one a slower responder never
+# joins at all.
 ACKNOWLEDGED_AFTER: dict[str, timedelta] = {
-    "PDUSERA": timedelta(minutes=4),
-    "PDUSERB": timedelta(minutes=9)
+    "PDUSERA": timedelta(minutes=1),
+    "PDUSERB": timedelta(minutes=2)
 }
+
+# What makes a minute one of the incident's rather than one of the day's. Clear
+# of the baseline's own wobble on either measure - a calm minute is about 1%
+# errors at 215ms - and under every staged phase, the mildest of which is 900ms
+# while its error rate is still ordinary. Either alone is enough: the scenario
+# that breaks by latency never moves the error rate, and the ones that break by
+# errors never move the latency.
+_A_TROUBLED_ERROR_RATE = 0.05
+_A_TROUBLED_P95_MS = 400
+
+# How long monitoring takes to notice, where nothing fired an alert through this
+# service. A suite drives the whole incident itself - it stages the scenario and
+# posts the alert straight at whatever is listening - so this service is never
+# told that anybody was paged, and an on-call provider that answered "nobody
+# was" would make the response cost a property of who pressed the button.
+#
+# A minute, because the shop's metrics are per minute and a rule that fires on
+# one bad minute cannot fire sooner than the minute after it.
+MONITORING_NOTICES_AFTER = timedelta(minutes=1)
 
 # PagerDuty's own vocabulary for what a resource is.
 _A_USER_REFERENCE = "user_reference"
 _RESOLVED = "resolved"
 
 
-def an_incident(incident_id: str, buckets: list[Any]) -> dict[str, Any] | None:
+def an_incident(incident_id: str,
+                buckets: list[Any],
+                alerted_at: datetime | None) -> dict[str, Any] | None:
     """The incident as the on-call provider holds it, or `None` if there is none.
 
-    The window comes from the telemetry: the first minute the service reported
-    is when the incident began, and the last is when it ended. A responder who
-    would have acknowledged after it was over did not acknowledge it at all,
-    which is what keeps a short scenario from reporting negative attention.
+    Two clocks, and keeping them apart is the whole of this. The page is when
+    somebody was told, and it is where every responder's minutes start: an
+    incident nobody has been alerted on has no responders, however long the shop
+    has been broken. Recovery is the last minute the telemetry was troubled, and
+    it is what those minutes are counted to.
+
+    Neither end is "the oldest thing I can see". The metrics endpoint answers a
+    rolling window whether the shop is well or not, so a window read as the
+    incident makes the response look ninety minutes long on a seven-minute
+    outage - and grows by one minute per responder per minute, so that two reads
+    of the same finished incident disagree.
+
+    `alerted_at` is when an alert was actually fired through this service, which
+    is how the demo runs it. A suite drives the incident itself and posts its
+    alert straight at Argus, so there is nothing to record - and there the page
+    is modelled: monitoring notices a minute after the shop breaks.
+
+    A responder who would have acknowledged after recovery did not acknowledge
+    it at all, which is what keeps a short incident from reporting negative
+    attention.
     """
-    minutes = sorted(
-        minute for minute in (_minute_of(bucket.bucket_id) for bucket in buckets)
+    troubled = sorted(
+        minute
+        for minute in (
+            _minute_of(bucket.bucket_id) for bucket in buckets if _is_troubled(bucket)
+        )
         if minute is not None
     )
 
-    if not minutes:
+    if not troubled:
         return None
 
-    began_at, ended_at = minutes[0], minutes[-1]
+    paged_at = alerted_at or troubled[0] + MONITORING_NOTICES_AFTER
+    ended_at = max(troubled[-1], paged_at)
 
     return {
         "id": incident_id,
@@ -78,15 +124,28 @@ def an_incident(incident_id: str, buckets: list[Any]) -> dict[str, Any] | None:
         "summary": "Elevated error rate on checkout",
         "title": "Elevated error rate on checkout",
         "status": _RESOLVED,
-        "created_at": _as_text(began_at),
+        "created_at": _as_text(paged_at),
         "resolved_at": _as_text(ended_at),
         "last_status_change_at": _as_text(ended_at),
         "acknowledgements": [
-            _an_acknowledgement(responder, began_at + waited)
+            _an_acknowledgement(responder, paged_at + waited)
             for responder, waited in ACKNOWLEDGED_AFTER.items()
-            if began_at + waited <= ended_at
+            if paged_at + waited <= ended_at
         ]
     }
+
+
+def _is_troubled(bucket: Any) -> bool:
+    """Whether this is a minute the shop was broken in.
+
+    Either measure, because the scenarios break in different ways: one climbs in
+    latency while its error rate stays ordinary, and the others throw errors at
+    a latency nobody would notice.
+    """
+    return (
+        bucket.error_rate > _A_TROUBLED_ERROR_RATE
+        or bucket.p95_ms > _A_TROUBLED_P95_MS
+    )
 
 
 def a_user(user_id: str) -> dict[str, Any] | None:
