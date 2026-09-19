@@ -66,6 +66,22 @@ _BASELINE_P50_MS = 45
 _BASELINE_P95_MS = 215
 _LATENCY_WOBBLE_MS = 8
 
+# What the shop's memory looks like when nothing is eating it: a working set a
+# little over a fifth of the limit, wobbling the way a garbage-collected
+# service's does between collections. Reported on every minute of every
+# scenario, not only the ones about memory - a field that appeared when it
+# mattered would be a field read as a signal by its presence, and a baseline
+# nobody can see is not a baseline.
+MEMORY_LIMIT_BYTES = 2 * 1024**3
+BASELINE_MEMORY_BYTES = 440 * 1024**2
+_MEMORY_WOBBLE_BYTES = 12 * 1024**2
+
+# How long a shop nobody has restarted has been up. Further back than any
+# window served here reaches, on purpose: a start time *inside* the window
+# reads as a restart during the incident, which is the one thing this field
+# exists to report.
+SETTLED_UPTIME = timedelta(hours=6)
+
 _SECONDS_PER_MINUTE = 60
 
 
@@ -125,6 +141,9 @@ class GeneratedMinute:
     p50_ms: int
     p95_ms: int
     request_volume: int
+    memory_used_bytes: int
+    memory_limit_bytes: int | None
+    process_start_time_seconds: float
     log_lines: tuple[str, ...]
 
 
@@ -134,7 +153,8 @@ def generate(timeline: FlagTimeline,
              flag: str | None = None,
              breaks_when_flag_is_on: bool = True,
              decoy_flag: str | None = None,
-             decoy_timeline: FlagTimeline | None = None) -> list[GeneratedMinute]:
+             decoy_timeline: FlagTimeline | None = None,
+             process_started_at: datetime | None = None) -> list[GeneratedMinute]:
     """Every minute from `span_minutes` ago up to and including the one in
     progress, once any of it has happened.
 
@@ -157,10 +177,20 @@ def generate(timeline: FlagTimeline,
     somebody reverts it - which, being a coincidence rather than a cause,
     changes no metric at all. A reader that saw the decoy frozen after being
     reverted would be reading a log that disagrees with the provider.
+
+    `process_started_at` is when the serving process last came up, reported on
+    every minute so that a restart is visible as a change in it. Left unsaid, it
+    is taken to be further back than this window reaches, which is what a shop
+    nobody has restarted looks like.
     """
     current_minute = now.replace(second=0, microsecond=0)
     elapsed_in_current = int((now - current_minute).total_seconds())
     named_flag = flag or get_unleash_settings().flag
+    started_at = (
+        process_started_at
+        if process_started_at is not None
+        else current_minute - SETTLED_UPTIME
+    )
 
     minutes = [
         _generate_minute(
@@ -171,6 +201,7 @@ def generate(timeline: FlagTimeline,
             breaks_when_flag_is_on=breaks_when_flag_is_on,
             decoy_flag=decoy_flag,
             decoy_timeline=decoy_timeline,
+            process_started_at=started_at,
         )
         for offset in range(span_minutes, 0, -1)
     ]
@@ -191,6 +222,7 @@ def generate(timeline: FlagTimeline,
                 breaks_when_flag_is_on=breaks_when_flag_is_on,
                 decoy_flag=decoy_flag,
                 decoy_timeline=decoy_timeline,
+                process_started_at=started_at,
             )
         )
 
@@ -203,6 +235,7 @@ def _generate_minute(
     elapsed_seconds: int,
     flag: str,
     breaks_when_flag_is_on: bool,
+    process_started_at: datetime,
     decoy_flag: str | None = None,
     decoy_timeline: FlagTimeline | None = None,
 ) -> GeneratedMinute:
@@ -236,6 +269,14 @@ def _generate_minute(
         p50_ms=_BASELINE_P50_MS + entropy.randint(-_LATENCY_WOBBLE_MS, _LATENCY_WOBBLE_MS),
         p95_ms=_BASELINE_P95_MS + entropy.randint(-_LATENCY_WOBBLE_MS, _LATENCY_WOBBLE_MS),
         request_volume=_REPORTED_VOLUME_PER_MINUTE,
+        # Drawn after the latencies, so that adding memory to the bucket left
+        # every figure this generator already produced exactly where it was:
+        # each minute seeds one generator, and a draw inserted earlier would
+        # shift every draw after it.
+        memory_used_bytes=BASELINE_MEMORY_BYTES
+        + entropy.randint(-_MEMORY_WOBBLE_BYTES, _MEMORY_WOBBLE_BYTES),
+        memory_limit_bytes=MEMORY_LIMIT_BYTES,
+        process_start_time_seconds=process_started_at.timestamp(),
         log_lines=_log_lines_for(
             minute_id,
             failures,

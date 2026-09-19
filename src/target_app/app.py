@@ -13,7 +13,12 @@ from pydantic import BaseModel
 
 from target_app import console
 from target_app.flags import FlagClient, FlagProviderUnavailable
-from target_app.generator import GeneratedMinute, generate
+from target_app.generator import (
+    BASELINE_MEMORY_BYTES,
+    MEMORY_LIMIT_BYTES,
+    GeneratedMinute,
+    generate,
+)
 from target_app.history import FlagHistoryUnavailable
 from target_app.monitoring import AlertNotDelivered, fire_alert
 from target_app.oncall import a_user, an_incident
@@ -217,6 +222,13 @@ class MetricBucket(BaseModel):
     p50_ms: int
     p95_ms: int
     request_volume: int
+    # The resource fields, reported by every bucket of every scenario. Gauges
+    # where the four above are rates and quantiles, so each minute takes the
+    # peak for usage and the last reading for the other two - a minute
+    # containing a restart reports the process that finished it.
+    memory_used_bytes: int
+    memory_limit_bytes: int | None = None
+    process_start_time_seconds: float
 
 
 # The four models below mirror Argo CD's own wire shape, field names included -
@@ -457,11 +469,16 @@ def metrics() -> list[MetricBucket]:
                 p50_ms=minute.p50_ms,
                 p95_ms=minute.p95_ms,
                 request_volume=minute.request_volume,
+                memory_used_bytes=minute.memory_used_bytes,
+                memory_limit_bytes=minute.memory_limit_bytes,
+                process_start_time_seconds=minute.process_start_time_seconds,
             )
             for minute in _generated_minutes()
         ]
 
-    return _authored_metrics(active.scenario, active.seeded_at)
+    return _authored_metrics(
+        active.scenario, active.seeded_at, active.process_started_at
+    )
 
 
 # Stripe's own list envelope, field names included - `object`, `has_more`, and
@@ -664,6 +681,7 @@ def _generated_minutes() -> list[GeneratedMinute]:
         breaks_when_flag_is_on=scenario.breaks_when_flag_is_on,
         decoy_flag=_the_decoy_flag(scenario),
         decoy_timeline=state.decoy_timeline_now(),
+        process_started_at=active.process_started_at if active else None,
     )
 
 
@@ -693,8 +711,17 @@ def _authored_log_lines(scenario: Scenario, seeded_at: datetime | None) -> list[
     ]
 
 
-def _authored_metrics(scenario: Scenario, seeded_at: datetime | None) -> list[MetricBucket]:
-    if seeded_at is None:
+def _authored_metrics(scenario: Scenario,
+                      seeded_at: datetime | None,
+                      process_started_at: datetime | None) -> list[MetricBucket]:
+    """An authored scenario's minutes as buckets, resources included.
+
+    The resources are the calm baseline, flat across the window: an authored
+    scenario is a fault in something other than memory, and a fixture that
+    moved every metric at once would leave a reader unable to tell which one
+    the incident is about.
+    """
+    if seeded_at is None or process_started_at is None:
         return []
 
     span_minutes = scenario_span_minutes(scenario)
@@ -705,6 +732,9 @@ def _authored_metrics(scenario: Scenario, seeded_at: datetime | None) -> list[Me
             p50_ms=entry.p50_ms,
             p95_ms=entry.p95_ms,
             request_volume=entry.request_volume,
+            memory_used_bytes=BASELINE_MEMORY_BYTES,
+            memory_limit_bytes=MEMORY_LIMIT_BYTES,
+            process_start_time_seconds=process_started_at.timestamp(),
         )
         for entry in scenario.minutes
     ]

@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 from target_app.flags import FlagClient, FlagProviderUnavailable
-from target_app.generator import FlagTimeline
+from target_app.generator import SETTLED_UPTIME, FlagTimeline
 from target_app.history import forget_the_changes_to
 from target_app.scenarios import (
     FALLBACK_FLAG,
@@ -118,6 +118,12 @@ class ActiveScenario:
     # `timeline` because the two diverge the moment somebody reverts the decoy:
     # that revert is real and belongs in the logs, and it ends nothing.
     decoy_timeline: FlagTimeline | None = None
+    # When the serving process came up, as every metric bucket reports it.
+    # Fixed at staging rather than recomputed per read: a start time derived
+    # from the current minute would move every minute, and a reader comparing
+    # two polls would see a shop restarting itself continuously. `None` only
+    # before anything is staged, where there is no telemetry to report it on.
+    process_started_at: datetime | None = None
 
 
 class ScenarioState:
@@ -227,7 +233,11 @@ class ScenarioState:
 
         if not scenario.is_generated:
             self._remember_where_the_flags_are_now()
-            self._active = ActiveScenario(scenario=scenario, seeded_at=now)
+            self._active = ActiveScenario(
+                scenario=scenario,
+                seeded_at=now,
+                process_started_at=now - SETTLED_UPTIME,
+            )
             return
 
         # The scenario's own flag, created here rather than at startup: a
@@ -266,6 +276,7 @@ class ScenarioState:
                 if scenario.decoy_flag_role is not None
                 else None
             ),
+            process_started_at=now - SETTLED_UPTIME,
         )
 
     def _stage_the_decoy(self, scenario: Scenario) -> None:

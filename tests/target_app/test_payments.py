@@ -20,7 +20,7 @@ not happen, and an estimate built on takings that ignored the incident would
 be measuring the shop's traffic rather than its outage.
 
 Nothing here needs the app, a provider or a clock - charges are derived from
-metric buckets, and a bucket is four numbers and a timestamp.
+metric buckets, and a bucket is a handful of numbers and a timestamp.
 """
 
 SOME_MINUTE = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
@@ -30,6 +30,11 @@ A_WINDOW_AROUND_IT = (SOME_MINUTE - timedelta(minutes=1),
 
 SOME_VOLUME = 1_000
 NOTHING_FAILED = 0.0
+
+# Takings come from traffic and failures. What the shop's memory was doing is
+# required on a bucket and decides nothing here.
+DONT_CARE_MEMORY_BYTES = 400 * 1024**2
+DONT_CARE_STARTED_AT = SOME_MINUTE.timestamp()
 
 
 def test_a_minute_of_traffic_becomes_orders_at_the_shops_conversion_rate() -> None:
@@ -136,4 +141,6 @@ def _a_minute(error_rate: float,
         p50_ms=40,
         p95_ms=90,
         request_volume=request_volume,
+        memory_used_bytes=DONT_CARE_MEMORY_BYTES,
+        process_start_time_seconds=DONT_CARE_STARTED_AT,
     )

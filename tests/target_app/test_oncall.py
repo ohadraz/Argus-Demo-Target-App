@@ -26,7 +26,7 @@ oldest bucket to newest - a seven-minute outage reported an hour and a half of
 somebody's attention, and it grew while nobody touched it.
 
 Nothing needs the app or a clock: the incident is derived from metric buckets
-and a moment, and a bucket is four numbers and a timestamp.
+and a moment, and a bucket is a handful of numbers and a timestamp.
 """
 
 SOME_INCIDENT = "incident-1"
@@ -42,6 +42,11 @@ A_TROUBLED_ERROR_RATE = 0.33
 A_CALM_ERROR_RATE = 0.01
 A_TROUBLED_P95_MS = 1_800
 A_CALM_P95_MS = 215
+
+# What an incident is bounded by is the error rate and the latency. Memory is
+# required on a bucket and decides nothing here.
+DONT_CARE_MEMORY_BYTES = 400 * 1024**2
+DONT_CARE_STARTED_AT = SOME_MINUTE.timestamp()
 
 A_RESPONDER = next(iter(RESPONDERS))
 THE_SLOWEST_RESPONSE = max(ACKNOWLEDGED_AFTER.values())
@@ -229,7 +234,9 @@ def _minutes_from(began_at: datetime,
             error_rate=error_rate,
             p50_ms=100,
             p95_ms=p95_ms,
-            request_volume=DONT_CARE_VOLUME
+            request_volume=DONT_CARE_VOLUME,
+            memory_used_bytes=DONT_CARE_MEMORY_BYTES,
+            process_start_time_seconds=DONT_CARE_STARTED_AT
         )
         for minute in range(int(span // timedelta(minutes=1)) + 1)
     ]
