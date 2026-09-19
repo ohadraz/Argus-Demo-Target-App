@@ -130,6 +130,36 @@ class ScenarioStatus(BaseModel):
     active_scenario: str | None
 
 
+class ShopRestarted(BaseModel):
+    # When the process came back. Answered rather than left implicit because it
+    # is what the telemetry then reports as the start time, and whoever asked
+    # for the restart is about to go looking for exactly that.
+    restarted_at: datetime
+
+
+# The action Argo CD runs against a Deployment to roll it, by the name it is
+# registered under. The vendor's own word, so it is named once here rather than
+# spelled at the comparison.
+RESTART_ACTION = "restart"
+
+
+class ArgoCdResourceAction(BaseModel):
+    """The body Argo CD's resource-action endpoint takes.
+
+    Every field the real one carries, and all of them ignored but `action`.
+    This shop has one service and no namespaces, so the resource a caller
+    addressed can only be the one there is - but an adapter written against a
+    real server sends all five, and a stand-in that refused them would be one
+    nothing real could be pointed at.
+    """
+
+    action: str
+    namespace: str | None = None
+    resourceName: str | None = None  # noqa: N815 - Argo CD's own spelling
+    group: str | None = None
+    kind: str | None = None
+
+
 class AlertRaised(BaseModel):
     # Whatever the receiver called the incident this alert opened, if it named
     # one at all. `None` rather than an error when it did not: the alert was
@@ -410,6 +440,50 @@ def reset_scenario() -> ScenarioStatus:
     return ScenarioStatus(active_scenario=state.active_scenario_id)
 
 
+@app.post("/scenario/restart", response_model=ShopRestarted)
+def restart_the_shop() -> ShopRestarted:
+    """Brings the shop's serving process back.
+
+    Under the scenario prefix because it is a control on the fixture rather
+    than something the shop offers its shoppers - the same place the seed and
+    the reset live.
+
+    It is not, however, the only way in. A platform restart arrives at the Argo
+    CD endpoint below, and both land here, because a mitigation that behaved
+    differently depending on who asked for it would be a fixture grading itself.
+    """
+    return ShopRestarted(restarted_at=state.restart_the_shop())
+
+
+@app.post("/argocd/{application}/resource/actions/v2")
+def argocd_run_resource_action(application: str,
+                               body: ArgoCdResourceAction) -> dict[str, str]:
+    """Stands in for Argo CD's `POST
+    /api/v1/applications/{name}/resource/actions/v2`.
+
+    A restart on a real platform is not an endpoint of its own: it is a named
+    action the server runs against a resource, and `restart` is the built-in one
+    for a Deployment. The shape here is the vendor's for the reason every other
+    stand-in in this file uses the vendor's - the adapter pointed at this is the
+    same adapter that would be pointed at a real Argo CD.
+
+    Anything other than the restart action is refused rather than quietly
+    accepted. A platform that answered 200 to an action it did not run would
+    have a caller believe production had changed when it had not.
+
+    Argo CD answers an empty body on success, and so does this.
+    """
+    if body.action != RESTART_ACTION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown resource action: {body.action}",
+        )
+
+    state.restart_the_shop()
+
+    return {}
+
+
 @app.post("/monitoring/alert", response_model=AlertRaised)
 def raise_alert() -> AlertRaised:
     """Fires the alert the shop's monitoring would fire, at whatever is
@@ -682,6 +756,8 @@ def _generated_minutes() -> list[GeneratedMinute]:
         decoy_flag=_the_decoy_flag(scenario),
         decoy_timeline=state.decoy_timeline_now(),
         process_started_at=active.process_started_at if active else None,
+        leak_started_at=active.leak_started_at if active else None,
+        restarts=active.restarts if active else (),
     )
 
 

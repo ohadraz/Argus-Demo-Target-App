@@ -4,6 +4,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
+from io_shop.visits import forget_every_visit
 from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.generator import SETTLED_UPTIME, FlagTimeline
 from target_app.history import forget_the_changes_to
@@ -124,6 +125,17 @@ class ActiveScenario:
     # two polls would see a shop restarting itself continuously. `None` only
     # before anything is staged, where there is no telemetry to report it on.
     process_started_at: datetime | None = None
+    # When the shop began retaining what it should have let go. `None` for
+    # every scenario that is not about memory, which is what keeps the heap
+    # flat in all of them - a fixture that moved every signal at once would
+    # leave a reader unable to say which one the incident is about.
+    leak_started_at: datetime | None = None
+    # Every time somebody has brought the process back since. A list rather
+    # than a latest value, because a restart has to stay in the window it
+    # happened in: the minutes before it kept the heap they had, and a single
+    # moving instant would flatten the climb retrospectively and take the
+    # incident out of the record the moment it was mitigated.
+    restarts: tuple[datetime, ...] = ()
 
 
 class ScenarioState:
@@ -240,6 +252,22 @@ class ScenarioState:
             )
             return
 
+        if scenario.leaks:
+            # No flag is touched, because no flag is involved. The condition
+            # this stages is the process's own accumulation, which has been
+            # going on for a while already - long enough that the window opens
+            # quiet and the climb is visible in it the instant anybody looks.
+            self._remember_where_the_flags_are_now()
+            self._active = ActiveScenario(
+                scenario=scenario,
+                seeded_at=now,
+                process_started_at=now - SETTLED_UPTIME,
+                leak_started_at=now - timedelta(
+                    minutes=get_scenario_settings().leak_backdate_minutes
+                ),
+            )
+            return
+
         # The scenario's own flag, created here rather than at startup: a
         # scenario provisions the condition it stages, and one that is never
         # staged leaves the provider carrying nothing to explain. Idempotent, so
@@ -278,6 +306,34 @@ class ScenarioState:
             ),
             process_started_at=now - SETTLED_UPTIME,
         )
+
+    def restart_the_shop(self) -> datetime:
+        """Brings the serving process back, and says when.
+
+        Two things happen, and both of them are the restart: what the shop had
+        accumulated is gone, and the moment is recorded so that the telemetry
+        reports a new process from here on. A restart that reclaimed the heap
+        without moving the start time would be indistinguishable, from outside,
+        from one that never happened - and that distinction is the only thing
+        separating "the restart did not land" from "it landed and did not
+        help".
+
+        It works with nothing staged, and does the same thing. A platform
+        restarts whatever is running, and refusing because this service has no
+        scenario in mind would make the control lie about what it is.
+
+        The climb then begins again, because a restart takes away what
+        accumulated and not what accumulates it. That is the whole of why this
+        mitigates a leak without resolving it.
+        """
+        at = utc_now()
+        forget_every_visit()
+        active = self._active
+
+        if active is not None:
+            self._active = replace(active, restarts=(*active.restarts, at))
+
+        return at
 
     def _stage_the_decoy(self, scenario: Scenario) -> None:
         """Moves the decoy flag, if the scenario has one, the way its role moves.
@@ -423,9 +479,21 @@ class ScenarioState:
         self._active = None
         self._moments = []
         self._last_seen = {}
+        # Whatever the shop itself accumulated goes too, whichever scenario was
+        # staged. It is the shop's own state rather than the scenario's, and a
+        # reset that left it behind would hand the next run a heap it did not
+        # start.
+        forget_every_visit()
 
         if active is None:
             self._put_the_flags_back_where_they_rest()
+            self._forget_what_the_flags_did()
+            return
+
+        if active.scenario.leaks:
+            # Nothing to put back: a leaking scenario moved no flag, and
+            # toggling one here would plant a change for the next
+            # investigation to find.
             self._forget_what_the_flags_did()
             return
 
@@ -458,6 +526,11 @@ class ScenarioState:
         stopped advancing and the next scenario can be staged. An authored
         scenario is `staged` for ever - it has no live condition, so there is
         no progress for it to be in the middle of.
+
+        A leak reaches the same three phases by a different road: what ends its
+        running phase is a restart rather than a flag going back, and what it
+        settles into is a reclaimed heap climbing again rather than a rate that
+        stayed down. Both are worth watching for the same few minutes.
         """
         active = self._active
 
@@ -470,16 +543,20 @@ class ScenarioState:
             return STAGED
 
         timeline, _ = window
+        if active.scenario.leaks:
+            ended_at = active.restarts[-1] if active.restarts else None
+        else:
+            ended_at = timeline.turned_off_at if timeline is not None else None
 
-        if timeline.turned_off_at is None:
+        if ended_at is None:
             return RUNNING
 
-        if utc_now() < _settled_at(timeline.turned_off_at):
+        if utc_now() < _settled_at(ended_at):
             return RECOVERING
 
         return COMPLETE
 
-    def generated_window(self) -> tuple[FlagTimeline, datetime] | None:
+    def generated_window(self) -> tuple[FlagTimeline | None, datetime] | None:
         """The active generated scenario's timeline, and the instant its
         telemetry runs up to - or `None` if no generated scenario is active.
 
@@ -491,7 +568,21 @@ class ScenarioState:
 
         Freezing rather than clearing, because the point of a demo is to be
         looked at after it finishes. Clearing is what `reset` is for.
+
+        A leaking scenario has no flag and so no timeline, and answers `None`
+        in its place. What ends it is the last restart, settled the same way -
+        the point of watching a few minutes past a restart is to see the heap
+        come back down and start climbing again, which is the evidence that the
+        incident was mitigated and not fixed.
         """
+        active = self._active
+
+        if active is not None and active.scenario.leaks:
+            if not active.restarts:
+                return None, utc_now()
+
+            return None, min(utc_now(), _settled_at(active.restarts[-1]))
+
         timeline = self.timeline_now()
 
         if timeline is None:

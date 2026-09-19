@@ -16,6 +16,7 @@ own words, which are what a reader diagnoses from.
 
 def an_account_idle_this_month(*prices: int) -> Account:
     return Account(
+        shopper_id="shopper-idle-this-month",
         purchases=tuple(
             Purchase(price_cents=price, in_current_month=False) for price in prices
         ),
@@ -28,7 +29,10 @@ def an_account_that_never_bought_anything() -> Account:
     """A shopper with no purchase history at all - the lifetime figure's own
     empty divisor, and the failure this file is built on.
     """
-    return Account(purchases=(), total_cents=0, total_this_month_cents=0)
+    return Account(
+        shopper_id="shopper-with-no-history", purchases=(), total_cents=0,
+        total_this_month_cents=0
+    )
 
 
 def test_a_page_that_renders_carries_the_figure_and_no_failure() -> None:

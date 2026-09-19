@@ -77,6 +77,17 @@ class ScenarioSettings(BaseSettings):
     # being presented.
     settle_minutes: int = Field(default=3, gt=0)
 
+    # How long a leaking shop has been leaking by the time it is seeded, which
+    # is the same trick `onset_backdate_minutes` plays and needs a bigger number
+    # for a different reason. A flag fault steps: one minute of it is already a
+    # departure. A leak ramps, so the departure has to be *accumulated* - and
+    # what locates its onset is the contrast between a quiet opening and a climb,
+    # which means both have to be in the window. Thirty minutes puts the heap at
+    # about two thirds of its limit when anybody first looks: memory well clear
+    # of its baseline, latency just beginning to follow, and the error rate not
+    # moved at all.
+    leak_backdate_minutes: int = Field(default=30, gt=0)
+
 
 @lru_cache
 def get_unleash_settings() -> UnleashSettings:

@@ -18,6 +18,15 @@ class Purchase:
 
 @dataclass(frozen=True)
 class Account:
+    """One shopper, and what they have bought.
+
+    `shopper_id` is who the history belongs to. It is on the account rather
+    than passed beside it because everything the page does with an account it
+    does for a shopper - rendering the figure, and remembering that they were
+    here.
+    """
+
+    shopper_id: str
     purchases: tuple[Purchase, ...]
     total_cents: int
     total_this_month_cents: int

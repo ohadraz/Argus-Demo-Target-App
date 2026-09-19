@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from target_app.generator import FlagTimeline, GeneratedMinute, generate
+from target_app.generator import (
+    BASELINE_MEMORY_BYTES,
+    LEAK_CLIMB_BYTES_PER_MINUTE,
+    MEMORY_LIMIT_BYTES,
+    FlagTimeline,
+    GeneratedMinute,
+    generate,
+)
 
 """The generator, which is where this service earns its keep.
 
@@ -306,3 +313,210 @@ def test_reverting_the_decoy_does_not_end_the_incident() -> None:
     )
 
     assert minute_at(1, minutes).error_rate > CLEARLY_DEGRADED
+
+
+# A leak's window is longer than a flag's: the whole point is the contrast
+# between a quiet opening and a climb, and both have to fit in it.
+A_LEAKING_SPAN_MINUTES = 90
+
+
+def a_leaking_window(
+    began_minutes_ago: int = 30,
+    now: datetime = SOME_NOW,
+    restarts: tuple[datetime, ...] = (),
+) -> list[GeneratedMinute]:
+    """The leak scenario's window - no flag at all, and a heap that climbs."""
+    return generate(
+        None,
+        now,
+        A_LEAKING_SPAN_MINUTES,
+        flag="dont-care-flag",
+        leak_started_at=now - timedelta(minutes=began_minutes_ago),
+        restarts=restarts,
+    )
+
+
+def a_calm_p95_in(minutes: list[GeneratedMinute]) -> int:
+    """What this window reads at before anything started climbing.
+
+    Taken from the window rather than named here, so that a test about the
+    heap dragging latency up is comparing against the same service - and does
+    not have to be edited every time the baseline is tuned.
+    """
+    return minutes[0].p95_ms
+
+
+def test_a_minute_before_the_leak_began_sits_at_the_baseline() -> None:
+    minutes = a_leaking_window(began_minutes_ago=30)
+
+    assert minute_at(60, minutes).memory_used_bytes < BASELINE_MEMORY_BYTES * 1.1
+
+
+def test_the_heap_is_higher_the_longer_the_leak_has_run() -> None:
+    # A ramp, not a step. It is what separates this from every other scenario
+    # here, and what a reader has to be able to date the start of.
+    minutes = a_leaking_window(began_minutes_ago=30)
+
+    early = minute_at(20, minutes).memory_used_bytes
+    later = minute_at(10, minutes).memory_used_bytes
+
+    assert later > early > BASELINE_MEMORY_BYTES
+
+
+def test_the_heap_climbs_at_about_the_rate_it_says_it_does() -> None:
+    # Pinned because everything downstream is calibrated against it: how long
+    # the scenario takes to become diagnosable, and how long it has after that
+    # before the shop is at its limit.
+    minutes = a_leaking_window(began_minutes_ago=30)
+
+    over_ten_minutes = (
+        minute_at(5, minutes).memory_used_bytes
+        - minute_at(15, minutes).memory_used_bytes
+    )
+
+    assert abs(over_ten_minutes - 10 * LEAK_CLIMB_BYTES_PER_MINUTE) < 40 * 1024**2
+
+
+def test_the_heap_never_exceeds_the_limit_it_is_given() -> None:
+    # A heap cannot be larger than it is allowed to be. What a shop at its
+    # limit does is fail allocations, and that is reported as its own signal.
+    minutes = a_leaking_window(began_minutes_ago=300)
+
+    assert minute_at(0, minutes).memory_used_bytes <= MEMORY_LIMIT_BYTES
+
+
+def test_a_scenario_that_is_not_about_memory_leaves_the_heap_alone() -> None:
+    # The baseline has to be a baseline. A fixture that moved memory in every
+    # scenario would leave a reader unable to say which one an incident is
+    # about.
+    minutes = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES)
+
+    assert minute_at(1, minutes).memory_used_bytes < BASELINE_MEMORY_BYTES * 1.1
+
+
+def test_latency_is_untouched_while_the_heap_is_merely_large() -> None:
+    # Half the limit is a larger heap and nothing else. A service reporting
+    # latency for every megabyte it allocated would make memory undiagnosable
+    # by making everything look like memory.
+    minutes = a_leaking_window(began_minutes_ago=15)
+
+    assert minute_at(0, minutes).p95_ms < 2 * a_calm_p95_in(minutes)
+
+
+def test_latency_follows_the_heap_once_it_is_past_half_the_limit() -> None:
+    minutes = a_leaking_window(began_minutes_ago=45)
+
+    assert minute_at(0, minutes).p95_ms > 3 * a_calm_p95_in(minutes)
+
+
+def test_the_error_rate_does_not_move_until_allocations_fail() -> None:
+    # The whole shape of a leak, and why it gets paged on too late: the heap
+    # climbs for the better part of an hour and latency follows it for half of
+    # that, while the one signal most alert rules watch stays where it was.
+    minutes = a_leaking_window(began_minutes_ago=45)
+
+    assert minute_at(0, minutes).p95_ms > 3 * a_calm_p95_in(minutes)
+    assert minute_at(0, minutes).error_rate < CLEARLY_HEALTHY
+
+
+def test_a_shop_at_its_limit_finally_fails_requests() -> None:
+    minutes = a_leaking_window(began_minutes_ago=60)
+
+    assert minute_at(0, minutes).error_rate > CLEARLY_DEGRADED
+
+
+def test_a_restart_reclaims_the_heap() -> None:
+    restarted_at = SOME_NOW - timedelta(minutes=2)
+    minutes = a_leaking_window(began_minutes_ago=40, restarts=(restarted_at,))
+
+    assert minute_at(0, minutes).memory_used_bytes < BASELINE_MEMORY_BYTES * 1.2
+
+
+def test_a_restart_leaves_the_climb_before_it_where_it_was() -> None:
+    # A restart is a moment in the window, not a new beginning for the whole of
+    # it. If the minutes before it flattened out, mitigating the incident would
+    # erase it from the record it is diagnosed from.
+    restarted_at = SOME_NOW - timedelta(minutes=2)
+    minutes = a_leaking_window(began_minutes_ago=40, restarts=(restarted_at,))
+
+    assert minute_at(5, minutes).memory_used_bytes > BASELINE_MEMORY_BYTES * 1.5
+
+
+def test_the_heap_climbs_again_after_a_restart() -> None:
+    # The fault is still in the code when the new process comes up. This is the
+    # whole of why a restart mitigates a leak and does not resolve it.
+    restarted_at = SOME_NOW - timedelta(minutes=10)
+    minutes = a_leaking_window(began_minutes_ago=40, restarts=(restarted_at,))
+
+    assert (
+        minute_at(0, minutes).memory_used_bytes
+        > minute_at(8, minutes).memory_used_bytes
+    )
+
+
+def test_a_restarted_minute_reports_the_process_that_came_up() -> None:
+    # The only evidence that a restart landed. Memory falling is ambiguous on
+    # its own - the process restarted, or the traffic dropped - and without a
+    # start time that moved, a restart that never happened is indistinguishable
+    # from one that happened and did not help.
+    restarted_at = SOME_NOW - timedelta(minutes=2)
+    minutes = a_leaking_window(began_minutes_ago=40, restarts=(restarted_at,))
+
+    assert (
+        minute_at(0, minutes).process_start_time_seconds
+        > minute_at(5, minutes).process_start_time_seconds
+    )
+
+
+def test_a_leaking_minute_says_what_its_heap_is_doing() -> None:
+    minutes = a_leaking_window(began_minutes_ago=45)
+
+    said = " ".join(minute_at(0, minutes).log_lines)
+
+    assert "heap at" in said
+    assert "limit" in said
+
+
+def test_a_shop_at_its_limit_says_allocations_are_failing() -> None:
+    minutes = a_leaking_window(began_minutes_ago=60)
+
+    assert "heap allocation failed" in " ".join(minute_at(0, minutes).log_lines)
+
+
+def test_a_calm_shop_says_nothing_about_its_heap() -> None:
+    # A service that logged its heap every minute would bury the minute it
+    # mattered, and a reader scanning for the first mention of memory is doing
+    # what a responder does.
+    minutes = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES)
+
+    assert "heap" not in " ".join(minute_at(1, minutes).log_lines)
+
+
+def test_the_minute_a_restart_landed_in_says_so_both_ways() -> None:
+    # Two events, and a reader needs both: the process that was serving went
+    # away, and another came up with the heap reclaimed. A restart that did not
+    # reclaim would be a different incident.
+    restarted_at = SOME_NOW - timedelta(minutes=2)
+    minutes = a_leaking_window(began_minutes_ago=40, restarts=(restarted_at,))
+
+    said = " ".join(minute_at(2, minutes).log_lines)
+
+    assert "process terminated" in said
+    assert "process started" in said
+
+
+def test_a_scenario_with_no_flag_reports_no_flag_value() -> None:
+    # Nothing here evaluated a flag, so nothing may say one did. A line naming
+    # a flag would be the fixture handing an investigation a suspect it made up.
+    minutes = a_leaking_window(began_minutes_ago=30)
+
+    assert "dont-care-flag" not in " ".join(minute_at(1, minutes).log_lines)
+
+
+def test_a_leaking_shop_still_serves_most_of_its_traffic() -> None:
+    # A leak is not an outage until the very end, and even then it is thrashing
+    # rather than down. A window that read as a total failure would be a
+    # different incident with a different right answer.
+    minutes = a_leaking_window(began_minutes_ago=30)
+
+    assert minute_at(1, minutes).error_rate < CLEARLY_HEALTHY

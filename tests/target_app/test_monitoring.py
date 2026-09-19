@@ -11,7 +11,11 @@ from target_app.monitoring import (
     an_alert_for,
     fire_alert,
 )
-from target_app.scenarios import BAD_DEPLOYMENT, FEATURE_FLAG_TOGGLE
+from target_app.scenarios import (
+    BAD_DEPLOYMENT,
+    FEATURE_FLAG_TOGGLE,
+    RESOURCE_LEAK,
+)
 
 """What the shop's monitoring promises about the alert it raises.
 
@@ -51,6 +55,23 @@ def test_a_deploy_that_slowed_the_shop_down_fires_the_latency_rule() -> None:
     alert = an_alert_for(BAD_DEPLOYMENT, DONT_CARE_INSTANT)
 
     assert alert["alerts"][0]["labels"]["alertname"] == "HighLatency"
+
+
+def test_a_leaking_shop_pages_on_memory_rather_than_on_errors() -> None:
+    # The rule that matters for a leak, and the argument for it: by the time a
+    # climbing heap moves the error rate the shop has been failing for a while
+    # and the page is late. Memory is the signal that moves first.
+    alert = an_alert_for(RESOURCE_LEAK, DONT_CARE_INSTANT)
+
+    assert alert["alerts"][0]["labels"]["alertname"] == "HighMemoryUsage"
+
+
+def test_a_memory_alert_says_it_is_about_a_climb() -> None:
+    # A responder is being told about a trend, not an outage. "Error rate above
+    # threshold" on a leak would describe an incident that is not happening yet.
+    alert = an_alert_for(RESOURCE_LEAK, DONT_CARE_INSTANT)
+
+    assert "climbing" in alert["alerts"][0]["annotations"]["summary"]
 
 
 def test_the_alert_names_the_service_it_is_about() -> None:

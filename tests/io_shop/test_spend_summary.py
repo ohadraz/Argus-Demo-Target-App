@@ -18,6 +18,7 @@ cover the shape the page has had for years plus the one the flag adds.
 def an_account_with_no_purchases_this_month(*prices: int) -> Account:
     """The ordinary case: a shopper who has bought before, but not this month."""
     return Account(
+        shopper_id="shopper-idle-this-month",
         purchases=tuple(
             Purchase(price_cents=price, in_current_month=False) for price in prices
         ),
@@ -36,6 +37,7 @@ def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
     # The ordinary case for the monthly figure: a shopper who has bought
     # something this month, averaged over what they bought this month.
     an_active_shopper = Account(
+        shopper_id="shopper-who-bought-this-month",
         purchases=(
             Purchase(price_cents=4000, in_current_month=True),
             Purchase(price_cents=2000, in_current_month=True),
@@ -58,7 +60,8 @@ def test_the_page_lets_a_failure_reach_its_caller() -> None:
     # Swallowing it here would render a wrong number instead of an error, and
     # there would be no error rate for anyone to alert on.
     a_shopper_who_never_bought_anything = Account(
-        purchases=(), total_cents=0, total_this_month_cents=0
+        shopper_id="shopper-with-no-history", purchases=(), total_cents=0,
+        total_this_month_cents=0
     )
 
     with pytest.raises(ZeroDivisionError):

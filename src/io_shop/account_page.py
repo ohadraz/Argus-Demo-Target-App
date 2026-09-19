@@ -6,6 +6,7 @@ from pathlib import PurePath
 
 from io_shop.accounts import Account
 from io_shop.spend_summary import render_spend_summary
+from io_shop.visits import record_visit
 
 """Serving one account page - the shop's request boundary.
 
@@ -43,17 +44,18 @@ def serve_account_page(account: Account, use_monthly_summary: bool) -> RenderedP
     SDK that evaluated for this user.
     """
     try:
-        return RenderedPage(
-            figure_cents=render_spend_summary(
-                account, use_monthly_summary=use_monthly_summary
-            ),
-            failure=None,
+        figure_cents = render_spend_summary(
+            account, use_monthly_summary=use_monthly_summary
         )
     except Exception as error:  # noqa: BLE001 - the boundary records anything
-        return RenderedPage(
-            figure_cents=None,
-            failure=f"{type(error).__name__}: {error} at {_where_it_was_raised(error)}",
-        )
+        failure = f"{type(error).__name__}: {error} at {_where_it_was_raised(error)}"
+        record_visit(account.shopper_id, failure)
+
+        return RenderedPage(figure_cents=None, failure=failure)
+
+    record_visit(account.shopper_id, str(figure_cents))
+
+    return RenderedPage(figure_cents=figure_cents, failure=None)
 
 
 def _where_it_was_raised(error: BaseException) -> str:

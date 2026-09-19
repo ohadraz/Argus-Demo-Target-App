@@ -82,7 +82,33 @@ _MEMORY_WOBBLE_BYTES = 12 * 1024**2
 # exists to report.
 SETTLED_UPTIME = timedelta(hours=6)
 
+# How fast a leaking shop's heap grows. Fast enough that the climb is a climb
+# within a few minutes of anybody looking, and slow enough that the whole of it
+# fits in the window: from the baseline this reaches the limit in a little under
+# an hour, which is longer than a demo and shorter than a shift.
+LEAK_CLIMB_BYTES_PER_MINUTE = 30 * 1024**2
+
+# Where a heap stops being merely large. Below this the collector keeps up and
+# nothing outside notices; above it, it runs more or less constantly and every
+# request waits behind it - which is why latency follows memory rather than
+# arriving with it.
+_PRESSURE_BEGINS_AT = 0.5
+# Where the shop stops serving. Allocations start failing outright, and the
+# error rate finally moves - last of the three signals, which is what makes a
+# leak so easy to page on too late.
+_FAILING_BEGINS_AT = 0.9
+# How much slower the shop is at the limit than at rest. Nine times over a
+# 215ms p95 is the better part of two seconds, which is what a service spending
+# its time in the collector actually looks like.
+_SLOWEST_UNDER_PRESSURE = 9.0
+# What share of requests fail once allocations do. Not all of them: a shop at
+# its limit is thrashing, not down, and an outage would be a different incident.
+_FAILING_SHARE = 0.35
+
+_OUT_OF_MEMORY_FAILURE = "OutOfMemoryError: heap allocation failed"
+
 _SECONDS_PER_MINUTE = 60
+_BYTES_PER_MIB = 1024**2
 
 
 @dataclass(frozen=True)
@@ -128,6 +154,39 @@ class FlagTimeline:
 
 
 @dataclass(frozen=True)
+class ProcessLifetime:
+    """When the shop's process came up, and every time it has come up since.
+
+    A leak is measured from whichever process is serving, so a restart has to
+    be a moment in a history rather than a new value replacing the old one. A
+    single "started at" that moved would flatten the climb retrospectively:
+    the minutes before the restart would report the heap they would have had if
+    the process had only just started, and the incident would vanish from the
+    window the moment it was mitigated.
+    """
+
+    started_at: datetime
+    restarts: tuple[datetime, ...] = ()
+
+    def serving_during(self, minute: datetime) -> datetime:
+        """When the process serving this minute came up.
+
+        The latest start at or before the minute. A restart lands mid-minute
+        and the minute it lands in is served mostly by the new process, so the
+        minute takes the new start rather than splitting - a bucket carries one
+        start time, and the one worth reporting is the one still serving when
+        anybody reads it.
+        """
+        came_up = [
+            moment.replace(second=0, microsecond=0)
+            for moment in self.restarts
+            if moment.replace(second=0, microsecond=0) <= minute
+        ]
+
+        return max(came_up) if came_up else self.started_at
+
+
+@dataclass(frozen=True)
 class GeneratedMinute:
     """One minute, as both channels see it.
 
@@ -147,14 +206,16 @@ class GeneratedMinute:
     log_lines: tuple[str, ...]
 
 
-def generate(timeline: FlagTimeline,
+def generate(timeline: FlagTimeline | None,
              now: datetime,
              span_minutes: int,
              flag: str | None = None,
              breaks_when_flag_is_on: bool = True,
              decoy_flag: str | None = None,
              decoy_timeline: FlagTimeline | None = None,
-             process_started_at: datetime | None = None) -> list[GeneratedMinute]:
+             process_started_at: datetime | None = None,
+             leak_started_at: datetime | None = None,
+             restarts: tuple[datetime, ...] = ()) -> list[GeneratedMinute]:
     """Every minute from `span_minutes` ago up to and including the one in
     progress, once any of it has happened.
 
@@ -178,18 +239,36 @@ def generate(timeline: FlagTimeline,
     changes no metric at all. A reader that saw the decoy frozen after being
     reverted would be reading a log that disagrees with the provider.
 
+    `timeline` is `None` for a scenario that stages no flag at all. Nothing is
+    then routed to the canary and no flag value is reported, because there is
+    no flag whose value could be reported - a line naming one would be the
+    fixture inventing a suspect.
+
     `process_started_at` is when the serving process last came up, reported on
     every minute so that a restart is visible as a change in it. Left unsaid, it
     is taken to be further back than this window reaches, which is what a shop
     nobody has restarted looks like.
+
+    `leak_started_at` is when the shop began retaining what it should have let
+    go. From that minute the heap climbs, and everything the climb does to the
+    service follows from it. Left unsaid, the shop's memory sits at its
+    baseline, which is what every scenario that is not about memory looks like.
+
+    `restarts` are the moments somebody brought the process back. Each one
+    reclaims the heap and starts the climb again from the baseline, because the
+    fault is still in the code when the new process comes up - which is exactly
+    why a restart mitigates a leak and does not resolve it.
     """
     current_minute = now.replace(second=0, microsecond=0)
     elapsed_in_current = int((now - current_minute).total_seconds())
     named_flag = flag or get_unleash_settings().flag
-    started_at = (
-        process_started_at
-        if process_started_at is not None
-        else current_minute - SETTLED_UPTIME
+    lifetime = ProcessLifetime(
+        started_at=(
+            process_started_at
+            if process_started_at is not None
+            else current_minute - SETTLED_UPTIME
+        ),
+        restarts=restarts,
     )
 
     minutes = [
@@ -201,7 +280,8 @@ def generate(timeline: FlagTimeline,
             breaks_when_flag_is_on=breaks_when_flag_is_on,
             decoy_flag=decoy_flag,
             decoy_timeline=decoy_timeline,
-            process_started_at=started_at,
+            lifetime=lifetime,
+            leak_started_at=leak_started_at,
         )
         for offset in range(span_minutes, 0, -1)
     ]
@@ -222,7 +302,8 @@ def generate(timeline: FlagTimeline,
                 breaks_when_flag_is_on=breaks_when_flag_is_on,
                 decoy_flag=decoy_flag,
                 decoy_timeline=decoy_timeline,
-                process_started_at=started_at,
+                lifetime=lifetime,
+                leak_started_at=leak_started_at,
             )
         )
 
@@ -230,19 +311,24 @@ def generate(timeline: FlagTimeline,
 
 
 def _generate_minute(
-    timeline: FlagTimeline,
+    timeline: FlagTimeline | None,
     minute: datetime,
     elapsed_seconds: int,
     flag: str,
     breaks_when_flag_is_on: bool,
-    process_started_at: datetime,
+    lifetime: ProcessLifetime,
     decoy_flag: str | None = None,
     decoy_timeline: FlagTimeline | None = None,
+    leak_started_at: datetime | None = None,
 ) -> GeneratedMinute:
     minute_id = minute.strftime(TIMESTAMP_FORMAT)
     entropy = random.Random(minute_id)
 
-    seconds_on = timeline.seconds_on_within(minute, elapsed_seconds)
+    seconds_on = (
+        timeline.seconds_on_within(minute, elapsed_seconds)
+        if timeline is not None
+        else 0
+    )
     share_of_minute_flagged = (
         seconds_on / elapsed_seconds if elapsed_seconds > 0 else 0.0
     )
@@ -259,36 +345,168 @@ def _generate_minute(
         else len(outcomes) - served_the_broken_path
     )
 
+    serving_since = lifetime.serving_during(minute)
+    # Before the wobble, and deliberately: what the service around the heap
+    # does follows the trend rather than the jitter, and a p95 that moved with
+    # the collector's sawtooth would be noise dressed as a signal.
+    heap_bytes = _the_heap_at(minute, leak_started_at, serving_since)
+    pressure = heap_bytes / MEMORY_LIMIT_BYTES
+    under_pressure = _how_much_slower_under(pressure)
+    failures = _with_the_allocations_that_failed(failures, pressure)
+
     return GeneratedMinute(
         minute_id=minute_id,
         error_rate=round(len(failures) / _SAMPLE_SIZE, 4),
-        # Latency is untouched by this fault, and that is load-bearing: an
+        # A flag fault leaves latency alone, and that is load-bearing: an
         # error-rate departure with flat latency is what distinguishes a bad
-        # flag from a bad deploy, and a reader that cannot tell them apart is
-        # reading the alert rather than the evidence.
-        p50_ms=_BASELINE_P50_MS + entropy.randint(-_LATENCY_WOBBLE_MS, _LATENCY_WOBBLE_MS),
-        p95_ms=_BASELINE_P95_MS + entropy.randint(-_LATENCY_WOBBLE_MS, _LATENCY_WOBBLE_MS),
+        # flag from a bad deploy. A leak is the case where it does not stay
+        # flat - the multiplier is 1 until the heap is over half the limit, so
+        # every scenario that is not about memory reads exactly as it did.
+        p50_ms=round(
+            (_BASELINE_P50_MS + entropy.randint(-_LATENCY_WOBBLE_MS, _LATENCY_WOBBLE_MS))
+            * under_pressure
+        ),
+        p95_ms=round(
+            (_BASELINE_P95_MS + entropy.randint(-_LATENCY_WOBBLE_MS, _LATENCY_WOBBLE_MS))
+            * under_pressure
+        ),
         request_volume=_REPORTED_VOLUME_PER_MINUTE,
         # Drawn after the latencies, so that adding memory to the bucket left
         # every figure this generator already produced exactly where it was:
         # each minute seeds one generator, and a draw inserted earlier would
         # shift every draw after it.
-        memory_used_bytes=BASELINE_MEMORY_BYTES
-        + entropy.randint(-_MEMORY_WOBBLE_BYTES, _MEMORY_WOBBLE_BYTES),
+        memory_used_bytes=min(
+            MEMORY_LIMIT_BYTES,
+            heap_bytes + entropy.randint(-_MEMORY_WOBBLE_BYTES, _MEMORY_WOBBLE_BYTES),
+        ),
         memory_limit_bytes=MEMORY_LIMIT_BYTES,
-        process_start_time_seconds=process_started_at.timestamp(),
+        process_start_time_seconds=serving_since.timestamp(),
         log_lines=_log_lines_for(
             minute_id,
             failures,
             len(outcomes),
             evaluated_on,
-            flag,
+            flag if timeline is not None else None,
             decoy=_decoy_evaluation_line(
                 minute_id, minute, elapsed_seconds, len(outcomes),
                 decoy_flag, decoy_timeline,
             ),
+            heap=_heap_lines_for(minute_id, minute, heap_bytes, pressure, lifetime),
         ),
     )
+
+
+def _the_heap_at(minute: datetime,
+                 leak_started_at: datetime | None,
+                 serving_since: datetime) -> int:
+    """How much memory the shop is holding during this minute.
+
+    The baseline until something starts retaining, then the baseline plus
+    whatever has accumulated since - counted from the later of the leak
+    beginning and the process coming up, because a new process starts with an
+    empty heap however long the fault has been in the code.
+
+    Capped at the limit. A heap cannot exceed the limit it is allowed; what a
+    shop at its limit does is fail allocations, which is a different signal and
+    is reported as one.
+    """
+    if leak_started_at is None:
+        return BASELINE_MEMORY_BYTES
+
+    climbing_since = max(leak_started_at, serving_since)
+    minutes_climbing = max(
+        0.0, (minute - climbing_since).total_seconds() / _SECONDS_PER_MINUTE
+    )
+
+    return min(
+        MEMORY_LIMIT_BYTES,
+        BASELINE_MEMORY_BYTES + int(minutes_climbing * LEAK_CLIMB_BYTES_PER_MINUTE),
+    )
+
+
+def _how_much_slower_under(pressure: float) -> float:
+    """How much longer a request takes at this much of the limit.
+
+    Nothing at all until the heap is over half the limit - a larger heap is
+    just a larger heap, and a service reporting latency for every megabyte it
+    allocates would make memory undiagnosable by making everything look like
+    memory. Past that the collector is running more or less constantly, and the
+    curve is linear to the limit because what it is competing for is the one
+    thing the shop cannot get more of.
+    """
+    if pressure <= _PRESSURE_BEGINS_AT:
+        return 1.0
+
+    how_far_in = (pressure - _PRESSURE_BEGINS_AT) / (1.0 - _PRESSURE_BEGINS_AT)
+
+    return 1.0 + how_far_in * (_SLOWEST_UNDER_PRESSURE - 1.0)
+
+
+def _with_the_allocations_that_failed(failures: list[str], pressure: float) -> list[str]:
+    """The minute's failures, plus the ones a shop at its limit cannot serve.
+
+    Last of the three signals to move, which is the whole shape of a leak: the
+    heap climbs for an hour, latency follows it for the back half of that, and
+    the error rate only goes anywhere once allocations actually start failing.
+    A responder paging on error rate alone finds out last.
+
+    Topped up rather than replaced: the shop's ordinary failures are still
+    happening, and a minute that reported only allocation failures would have
+    lost the baseline noise every other minute has.
+    """
+    if pressure < _FAILING_BEGINS_AT:
+        return failures
+
+    failing = round(_FAILING_SHARE * _SAMPLE_SIZE)
+
+    return [*failures, *([_OUT_OF_MEMORY_FAILURE] * max(0, failing - len(failures)))]
+
+
+def _heap_lines_for(minute_id: str,
+                    minute: datetime,
+                    heap_bytes: int,
+                    pressure: float,
+                    lifetime: ProcessLifetime) -> tuple[str, ...]:
+    """What the shop says about its own memory this minute.
+
+    Quiet while there is nothing to say. A service that logged its heap every
+    minute would bury the minute it mattered, and a reader scanning for the
+    first mention of memory is doing what a responder does.
+
+    A restart is two lines, because it is two events: the process that was
+    serving went away, and another one came up. Said in the order they
+    happened, with the new heap named - the reclaim is the thing a reader is
+    checking for, and a restart that did not reclaim is a different incident.
+    """
+    restarted = [
+        moment for moment in lifetime.restarts
+        if moment.replace(second=0, microsecond=0) == minute
+    ]
+    said: list[str] = []
+
+    if restarted:
+        said.append(f"{minute_id} WARN io-shop: process terminated")
+        said.append(
+            f"{minute_id} INFO io-shop: process started - heap reclaimed to "
+            f"{_as_mib(heap_bytes)}"
+        )
+
+    if pressure >= _FAILING_BEGINS_AT:
+        said.append(
+            f"{minute_id} ERROR io-shop: heap allocation failed - "
+            f"{_as_mib(heap_bytes)} of {_as_mib(MEMORY_LIMIT_BYTES)} limit"
+        )
+    elif pressure > _PRESSURE_BEGINS_AT:
+        said.append(
+            f"{minute_id} WARN io-shop: heap at {_as_mib(heap_bytes)} of "
+            f"{_as_mib(MEMORY_LIMIT_BYTES)} limit"
+        )
+
+    return tuple(said)
+
+
+def _as_mib(memory_bytes: int) -> str:
+    return f"{memory_bytes // _BYTES_PER_MIB}MiB"
 
 
 def _decoy_evaluation_line(
@@ -389,6 +607,11 @@ def _an_account(entropy: random.Random) -> Account:
         purchases_this_month = 0
 
     return Account(
+        # Named from the history itself, because there is no shopper database
+        # here to draw a name out of - and named without drawing anything, so
+        # that adding an identity left every figure this generator already
+        # produced exactly where it was.
+        shopper_id=f"shopper-{sum(prices)}-{len(prices)}-{purchases_this_month}",
         purchases=tuple(
             Purchase(price_cents=price, in_current_month=index < purchases_this_month)
             for index, price in enumerate(prices)
@@ -403,12 +626,18 @@ def _log_lines_for(
     failures: list[str],
     sample_size: int,
     evaluated_on: int,
-    flag: str,
+    flag: str | None,
     decoy: str | None = None,
+    heap: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     evaluations = (
-        _flag_evaluation_line(minute_id, sample_size, evaluated_on, flag),
+        *(
+            (_flag_evaluation_line(minute_id, sample_size, evaluated_on, flag),)
+            if flag is not None
+            else ()
+        ),
         *((decoy,) if decoy is not None else ()),
+        *heap,
     )
 
     if not failures:

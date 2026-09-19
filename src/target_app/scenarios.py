@@ -121,6 +121,13 @@ class Scenario:
     learns the ordinary lesson of an incident - that the first correlated change
     was not the cause - and still has somewhere to go next.
 
+    `leaks` stages a scenario of the other generated kind: its live condition is
+    the serving process's own accumulation rather than a flag's state. No flag
+    is touched, nothing anybody does to a flag ends it, and what does end it is
+    a restart - which reclaims the heap and leaves the fault in the code, so the
+    climb begins again. That is what makes it the first scenario Argus can
+    mitigate without resolving.
+
     `offered_in_console` is presentation only. A scenario kept for the capability
     it pins down is not automatically one worth showing an audience; hiding it
     leaves it seedable by id, which is how the e2e suite stages it.
@@ -134,6 +141,7 @@ class Scenario:
     breaks_when_flag_is_on: bool = True
     recovers_when_flag_reverts: bool = True
     decoy_flag_role: str | None = None
+    leaks: bool = False
     offered_in_console: bool = True
 
     @property
@@ -149,6 +157,7 @@ class Scenario:
 
 FEATURE_FLAG_TOGGLE = "feature-flag-toggle"
 BAD_DEPLOYMENT = "bad-deployment"
+RESOURCE_LEAK = "resource-leak"
 FALLBACK_DISABLED = "fallback-disabled"
 FLAG_TOGGLE_RED_HERRING = "flag-toggle-red-herring"
 COMPETING_FLAG_CHANGES = "competing-flag-changes"
@@ -216,6 +225,24 @@ SCENARIOS: dict[str, Scenario] = {
         flag_role=FALLBACK_FLAG,
         breaks_when_flag_is_on=False,
         decoy_flag_role=FEATURE_FLAG,
+    ),
+    RESOURCE_LEAK: Scenario(
+        id=RESOURCE_LEAK,
+        title="The shop is leaking memory",
+        description=(
+            "Io's account page remembers every shopper who visits it, so the "
+            "page can greet them with what they saw last time. Nothing ever "
+            "drops an entry, so the heap climbs for as long as the process is "
+            "up. Memory departs its baseline first, latency follows it once "
+            "the collector stops keeping up, and the error rate only moves at "
+            "the very end when allocations start failing - which is the order "
+            "that makes a leak so easy to page on too late. No flag touches "
+            "it. Restarting the shop reclaims the heap and the climb begins "
+            "again, because the fault is still in the code: the incident is "
+            "mitigated, never resolved, and what ends it is a fix."
+        ),
+        leaks=True,
+        offered_in_console=False,
     ),
     BAD_DEPLOYMENT: Scenario(
         id=BAD_DEPLOYMENT,

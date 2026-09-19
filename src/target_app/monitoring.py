@@ -24,7 +24,12 @@ import httpx
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from target_app.scenarios import BAD_DEPLOYMENT, TIMESTAMP_FORMAT, utc_now
+from target_app.scenarios import (
+    BAD_DEPLOYMENT,
+    RESOURCE_LEAK,
+    TIMESTAMP_FORMAT,
+    utc_now,
+)
 
 HttpPost = Callable[..., httpx.Response]
 
@@ -43,6 +48,23 @@ SERVICE_NAME = "io-shop"
 # payload that says which.
 _HIGH_LATENCY = "HighLatency"
 _HIGH_ERROR_RATE = "HighErrorRate"
+_HIGH_MEMORY_USAGE = "HighMemoryUsage"
+
+# The rule each scenario trips, and what it says. Anything not named here is
+# paging about an error rate, which is what most of these scenarios break.
+#
+# The leak's rule is the one worth arguing about: it pages on memory, because
+# by the time a leak moves the error rate the shop has been failing for a while
+# and the alert is late. Its summary says so - the responder is being told
+# about a climb, not an outage.
+_WHAT_FIRED: dict[str, tuple[str, str]] = {
+    BAD_DEPLOYMENT: (_HIGH_LATENCY, "p95 latency above threshold for 5m"),
+    RESOURCE_LEAK: (
+        _HIGH_MEMORY_USAGE,
+        "Memory usage climbing against the container limit for 15m",
+    ),
+}
+_BY_DEFAULT = (_HIGH_ERROR_RATE, "Error rate above threshold for 5m")
 
 
 class MonitoringSettings(BaseSettings):
@@ -79,20 +101,19 @@ def an_alert_for(scenario_id: str | None, at: datetime) -> dict[str, Any]:
     this with the same code it would point at a real Grafana, so a friendlier
     payload here would be a lie that consumer would have to be written around.
     """
+    alertname, summary = _WHAT_FIRED.get(scenario_id or "", _BY_DEFAULT)
+
     return {
         "status": "firing",
         "alerts": [
             {
                 "status": "firing",
                 "labels": {
-                    "alertname": (
-                        _HIGH_LATENCY if scenario_id == BAD_DEPLOYMENT
-                        else _HIGH_ERROR_RATE
-                    ),
+                    "alertname": alertname,
                     "service": SERVICE_NAME,
                     "severity": "critical",
                 },
-                "annotations": {"summary": "Error rate above threshold for 5m"},
+                "annotations": {"summary": summary},
                 "startsAt": at.strftime(TIMESTAMP_FORMAT),
             }
         ],

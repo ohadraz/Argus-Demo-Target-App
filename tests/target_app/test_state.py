@@ -4,14 +4,22 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from unittest.mock import Mock
 
+import pytest
+
 from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.generator import TIMESTAMP_FORMAT, generate, utc_now
+from io_shop.visits import (
+    forget_every_visit,
+    how_many_shoppers_are_remembered,
+    record_visit,
+)
 from target_app.scenarios import (
     BAD_DEPLOYMENT,
     COMPETING_FLAG_CHANGES,
     FALLBACK_DISABLED,
     FEATURE_FLAG_TOGGLE,
     FLAG_TOGGLE_RED_HERRING,
+    RESOURCE_LEAK,
     SCENARIOS,
 )
 from target_app.settings import get_scenario_settings
@@ -22,6 +30,18 @@ from target_app.state import (
     RUNNING,
     ScenarioState,
 )
+
+
+@pytest.fixture(autouse=True)
+def a_shop_that_has_just_started() -> None:
+    """Every case begins with the shop holding nothing.
+
+    What the account page retains is module state, so without this each case
+    would inherit whatever the last one left behind - which is the fault the
+    leak scenario is about, and a poor thing to also have in the tests about it.
+    """
+    forget_every_visit()
+
 
 """Staging a scenario, and keeping it honest against a flag anyone can change.
 
@@ -555,3 +575,136 @@ def test_a_scenario_with_no_decoy_has_no_decoy_timeline() -> None:
     state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
 
     assert state.decoy_timeline_now() is None
+
+
+def a_leaking_scenario_state(flags: Mock | None = None) -> ScenarioState:
+    """A state object for the scenario that touches no flag at all.
+
+    Both clients are stubbed anyway. Staging a leak still puts the shop back
+    together first, and that step asks the provider about flags whether or not
+    the scenario has one.
+    """
+    return a_scenario_state(flags or a_flag_client_reporting(False))
+
+
+def test_staging_a_leak_records_when_it_began() -> None:
+    # Backdated, for the same reason a flag scenario's onset is: an audience
+    # watching a flat graph for half an hour is not a demo. The difference is
+    # how far back - a ramp needs a quiet opening and a climb, and both have to
+    # be in the window before anybody looks.
+    state = a_leaking_scenario_state()
+
+    state.seed(SCENARIOS[RESOURCE_LEAK])
+
+    active = state.active
+
+    assert active is not None
+    assert active.leak_started_at is not None
+    assert utc_now() - active.leak_started_at >= timedelta(
+        minutes=get_scenario_settings().leak_backdate_minutes
+    )
+
+
+def test_staging_a_leak_moves_no_flag() -> None:
+    # Nothing here is a flag's doing, so nothing may look like one. A toggle
+    # recorded while staging this would hand the investigation a suspect the
+    # fixture invented.
+    flags = a_flag_client_reporting(False)
+    state = a_leaking_scenario_state(flags)
+
+    flags.enable.reset_mock()
+    state.seed(SCENARIOS[RESOURCE_LEAK])
+
+    assert flags.enable.call_count == 0
+
+
+def test_a_leak_nobody_has_restarted_is_still_running() -> None:
+    state = a_leaking_scenario_state()
+
+    state.seed(SCENARIOS[RESOURCE_LEAK])
+
+    assert state.phase() == RUNNING
+
+
+def test_a_restart_is_recorded_as_the_moment_it_happened() -> None:
+    state = a_leaking_scenario_state()
+    state.seed(SCENARIOS[RESOURCE_LEAK])
+
+    restarted_at = state.restart_the_shop()
+
+    active = state.active
+
+    assert active is not None
+    assert active.restarts == (restarted_at,)
+
+
+def test_a_restart_takes_away_what_the_shop_had_accumulated() -> None:
+    state = a_leaking_scenario_state()
+    state.seed(SCENARIOS[RESOURCE_LEAK])
+    record_visit("shopper-1", "2000")
+
+    state.restart_the_shop()
+
+    assert how_many_shoppers_are_remembered() == 0
+
+
+def test_every_restart_is_kept_rather_than_replacing_the_last() -> None:
+    # A restart has to stay in the window it happened in. A single moving
+    # instant would flatten the climb before it and take the incident out of
+    # the record the moment it was mitigated a second time.
+    state = a_leaking_scenario_state()
+    state.seed(SCENARIOS[RESOURCE_LEAK])
+
+    first = state.restart_the_shop()
+    second = state.restart_the_shop()
+
+    active = state.active
+
+    assert active is not None
+    assert active.restarts == (first, second)
+
+
+def test_a_restarted_leak_is_recovering_rather_than_running() -> None:
+    state = a_leaking_scenario_state()
+    state.seed(SCENARIOS[RESOURCE_LEAK])
+
+    state.restart_the_shop()
+
+    assert state.phase() == RECOVERING
+
+
+def test_restarting_with_nothing_staged_still_clears_the_shop() -> None:
+    # A platform restarts whatever is running. Refusing because this service
+    # has no scenario in mind would make the control lie about what it is.
+    state = a_leaking_scenario_state()
+    record_visit("shopper-1", "2000")
+
+    state.restart_the_shop()
+
+    assert how_many_shoppers_are_remembered() == 0
+
+
+def test_resetting_clears_what_the_shop_accumulated() -> None:
+    state = a_leaking_scenario_state()
+    state.seed(SCENARIOS[RESOURCE_LEAK])
+    record_visit("shopper-1", "2000")
+
+    state.reset()
+
+    assert how_many_shoppers_are_remembered() == 0
+
+
+def test_resetting_a_leak_moves_no_flag() -> None:
+    # Nothing was staged with one, so there is nothing to put back - and a
+    # toggle here would be housekeeping that the next investigation reads as
+    # evidence.
+    flags = a_flag_client_reporting(False)
+    state = a_leaking_scenario_state(flags)
+    state.seed(SCENARIOS[RESOURCE_LEAK])
+    flags.enable.reset_mock()
+    flags.disable.reset_mock()
+
+    state.reset()
+
+    assert flags.enable.call_count == 0
+    assert flags.disable.call_count == 0
