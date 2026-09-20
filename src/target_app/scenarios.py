@@ -210,8 +210,8 @@ CACHE_MISCONFIGURED = "cache-misconfigured"
 #
 # Filled in after the commit exists, which is why it is a constant here and not
 # a literal in the scenario - the commit cannot name itself.
-THE_COMMIT_THAT_MOVED_THE_CACHE_PORT = "0" * 40
-THE_COMMIT_BEFORE_IT = "0" * 40
+THE_COMMIT_THAT_MOVED_THE_CACHE_PORT = "0d8e826225f0de73958a8a8dd3d867b2ae249e72"
+THE_COMMIT_BEFORE_IT = "544cef36a8eaf45c5b030c3d5c21473d8176cef3"
 FALLBACK_DISABLED = "fallback-disabled"
 FLAG_TOGGLE_RED_HERRING = "flag-toggle-red-herring"
 COMPETING_FLAG_CHANGES = "competing-flag-changes"
