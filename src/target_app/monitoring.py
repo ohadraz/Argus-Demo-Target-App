@@ -26,6 +26,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from target_app.scenarios import (
     BAD_DEPLOYMENT,
+    CACHE_MISCONFIGURED,
     RESOURCE_LEAK,
     TIMESTAMP_FORMAT,
     utc_now,
@@ -59,6 +60,14 @@ _HIGH_MEMORY_USAGE = "HighMemoryUsage"
 # about a climb, not an outage.
 _WHAT_FIRED: dict[str, tuple[str, str]] = {
     BAD_DEPLOYMENT: (_HIGH_LATENCY, "p95 latency above threshold for 5m"),
+    # The median rather than the tail, and that is the scenario rather than a
+    # detail: nine requests in ten were served from cache, so the tail always
+    # described a recomputed page and barely moves when the cache goes. A rule
+    # written against p95 - which is how most latency alerting is written -
+    # would never fire on this at all.
+    CACHE_MISCONFIGURED: (
+        _HIGH_LATENCY, "p50 latency above threshold for 5m"
+    ),
     RESOURCE_LEAK: (
         _HIGH_MEMORY_USAGE,
         "Memory usage climbing against the container limit for 15m",

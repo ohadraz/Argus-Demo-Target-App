@@ -7,6 +7,12 @@ from pathlib import PurePath
 from io_shop.accounts import Account
 from io_shop.payment_provider import AskTheProvider, card_on_file
 from io_shop.spend_summary import render_spend_summary
+from io_shop.summary_cache import (
+    CacheEndpoint,
+    CacheUnreachable,
+    LookUpSummary,
+    cached_summary,
+)
 from io_shop.visits import record_visit
 
 """Serving one account page - the shop's request boundary.
@@ -30,16 +36,30 @@ class RenderedPage:
     reach the log and what a reader diagnoses from. A generic "request failed"
     would describe every incident equally, and the error's words alone name a
     fault without naming where it lives.
+
+    `served_from_cache` says whether the figure was read rather than worked out.
+    It is reported on a page that rendered perfectly well, because it is the
+    difference between the two ways of rendering perfectly well - and the share
+    of requests taking each is what says whether the shop's fast path is there.
+
+    `cache_failure` carries the words of a cache that could not be reached. It
+    sits beside `failure` rather than in it, and the distinction is the whole
+    scenario: this is a page that *succeeded* while something underneath it was
+    broken, so a reader sees it in the logs without seeing it in the error rate.
     """
 
     figure_cents: int | None
     card_last_four: str | None
     failure: str | None
+    served_from_cache: bool = False
+    cache_failure: str | None = None
 
 
 def serve_account_page(account: Account,
                        use_monthly_summary: bool,
-                       ask_the_provider: AskTheProvider) -> RenderedPage:
+                       ask_the_provider: AskTheProvider,
+                       look_up_summary: LookUpSummary | None = None,
+                       cache_endpoint: CacheEndpoint | None = None) -> RenderedPage:
     """Renders the account page, reporting a failure rather than raising one.
 
     Two things are shown and both are needed: what the shopper averages per
@@ -52,10 +72,16 @@ def serve_account_page(account: Account,
     request is one of the ones the new figure is live for. The page does not
     make that decision itself; it is told, the way a handler is told by the flag
     SDK that evaluated for this user.
+
+    `look_up_summary` and `cache_endpoint` are how the figure is looked for
+    before it is worked out. Both optional and both absent together, because a
+    deployment that configured no cache has none - and a page that insisted on
+    one would make an optimisation into a requirement, which is the very thing
+    this shop's cache is not.
     """
     try:
-        figure_cents = render_spend_summary(
-            account, use_monthly_summary=use_monthly_summary
+        figure_cents, from_cache, cache_failure = _the_figure_for(
+            account, use_monthly_summary, look_up_summary, cache_endpoint
         )
         card = card_on_file(account.shopper_id, ask_the_provider)
     except Exception as error:  # noqa: BLE001 - the boundary records anything
@@ -68,7 +94,47 @@ def serve_account_page(account: Account,
 
     return RenderedPage(figure_cents=figure_cents,
                         card_last_four=card.last_four,
-                        failure=None)
+                        failure=None,
+                        served_from_cache=from_cache,
+                        cache_failure=cache_failure)
+
+
+def _the_figure_for(
+    account: Account,
+    use_monthly_summary: bool,
+    look_up_summary: LookUpSummary | None,
+    cache_endpoint: CacheEndpoint | None
+) -> tuple[int, bool, str | None]:
+    """The figure to show, whether it came from the cache, and what the cache
+    said if it could not be reached.
+
+    The cache is asked first and is allowed to fail. Whatever it does - answers
+    with a figure, answers with nothing, or cannot be reached at all - this
+    returns a figure, because the shop can always work one out. That is the
+    fallback the whole scenario rests on: the page is correct either way, and
+    the only thing the cache decides is how long getting here took.
+
+    A cache failure is returned rather than raised onward, because it is not
+    this request's failure. The request succeeded.
+    """
+    if look_up_summary is None or cache_endpoint is None:
+        return render_spend_summary(
+            account, use_monthly_summary=use_monthly_summary
+        ), False, None
+
+    cache_failure: str | None = None
+
+    try:
+        found = cached_summary(account.shopper_id, look_up_summary, cache_endpoint)
+    except CacheUnreachable as unreachable:
+        found, cache_failure = None, str(unreachable)
+
+    if found is not None:
+        return found, True, cache_failure
+
+    return render_spend_summary(
+        account, use_monthly_summary=use_monthly_summary
+    ), False, cache_failure
 
 
 def _where_it_was_raised(error: BaseException) -> str:

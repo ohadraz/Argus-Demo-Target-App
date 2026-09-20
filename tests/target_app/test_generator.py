@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from io_shop.payment_provider import PROVIDER_HOST
+from io_shop.summary_cache import CacheEndpoint
 from target_app.generator import (
     BASELINE_MEMORY_BYTES,
     LEAK_CLIMB_BYTES_PER_MINUTE,
     MEMORY_LIMIT_BYTES,
+    CacheOutage,
     FlagTimeline,
     GeneratedMinute,
     ProviderOutage,
@@ -87,6 +89,34 @@ def test_latency_stays_flat_while_the_error_rate_moves() -> None:
 
     assert degraded.error_rate > CLEARLY_DEGRADED
     assert abs(degraded.p95_ms - calm.p95_ms) < calm.p95_ms // 2
+
+
+def test_the_median_is_no_noisier_than_the_tail_in_proportion() -> None:
+    # The tail is the jittery quantile in any real service, and the median is
+    # the steady one. This used to be the other way round here, because both
+    # took the same absolute wobble - which made the median +/-18% of its
+    # baseline against the tail's +/-4%, and left the steadiest thing the shop
+    # reports looking like its noisiest. A detector reading the median then
+    # found departures in the noise: it dated a flag incident a minute before
+    # the flag was turned on.
+    minutes = generate(None, SOME_NOW, SOME_SPAN_MINUTES, flag="dont-care-flag")
+
+    medians = [minute.p50_ms for minute in minutes]
+    tails = [minute.p95_ms for minute in minutes]
+
+    assert _spread_as_fraction_of(medians) <= _spread_as_fraction_of(tails)
+
+
+def _spread_as_fraction_of(values: list[int]) -> float:
+    """How much a quiet series wobbles, relative to where it sits.
+
+    A fraction rather than a count of milliseconds, because that is the whole
+    question: two series at different magnitudes are being compared, and their
+    absolute spreads say nothing about which of them is the noisier.
+    """
+    calmest = min(values)
+
+    return (max(values) - calmest) / calmest
 
 
 def test_a_completed_minute_reads_the_same_every_time() -> None:
@@ -605,3 +635,101 @@ def test_a_scenario_with_no_outage_leaves_the_provider_answering() -> None:
     minutes = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES)
 
     assert PROVIDER_HOST not in " ".join(minute_at(5, minutes).log_lines)
+
+
+SOME_CACHE_ENDPOINT = CacheEndpoint(host="cache.io-shop.svc.cluster.local", port=6380)
+
+
+def a_window_with_the_cache_lost(began_minutes_ago: int) -> list[GeneratedMinute]:
+    return generate(
+        None,
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="dont-care-flag",
+        cache_endpoint=SOME_CACHE_ENDPOINT,
+        cache_outage=CacheOutage(
+            began_at=SOME_NOW - timedelta(minutes=began_minutes_ago)
+        ),
+    )
+
+
+def a_window_with_a_working_cache() -> list[GeneratedMinute]:
+    return generate(None, SOME_NOW, SOME_SPAN_MINUTES, flag="dont-care-flag",
+                    cache_endpoint=SOME_CACHE_ENDPOINT)
+
+
+def test_a_shop_with_no_cache_configured_reports_no_hit_ratio() -> None:
+    # Absent rather than zero. Zero is what a cache answering nothing reports,
+    # and a deployment without one has no fast path to have lost.
+    minutes = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES)
+
+    assert minute_at(5, minutes).cache_hit_ratio is None
+
+
+def test_a_working_cache_carries_most_of_the_traffic() -> None:
+    minutes = a_window_with_a_working_cache()
+
+    carried = minute_at(5, minutes).cache_hit_ratio
+
+    assert carried is not None
+    assert carried > 0.8
+
+
+def test_losing_the_cache_takes_the_hit_ratio_to_nothing() -> None:
+    minutes = a_window_with_the_cache_lost(began_minutes_ago=10)
+
+    assert minute_at(3, minutes).cache_hit_ratio == 0.0
+
+
+def test_losing_the_cache_moves_the_median_and_leaves_the_tail_alone() -> None:
+    # The property the whole scenario exists for. Nine requests in ten were
+    # served from cache, so the tail already described a recomputed page before
+    # anything went wrong - losing the cache moves it from one miss to another.
+    # The median steps from the cached path to the recomputed one.
+    #
+    # An incident visible only here is one a monitoring stack watching p95
+    # never sees, which is exactly the case worth staging.
+    minutes = a_window_with_the_cache_lost(began_minutes_ago=10)
+
+    calm = minute_at(15, minutes)
+    degraded = minute_at(3, minutes)
+
+    assert degraded.p50_ms > calm.p50_ms * 4
+    assert degraded.p95_ms < calm.p95_ms * 1.5
+
+
+def test_losing_the_cache_does_not_move_the_error_rate() -> None:
+    # The fallback is the designed behaviour: every page still renders, and
+    # renders correctly. That is why nobody is paged.
+    minutes = a_window_with_the_cache_lost(began_minutes_ago=10)
+
+    assert minute_at(3, minutes).error_rate < CLEARLY_HEALTHY
+
+
+def test_an_unreachable_cache_names_its_endpoint_in_the_logs() -> None:
+    # The port set against the values file is the diagnosis.
+    minutes = a_window_with_the_cache_lost(began_minutes_ago=10)
+
+    said = " ".join(minute_at(3, minutes).log_lines)
+
+    assert "cache.io-shop.svc.cluster.local" in said
+    assert "6380" in said
+
+
+def test_a_working_cache_says_nothing_about_itself() -> None:
+    # Quiet while it works, for the reason the heap lines are: a service that
+    # reported a healthy cache every minute would bury the minute it stopped.
+    minutes = a_window_with_a_working_cache()
+
+    assert "summary cache" not in " ".join(minute_at(5, minutes).log_lines)
+
+
+def test_the_cache_changes_nothing_for_a_scenario_that_stages_none() -> None:
+    # The cache draws from a sequence of its own, so consulting it cannot move
+    # a figure drawn from the shared one. This is what lets every other
+    # scenario stay exactly as it was.
+    without = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES)
+    again = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES)
+
+    assert [(m.p50_ms, m.p95_ms, m.error_rate) for m in without] == \
+           [(m.p50_ms, m.p95_ms, m.error_rate) for m in again]

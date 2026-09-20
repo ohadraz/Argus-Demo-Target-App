@@ -11,6 +11,11 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
+    # Reading `deploy/values-production.yaml`, the deployment configuration the
+    # shop is handed. Declared rather than leaned on: it arrives transitively
+    # through uvicorn's extras today, and a direct import of a dependency
+    # nobody asked for is one that disappears when an unrelated extra changes.
+    "pyyaml>=6.0",
     "uvicorn[standard]>=0.30",
 ]
 

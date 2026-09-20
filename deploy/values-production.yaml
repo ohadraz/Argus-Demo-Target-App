@@ -1,0 +1,25 @@
+# Deployment configuration for the io-shop account service, production.
+#
+# Rendered into the cluster as a ConfigMap and mounted into the pod, which is
+# why the service reads this file rather than being handed environment
+# variables: the values here are the deployment's, not the code's, and changing
+# one is a change to configuration that ships without the service being rebuilt.
+#
+# Owned by whoever runs the shop. Changes here go out the way any other change
+# goes out - reviewed, merged, and synced by the platform - and land without a
+# single line of io-shop's source being touched.
+
+replicas: 3
+
+resources:
+  memoryLimitMiB: 2048
+
+# Where the rendered-summary cache lives.
+#
+# The account page reads this cache before it works a shopper's spend figure
+# out, and recomputes when the cache has nothing or cannot be reached. So the
+# shop stays correct whatever is written here - it only stays *fast* while the
+# address is right.
+cache:
+  host: cache.io-shop.svc.cluster.local
+  port: 6379

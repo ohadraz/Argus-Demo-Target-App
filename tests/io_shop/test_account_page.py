@@ -6,6 +6,7 @@ from io_shop import payment_provider, spend_summary
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
+from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
 
 """The shop's request boundary: what a caller sees when the page fails.
 
@@ -140,3 +141,81 @@ def test_a_provider_failure_names_the_provider_and_the_status() -> None:
     assert page.failure.startswith("PaymentProviderFailed: ")
     assert payment_provider.PROVIDER_HOST in page.failure
     assert "503" in page.failure
+
+
+def a_cache_holding(summary_cents: int) -> LookUpSummary:
+    return lambda dont_care_shopper: CacheAnswer(
+        reached=True, summary_cents=summary_cents
+    )
+
+
+def a_cache_holding_nothing() -> LookUpSummary:
+    return lambda dont_care_shopper: CacheAnswer(reached=True)
+
+
+def a_cache_that_cannot_be_reached() -> LookUpSummary:
+    return lambda dont_care_shopper: CacheAnswer(reached=False)
+
+
+SOME_CACHE_ENDPOINT = CacheEndpoint(host="cache.io-shop.svc.cluster.local", port=6379)
+
+
+def test_a_page_whose_figure_was_cached_says_so() -> None:
+    page = serve_account_page(an_account_idle_this_month(1000, 3000),
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              look_up_summary=a_cache_holding(999),
+                              cache_endpoint=SOME_CACHE_ENDPOINT)
+
+    assert page.figure_cents == 999
+    assert page.served_from_cache
+
+
+def test_a_miss_is_computed_and_the_page_is_still_correct() -> None:
+    account = an_account_idle_this_month(1000, 3000)
+
+    computed = serve_account_page(account,
+                                  use_monthly_summary=False,
+                                  ask_the_provider=a_provider_holding_a_card(),
+                                  look_up_summary=a_cache_holding_nothing(),
+                                  cache_endpoint=SOME_CACHE_ENDPOINT)
+    without_a_cache_at_all = serve_account_page(
+        account,
+        use_monthly_summary=False,
+        ask_the_provider=a_provider_holding_a_card()
+    )
+
+    assert computed.figure_cents == without_a_cache_at_all.figure_cents
+    assert not computed.served_from_cache
+
+
+def test_a_cache_nobody_can_reach_does_not_fail_the_page() -> None:
+    # The whole scenario rests on this. The fallback is the designed behaviour,
+    # so losing the cache is a slowdown and not an outage - which is exactly
+    # why nobody notices it in the error rate.
+    account = an_account_idle_this_month(1000, 3000)
+
+    page = serve_account_page(account,
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              look_up_summary=a_cache_that_cannot_be_reached(),
+                              cache_endpoint=SOME_CACHE_ENDPOINT)
+
+    assert page.failure is None
+    assert page.figure_cents is not None
+    assert not page.served_from_cache
+
+
+def test_an_unreachable_cache_is_reported_beside_the_failure_not_in_it() -> None:
+    # A page that succeeded while something underneath it was broken. The
+    # distinction is the incident: a reader sees this in the logs without
+    # seeing it in the error rate.
+    page = serve_account_page(an_account_idle_this_month(1000, 3000),
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              look_up_summary=a_cache_that_cannot_be_reached(),
+                              cache_endpoint=SOME_CACHE_ENDPOINT)
+
+    assert page.failure is None
+    assert page.cache_failure is not None
+    assert "6379" in page.cache_failure

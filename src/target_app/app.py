@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,7 @@ from target_app.scenarios import (
     FEATURE_FLAG,
     FEATURE_FLAG_TOGGLE,
     SCENARIOS,
+    THE_COMMIT_BEFORE_IT,
     TIMESTAMP_FORMAT,
     Scenario,
     bucket_id,
@@ -37,13 +38,23 @@ from target_app.scenarios import (
     quiet_state_for,
     scenario_span_minutes,
 )
-from target_app.settings import get_unleash_settings
+from target_app.settings import get_scenario_settings, get_unleash_settings
 from target_app.state import ScenarioState
 
 # How much history the generated channels serve. Wide enough that a reader
 # looking for the service's calm baseline finds plenty of it either side of an
 # incident, and narrow enough that generating it stays cheap.
 GENERATED_SPAN_MINUTES = 90
+
+# How long before the change that broke it the previous revision went out. Far
+# enough back to be outside the incident and plainly not its cause, close
+# enough to be in a history a responder is looking at.
+_A_PREVIOUS_DEPLOY_AGO = timedelta(hours=4)
+
+
+def to_bucket_id(moment: datetime) -> str:
+    """One instant as the minute id every other channel spells it with."""
+    return moment.replace(second=0, microsecond=0).strftime(TIMESTAMP_FORMAT)
 
 flags = FlagClient()
 # The second flag guards the safe path, so the shop is well while it is on.
@@ -259,6 +270,14 @@ class MetricBucket(BaseModel):
     memory_used_bytes: int
     memory_limit_bytes: int | None = None
     process_start_time_seconds: float
+    # How much of the minute's work the summary cache carried. A rate over the
+    # minute like the error rate, not a gauge - averaging ratios taken over
+    # unequal numbers of lookups would weight a quiet instant as heavily as a
+    # busy one. Absent, rather than zero, for a deployment with no cache
+    # configured: zero is what a cache answering nothing reports, and a reader
+    # has to be able to tell a service without a cache from one whose cache
+    # has gone.
+    cache_hit_ratio: float | None = None
 
 
 # The four models below mirror Argo CD's own wire shape, field names included -
@@ -295,9 +314,49 @@ class ArgoCdApplicationStatus(BaseModel):
     history: list[ArgoCdRevisionHistory]
 
 
+class ArgoCdAutomatedSync(BaseModel):
+    """The automated half of a sync policy.
+
+    Argo CD spells the presence of this object as "this application syncs
+    itself"; there is no boolean to read. An application with no `automated`
+    key is one a human syncs, which is why the field above it is optional
+    rather than defaulting to anything.
+    """
+
+    prune: bool = False
+    selfHeal: bool = False  # noqa: N815
+
+
+class ArgoCdSyncPolicy(BaseModel):
+    automated: ArgoCdAutomatedSync | None = None
+
+
+class ArgoCdApplicationSpec(BaseModel):
+    syncPolicy: ArgoCdSyncPolicy = ArgoCdSyncPolicy()  # noqa: N815
+
+
 class ArgoCdApplication(BaseModel):
     metadata: ArgoCdApplicationMetadata
+    # Before `status`, as Argo CD orders them: the spec is what was asked for
+    # and the status is what happened. A rollback reads both - it cannot run
+    # while the spec says the application syncs itself, because the next
+    # reconciliation would undo it.
+    spec: ArgoCdApplicationSpec = ArgoCdApplicationSpec()
     status: ArgoCdApplicationStatus
+
+
+class ArgoCdRollback(BaseModel):
+    """The body Argo CD's rollback endpoint takes.
+
+    `id` is the history entry to return to - the same integer the application's
+    revision history reports, which is how a caller names a revision that was
+    actually deployed rather than any commit it happens to know about.
+    """
+
+    name: str | None = None
+    id: int
+    prune: bool = False
+    dryRun: bool = False  # noqa: N815
 
 
 @app.get("/health")
@@ -487,6 +546,62 @@ def argocd_run_resource_action(application: str,
     return {}
 
 
+@app.put("/argocd/{application}/spec")
+def argocd_update_spec(application: str,
+                       body: ArgoCdApplicationSpec) -> ArgoCdApplicationSpec:
+    """Stands in for Argo CD's `PUT /api/v1/applications/{name}/spec`.
+
+    The one thing a caller changes through it here is the sync policy, because
+    a rollback cannot run while an application syncs itself - the platform
+    refuses, and would in any case re-apply the revision being rolled away
+    from at the next reconciliation. Suspending automated sync is therefore
+    part of rolling back rather than a separate concern, and it is the half a
+    withdrawal has to put back.
+    """
+    state.set_automated_sync(body.syncPolicy.automated is not None)
+
+    return _the_spec_now()
+
+
+@app.post("/argocd/{application}/rollback", response_model=ArgoCdApplication)
+def argocd_rollback(application: str, body: ArgoCdRollback) -> ArgoCdApplication:
+    """Stands in for Argo CD's `POST /api/v1/applications/{name}/rollback`.
+
+    Returns the application to a revision it has already deployed. Nothing is
+    written to the repository - that is the whole reason this is a mitigation
+    Argus may take unasked rather than an infrastructure change somebody has to
+    approve: the revision being applied was reviewed and run before.
+
+    Refused while the application syncs itself, exactly as the real platform
+    refuses it. That is not a limitation being modelled for fidelity's sake -
+    it is the fact that makes a rollback honestly a *mitigation*: the values
+    file still names the port that broke this, so whatever brought the bad
+    revision in will bring it back the moment it is allowed to.
+
+    Refused, too, for a history entry that does not exist. A platform that
+    accepted a rollback to a revision it never deployed would have a caller
+    believe production had moved when it had not.
+    """
+    if state.syncs_itself:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "cannot rollback an application with automated sync enabled - "
+                "disable it first"
+            ),
+        )
+
+    if body.id not in {entry.id for entry in _the_revision_history()}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"no revision history entry with id {body.id}",
+        )
+
+    state.roll_the_configuration_back()
+
+    return argocd_application(application)
+
+
 @app.post("/monitoring/alert", response_model=AlertRaised)
 def raise_alert() -> AlertRaised:
     """Fires the alert the shop's monitoring would fire, at whatever is
@@ -549,6 +664,7 @@ def metrics() -> list[MetricBucket]:
                 memory_used_bytes=minute.memory_used_bytes,
                 memory_limit_bytes=minute.memory_limit_bytes,
                 process_start_time_seconds=minute.process_start_time_seconds,
+                cache_hit_ratio=minute.cache_hit_ratio,
             )
             for minute in _generated_minutes()
         ]
@@ -689,19 +805,92 @@ def argocd_application(application: str) -> ArgoCdApplication:
 
     A scenario with no deploy returns an empty history rather than an error: no
     deploy is a real answer, and the whole reason this endpoint exists is to let
-    a consumer tell an incident a deploy caused from one it did not. A generated
-    scenario has no deploys at all, and answers the same way.
+    a consumer tell an incident a deploy caused from one it did not.
+
+    Being generated is not itself an answer to whether anything was deployed.
+    Most generated scenarios stage a state - a flag, a heap, somebody else's
+    outage - and deployed nothing; one stages a change, and the change is a
+    deploy like any other. So the question asked here is whether the scenario
+    has a deploy, not how its telemetry is produced.
     """
-    metadata = ArgoCdApplicationMetadata(name=application, namespace="argocd")
+    return ArgoCdApplication(
+        metadata=ArgoCdApplicationMetadata(name=application, namespace="argocd"),
+        spec=_the_spec_now(),
+        status=ArgoCdApplicationStatus(history=_the_revision_history()),
+    )
+
+
+def _the_spec_now() -> ArgoCdApplicationSpec:
+    """The application's spec, which here is its sync policy and nothing else.
+
+    Argo CD spells "this application syncs itself" as the presence of an
+    `automated` object rather than as a boolean, so suspending it is the
+    removal of a key - which is exactly what a caller has to do before a
+    rollback, and exactly what an undo has to put back.
+    """
+    if not state.syncs_itself:
+        return ArgoCdApplicationSpec(syncPolicy=ArgoCdSyncPolicy())
+
+    return ArgoCdApplicationSpec(
+        syncPolicy=ArgoCdSyncPolicy(automated=ArgoCdAutomatedSync())
+    )
+
+
+def _the_revision_history() -> list[ArgoCdRevisionHistory]:
+    """What this application has had deployed to it, oldest first.
+
+    Two sources, because a deploy can be staged two ways. An authored scenario
+    hangs one on whichever of its minutes it landed in; a generated scenario
+    that stages a change carries it whole, and is given a parent entry beside
+    it - the revision that was running before. The parent is not decoration: a
+    rollback is addressed to a history entry, so a history with one entry is a
+    history nothing can be rolled back to.
+    """
     active = state.active
 
-    if active is None or active.seeded_at is None or active.scenario.is_generated:
-        return ArgoCdApplication(
-            metadata=metadata, status=ArgoCdApplicationStatus(history=[])
+    if active is None or active.seeded_at is None:
+        return []
+
+    if active.scenario.deploy is not None:
+        landed = active.seeded_at - timedelta(
+            minutes=get_scenario_settings().onset_backdate_minutes
         )
 
+        return [
+            ArgoCdRevisionHistory(
+                id=1,
+                revision=THE_COMMIT_BEFORE_IT,
+                deployedAt=to_bucket_id(landed - _A_PREVIOUS_DEPLOY_AGO),
+                deployStartedAt=to_bucket_id(
+                    landed - _A_PREVIOUS_DEPLOY_AGO - timedelta(minutes=1)
+                ),
+                source=ArgoCdSource(
+                    repoURL=active.scenario.deploy.repo_url,
+                    path=active.scenario.deploy.path,
+                    targetRevision=active.scenario.deploy.target_revision,
+                ),
+                initiatedBy=ArgoCdInitiator(username=active.scenario.deploy.initiated_by),
+            ),
+            ArgoCdRevisionHistory(
+                id=2,
+                revision=active.scenario.deploy.revision,
+                deployedAt=to_bucket_id(landed),
+                deployStartedAt=to_bucket_id(landed - timedelta(minutes=1)),
+                source=ArgoCdSource(
+                    repoURL=active.scenario.deploy.repo_url,
+                    path=active.scenario.deploy.path,
+                    targetRevision=active.scenario.deploy.target_revision,
+                ),
+                initiatedBy=ArgoCdInitiator(username=active.scenario.deploy.initiated_by),
+            ),
+        ]
+
+    if active.scenario.is_generated:
+        return []
+
     span_minutes = scenario_span_minutes(active.scenario)
-    history = [
+
+    return [
         ArgoCdRevisionHistory(
             id=index,
             revision=entry.deploy.revision,
@@ -722,10 +911,6 @@ def argocd_application(application: str) -> ArgoCdApplication:
         for index, entry in enumerate(active.scenario.minutes, start=1)
         if entry.deploy is not None
     ]
-
-    return ArgoCdApplication(
-        metadata=metadata, status=ArgoCdApplicationStatus(history=history)
-    )
 
 
 def _generated_minutes() -> list[GeneratedMinute]:
@@ -762,6 +947,8 @@ def _generated_minutes() -> list[GeneratedMinute]:
         leak_started_at=active.leak_started_at if active else None,
         restarts=active.restarts if active else (),
         provider_outage=active.provider_outage if active else None,
+        cache_endpoint=active.cache_endpoint if active else None,
+        cache_outage=active.cache_outage if active else None,
     )
 
 

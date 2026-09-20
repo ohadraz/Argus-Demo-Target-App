@@ -135,6 +135,17 @@ class Scenario:
     what is wrong - which is what makes it the one scenario where the correct
     outcome is that Argus takes nothing and hands the incident to a person.
 
+    `cache_is_misconfigured` stages the fourth generated kind, and the only one
+    where nothing is broken at all. The shop's summary cache is up and
+    answering; a configuration change pointed the shop at the wrong port, so
+    every lookup fails to connect and every page recomputes. The page is still
+    correct - the fallback is the designed behaviour - so the error rate never
+    moves, and because nine requests in ten were cached, the tail already
+    described a recomputed page and barely moves either. Only the median steps.
+    That makes it the one scenario an aggregate-watching monitor cannot see,
+    and the one whose fix is a value rather than a toggle, a restart or a
+    commit.
+
     `offered_in_console` is presentation only. A scenario kept for the capability
     it pins down is not automatically one worth showing an audience; hiding it
     leaves it seedable by id, which is how the e2e suite stages it.
@@ -150,6 +161,14 @@ class Scenario:
     decoy_flag_role: str | None = None
     leaks: bool = False
     upstream_fails: bool = False
+    cache_is_misconfigured: bool = False
+    # The deploy a *generated* scenario stages, for the one whose cause is a
+    # change rather than a state. An authored scenario carries its deploys on
+    # its minutes; a generated one has no minutes to hang them on, and a
+    # generated scenario caused by a configuration change needs the change to
+    # be readable somewhere - so it is here, and the revision it names is a
+    # real commit whose diff against its parent is the diagnosis.
+    deploy: ScenarioDeploy | None = None
     offered_in_console: bool = True
 
     @property
@@ -160,13 +179,16 @@ class Scenario:
     def stages_a_flag(self) -> bool:
         """Whether this scenario's incident is a flag's doing.
 
-        Two generated scenarios are not: a leak is the process's own
-        accumulation, and an upstream failure is another company's service. A
-        page offering a flag to watch for either would be offering a control
-        that changes nothing, and naming a flag as the thing that breaks the
-        shop would be pointing at a suspect the fixture invented.
+        Three generated scenarios are not: a leak is the process's own
+        accumulation, an upstream failure is another company's service, and a
+        misconfigured cache is a value in a file. A page offering a flag to
+        watch for any of them would be offering a control that changes
+        nothing, and naming a flag as the thing that breaks the shop would be
+        pointing at a suspect the fixture invented.
         """
-        return self.is_generated and not (self.leaks or self.upstream_fails)
+        return self.is_generated and not (
+            self.leaks or self.upstream_fails or self.cache_is_misconfigured
+        )
 
     @property
     def healthy_flag_state(self) -> bool:
@@ -179,6 +201,17 @@ FEATURE_FLAG_TOGGLE = "feature-flag-toggle"
 BAD_DEPLOYMENT = "bad-deployment"
 RESOURCE_LEAK = "resource-leak"
 UPSTREAM_DEPENDENCY_FAILURE = "upstream-dependency-failure"
+CACHE_MISCONFIGURED = "cache-misconfigured"
+
+# The commit that moved the cache's port in `deploy/values-production.yaml`,
+# and its parent. Real commits in this repository: the diagnosis is the diff
+# between them, so these are looked up rather than invented, and rewriting this
+# repository's history would break the one scenario that reads it.
+#
+# Filled in after the commit exists, which is why it is a constant here and not
+# a literal in the scenario - the commit cannot name itself.
+THE_COMMIT_THAT_MOVED_THE_CACHE_PORT = "0" * 40
+THE_COMMIT_BEFORE_IT = "0" * 40
 FALLBACK_DISABLED = "fallback-disabled"
 FLAG_TOGGLE_RED_HERRING = "flag-toggle-red-herring"
 COMPETING_FLAG_CHANGES = "competing-flag-changes"
@@ -280,6 +313,34 @@ SCENARIOS: dict[str, Scenario] = {
             "happened and escalates it to somebody who can call them."
         ),
         upstream_fails=True,
+    ),
+    CACHE_MISCONFIGURED: Scenario(
+        id=CACHE_MISCONFIGURED,
+        title="The cache is on the wrong port",
+        description=(
+            "Io's account page reads a shopper's spend figure from a cache "
+            "before working it out, because working it out means walking their "
+            "whole purchase history. A configuration change moved the cache's "
+            "port in 'deploy/values-production.yaml', so the shop now dials an "
+            "address nothing is listening on. The cache itself is up and well. "
+            "Every lookup fails to connect, every page recomputes, and every "
+            "page is still correct - the fallback is the designed behaviour, "
+            "so the error rate never moves and nobody is paged for a failure. "
+            "What moves is the median: nine requests in ten used to be served "
+            "from cache, and now none are. The tail barely stirs, because the "
+            "slowest one in twenty was always a recomputed page - which makes "
+            "this the one incident a monitor watching p95 cannot see. Nothing "
+            "in the source changed, no flag was touched, and a restart brings "
+            "back a shop reading the same configuration. What ends it is "
+            "rolling the deployment back to the revision before the port moved."
+        ),
+        cache_is_misconfigured=True,
+        deploy=ScenarioDeploy(
+            revision=THE_COMMIT_THAT_MOVED_THE_CACHE_PORT,
+            repo_url="https://github.com/ohadraz/Argus-Demo-Target-App",
+            path="deploy",
+            initiated_by="kuki",
+        ),
     ),
     BAD_DEPLOYMENT: Scenario(
         id=BAD_DEPLOYMENT,

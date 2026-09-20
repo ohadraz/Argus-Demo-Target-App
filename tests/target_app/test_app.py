@@ -15,7 +15,11 @@ from target_app import app as app_module
 from target_app.app import RESTART_ACTION, app
 from target_app.flags import FlagClient
 from target_app.generator import BASELINE_MEMORY_BYTES
-from target_app.scenarios import RESOURCE_LEAK, UPSTREAM_DEPENDENCY_FAILURE
+from target_app.scenarios import (
+    CACHE_MISCONFIGURED,
+    RESOURCE_LEAK,
+    UPSTREAM_DEPENDENCY_FAILURE,
+)
 from target_app.state import ScenarioState
 
 """The service's own endpoints, asked the way anybody actually asks them.
@@ -279,3 +283,94 @@ def test_resetting_ends_the_outage(client: TestClient) -> None:
     assert reset.status_code == 200
     assert client.get("/scenario/status").json()["active_scenario"] is None
     assert client.get("/metrics").json() == []
+
+
+def a_staged_cache_misconfiguration(client: TestClient) -> None:
+    seeded = client.post("/scenario/seed", json={"scenario_id": CACHE_MISCONFIGURED})
+
+    assert seeded.status_code == 200
+
+
+def suspend_automated_sync(client: TestClient) -> None:
+    client.put("/argocd/io-shop/spec", json={"syncPolicy": {}})
+
+
+def test_the_cache_scenario_is_seedable_by_id(client: TestClient) -> None:
+    a_staged_cache_misconfiguration(client)
+
+    assert client.get("/scenario/status").json()["active_scenario"] == CACHE_MISCONFIGURED
+
+
+def test_a_generated_scenario_can_carry_a_deploy(client: TestClient) -> None:
+    # Being generated is not an answer to whether anything was deployed. This
+    # one's cause *is* a deploy, and a history that reported none would hide
+    # the only evidence that names it.
+    a_staged_cache_misconfiguration(client)
+
+    history = client.get("/argocd/io-shop").json()["status"]["history"]
+
+    assert len(history) == 2
+
+
+def test_a_generated_scenario_staging_no_deploy_still_reports_none(
+    client: TestClient
+) -> None:
+    a_staged_leak(client)
+
+    assert client.get("/argocd/io-shop").json()["status"]["history"] == []
+
+
+def test_the_application_reports_that_it_syncs_itself(client: TestClient) -> None:
+    # A GitOps deployment reconciles itself unless somebody stopped it, and a
+    # rollback cannot run while it does.
+    a_staged_cache_misconfiguration(client)
+
+    spec = client.get("/argocd/io-shop").json()["spec"]
+
+    assert spec["syncPolicy"]["automated"] is not None
+
+
+def test_a_rollback_is_refused_while_the_application_syncs_itself(
+    client: TestClient
+) -> None:
+    # What the real platform does, and the fact that makes a rollback a
+    # mitigation rather than a fix: whatever brought the bad revision in will
+    # bring it back the moment it is allowed to.
+    a_staged_cache_misconfiguration(client)
+
+    refused = client.post("/argocd/io-shop/rollback", json={"id": 1})
+
+    assert refused.status_code == 400
+
+
+def test_a_rollback_to_a_revision_never_deployed_is_refused(
+    client: TestClient
+) -> None:
+    a_staged_cache_misconfiguration(client)
+    suspend_automated_sync(client)
+
+    refused = client.post("/argocd/io-shop/rollback", json={"id": 99})
+
+    assert refused.status_code == 400
+
+
+def test_suspending_automated_sync_then_rolling_back_is_accepted(
+    client: TestClient
+) -> None:
+    a_staged_cache_misconfiguration(client)
+    suspend_automated_sync(client)
+
+    rolled_back = client.post("/argocd/io-shop/rollback", json={"id": 1})
+
+    assert rolled_back.status_code == 200
+
+
+def test_the_cache_scenario_reports_a_hit_ratio_and_a_flat_error_rate(
+    client: TestClient
+) -> None:
+    a_staged_cache_misconfiguration(client)
+
+    newest = the_newest_minute(client)
+
+    assert newest["cache_hit_ratio"] == 0.0
+    assert newest["error_rate"] < 0.05

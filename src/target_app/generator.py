@@ -8,6 +8,7 @@ from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
 from io_shop.rollout import CANARY_SHARE
+from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
 from target_app.settings import get_unleash_settings
 
 """Telemetry generated from live state, at the moment it is asked for.
@@ -67,7 +68,21 @@ _BASELINE_ERROR_RATE = 0.01
 _BASELINE_ERROR_RATE_WOBBLE = 0.005
 _BASELINE_P50_MS = 45
 _BASELINE_P95_MS = 215
-_LATENCY_WOBBLE_MS = 8
+# How far each latency figure wobbles minute to minute, as a fraction of the
+# figure itself rather than as a count of milliseconds. One absolute spread
+# across both quantiles is a different claim about each: ±8ms is 4% of a 215ms
+# tail and 18% of a 45ms median, which made the median by far the noisiest
+# series the shop reports. Nothing about a real service works that way, and the
+# consequence was concrete - a detector reading the median found departures in
+# the noise, and dated a flag incident a minute before the flag moved.
+#
+# The tail's fraction is the larger of the two, which is the ordinary shape: a
+# median is an average shopper's page and moves only when the service does,
+# where a tail is whichever requests were unluckiest that minute and moves on
+# its own. Getting this the right way round is what makes the median worth
+# reading at all.
+_MEDIAN_WOBBLE_AS_FRACTION_OF_BASELINE = 0.02
+_TAIL_WOBBLE_AS_FRACTION_OF_BASELINE = 0.04
 
 # What the shop's memory looks like when nothing is eating it: a working set a
 # little over a fifth of the limit, wobbling the way a garbage-collected
@@ -100,6 +115,35 @@ _A_CARD = StoredCard(brand="visa", last_four="4242")
 # waiting on somebody else is visible in the latency long before anybody reads
 # a log - which is what makes errors *and* latency this scenario's signature.
 _PROVIDER_TIMEOUT_MS = 2000
+
+# What one account page costs, by which path it took. The cached path still
+# calls the payment provider and still renders; what it skips is walking the
+# shopper's whole purchase history, which is the expensive part and the reason
+# there is a cache at all.
+_CACHED_PAGE_MS = 25
+_RECOMPUTED_PAGE_MS = 190
+# How much requests on the same path differ from each other within a minute.
+_PAGE_LATENCY_WOBBLE_MS = 12
+
+# How much of the shop's traffic the cache carries while it is reachable.
+#
+# Load-bearing, and the one number this scenario's detectability rests on. At
+# nine in ten, the tail already describes a recomputed page *before* anything
+# goes wrong - the slowest one in twenty is a miss either way - so losing the
+# cache moves the tail from one miss to another and barely registers, while the
+# median steps from the cached path to the recomputed one and multiplies
+# sevenfold. That asymmetry is the incident: the aggregate a monitoring stack
+# watches most confidently is the one that does not see this.
+#
+# Raise it past about nineteen in twenty and the tail moves too, which makes
+# the scenario ordinary and costs it the only thing it demonstrates.
+_HEALTHY_HIT_SHARE = 0.9
+
+# What the cache hands back when it holds a shopper's figure. Which figure it
+# is decides nothing - the page shows it and no metric reads it - and a cached
+# value disagreeing with a recomputed one would be a staleness bug this
+# scenario is not about.
+_A_CACHED_FIGURE_CENTS = 2400
 
 # How fast a leaking shop's heap grows. Fast enough that the climb is a climb
 # within a few minutes of anybody looking, and slow enough that the whole of it
@@ -214,6 +258,50 @@ class ProviderOutage:
 
 
 @dataclass(frozen=True)
+class CacheOutage:
+    """When the shop stopped being able to reach its cache, and when it could
+    again.
+
+    Shaped like the provider's outage and meaning something different. That one
+    is another company's service being down; this one is Io's own cache, which
+    is up the whole time - what broke is the address the shop was told to dial.
+    So there is nothing wrong with the cache, nothing wrong with the code, and
+    the thing to put back is a value in a file.
+
+    Named for the outage rather than for the address, because `CacheEndpoint`
+    is already the address and the two are different facts: the endpoint says
+    where the shop is dialling, and this says over which minutes dialling it
+    got nowhere.
+
+    `ended_at` being `None` means the shop still cannot reach it.
+    """
+
+    began_at: datetime
+    ended_at: datetime | None = None
+
+    def share_of(self, minute: datetime, elapsed_seconds: int) -> float:
+        """How much of this minute's first `elapsed_seconds` the shop spent
+        unable to reach the cache.
+
+        A share for the reason the provider's is one: the minute a
+        misconfiguration lands in is partly served from cache and partly not,
+        and reporting it as either whole would put a step where the telemetry
+        has a slope.
+        """
+        if elapsed_seconds <= 0:
+            return 0.0
+
+        window_end = minute + timedelta(seconds=elapsed_seconds)
+        lost_from = max(minute, self.began_at)
+        lost_until = window_end if self.ended_at is None else min(
+            window_end, self.ended_at
+        )
+        seconds_lost = max(0.0, (lost_until - lost_from).total_seconds())
+
+        return min(1.0, seconds_lost / elapsed_seconds)
+
+
+@dataclass(frozen=True)
 class ProcessLifetime:
     """When the shop's process came up, and every time it has come up since.
 
@@ -264,6 +352,9 @@ class GeneratedMinute:
     memory_limit_bytes: int | None
     process_start_time_seconds: float
     log_lines: tuple[str, ...]
+    # `None` where the deployment configured no cache, which is a different
+    # fact from a cache answering nothing - see `_how_much_the_cache_carried`.
+    cache_hit_ratio: float | None = None
 
 
 def generate(timeline: FlagTimeline | None,
@@ -276,7 +367,9 @@ def generate(timeline: FlagTimeline | None,
              process_started_at: datetime | None = None,
              leak_started_at: datetime | None = None,
              restarts: tuple[datetime, ...] = (),
-             provider_outage: ProviderOutage | None = None) -> list[GeneratedMinute]:
+             provider_outage: ProviderOutage | None = None,
+             cache_endpoint: CacheEndpoint | None = None,
+             cache_outage: CacheOutage | None = None) -> list[GeneratedMinute]:
     """Every minute from `span_minutes` ago up to and including the one in
     progress, once any of it has happened.
 
@@ -323,6 +416,16 @@ def generate(timeline: FlagTimeline | None,
     `provider_outage` is the stretch the payment provider spent refusing. Left
     unsaid, it answers every request, which is what every scenario that is not
     about somebody else's outage looks like.
+
+    `cache_endpoint` is where the deployment says the summary cache lives. Left
+    unsaid, the shop has no cache at all: every page computes its figure, no
+    hit ratio is reported, and latency is the baseline model every scenario
+    used before there was a cache.
+
+    `cache_outage` is the stretch the shop could not reach that endpoint over.
+    Left unsaid, a configured cache answers throughout - which is what a shop
+    with a working cache looks like, and what the minutes before this
+    scenario's onset are.
     """
     current_minute = now.replace(second=0, microsecond=0)
     elapsed_in_current = int((now - current_minute).total_seconds())
@@ -348,6 +451,8 @@ def generate(timeline: FlagTimeline | None,
             lifetime=lifetime,
             leak_started_at=leak_started_at,
             provider_outage=provider_outage,
+            cache_endpoint=cache_endpoint,
+            cache_outage=cache_outage,
         )
         for offset in range(span_minutes, 0, -1)
     ]
@@ -371,6 +476,8 @@ def generate(timeline: FlagTimeline | None,
                 lifetime=lifetime,
                 leak_started_at=leak_started_at,
                 provider_outage=provider_outage,
+                cache_endpoint=cache_endpoint,
+                cache_outage=cache_outage,
             )
         )
 
@@ -388,9 +495,17 @@ def _generate_minute(
     decoy_timeline: FlagTimeline | None = None,
     leak_started_at: datetime | None = None,
     provider_outage: ProviderOutage | None = None,
+    cache_endpoint: CacheEndpoint | None = None,
+    cache_outage: CacheOutage | None = None,
 ) -> GeneratedMinute:
     minute_id = minute.strftime(TIMESTAMP_FORMAT)
     entropy = random.Random(minute_id)
+    # A sequence of its own, so that consulting a cache on every request cannot
+    # move a single figure drawn from the one above. Seeded from the same
+    # minute, so this minute reads the same however often it is fetched.
+    cache_entropy = (
+        random.Random(f"{minute_id}-cache") if cache_endpoint is not None else None
+    )
 
     seconds_on = (
         timeline.seconds_on_within(minute, elapsed_seconds)
@@ -406,8 +521,21 @@ def _generate_minute(
         else 0.0
     )
 
+    share_of_minute_without_the_cache = (
+        cache_outage.share_of(minute, elapsed_seconds)
+        if cache_outage is not None
+        else 0.0
+    )
+
     outcomes = [
-        _serve_one_account_page(entropy, share_of_minute_flagged, share_of_minute_refused)
+        _serve_one_account_page(
+            entropy,
+            share_of_minute_flagged,
+            share_of_minute_refused,
+            cache_entropy,
+            share_of_minute_without_the_cache,
+            cache_endpoint,
+        )
         for _ in range(_SAMPLE_SIZE)
     ]
     failures = [served.failure for served in outcomes if served.failure is not None]
@@ -426,6 +554,9 @@ def _generate_minute(
     pressure = heap_bytes / MEMORY_LIMIT_BYTES
     under_pressure = _how_much_slower_under(pressure)
     failures = _with_the_allocations_that_failed(failures, pressure)
+    measured = sorted(
+        served.latency_ms for served in outcomes if served.latency_ms is not None
+    )
 
     return GeneratedMinute(
         minute_id=minute_id,
@@ -435,16 +566,27 @@ def _generate_minute(
         # flag from a bad deploy. A leak is the case where it does not stay
         # flat - the multiplier is 1 until the heap is over half the limit, so
         # every scenario that is not about memory reads exactly as it did.
-        p50_ms=round(
-            (_BASELINE_P50_MS + entropy.randint(-_LATENCY_WOBBLE_MS, _LATENCY_WOBBLE_MS))
+        #
+        # A shop with a cache reports the quantiles of what it actually served
+        # instead. That is not a second latency model so much as the honest one:
+        # a mixture of a fast path and a slow path has quantiles that cannot be
+        # written down as a baseline and a multiplier, and the whole point of
+        # this scenario is where in that mixture the 50th and the 95th fall.
+        p50_ms=_the_quantile_at(measured, 0.50) if measured else round(
+            (_BASELINE_P50_MS + _wobble_around(
+                entropy, _BASELINE_P50_MS, _MEDIAN_WOBBLE_AS_FRACTION_OF_BASELINE
+            ))
             * under_pressure
             + _waiting_on_the_provider(share_of_minute_refused)
         ),
-        p95_ms=round(
-            (_BASELINE_P95_MS + entropy.randint(-_LATENCY_WOBBLE_MS, _LATENCY_WOBBLE_MS))
+        p95_ms=_the_quantile_at(measured, 0.95) if measured else round(
+            (_BASELINE_P95_MS + _wobble_around(
+                entropy, _BASELINE_P95_MS, _TAIL_WOBBLE_AS_FRACTION_OF_BASELINE
+            ))
             * under_pressure
             + _waiting_on_the_provider(share_of_minute_refused)
         ),
+        cache_hit_ratio=_how_much_the_cache_carried(outcomes),
         request_volume=_REPORTED_VOLUME_PER_MINUTE,
         # Drawn after the latencies, so that adding memory to the bucket left
         # every figure this generator already produced exactly where it was:
@@ -467,7 +609,63 @@ def _generate_minute(
                 decoy_flag, decoy_timeline,
             ),
             heap=_heap_lines_for(minute_id, minute, heap_bytes, pressure, lifetime),
+            cache=_cache_lines_for(minute_id, outcomes),
         ),
+    )
+
+
+def _the_quantile_at(sorted_latencies: list[int], quantile: float) -> int:
+    """The latency at this quantile of what the minute actually served.
+
+    Nearest-rank, which is what a monitoring stack reporting a percentile over
+    a sample does: the value at the position the quantile lands on, not an
+    interpolation between two neighbours. A mixture of a fast path and a slow
+    one has no meaningful value *between* them, and interpolating would invent
+    latencies no request experienced.
+    """
+    position = max(0, min(len(sorted_latencies) - 1,
+                          round(quantile * len(sorted_latencies)) - 1))
+
+    return sorted_latencies[position]
+
+
+def _how_much_the_cache_carried(outcomes: list[_ServedPage]) -> float | None:
+    """The share of this minute's requests the cache answered, or `None` where
+    the deployment has no cache.
+
+    `None` rather than zero for a shop without one, because zero is what a
+    cache answering nothing reports and the two are opposite situations: one
+    has no fast path to lose and the other has just lost it.
+    """
+    if not any(served.latency_ms is not None for served in outcomes):
+        return None
+
+    return round(
+        sum(1 for served in outcomes if served.from_cache) / len(outcomes), 4
+    )
+
+
+def _cache_lines_for(minute_id: str, outcomes: list[_ServedPage]) -> tuple[str, ...]:
+    """What the shop said about its cache this minute.
+
+    Quiet while it is answering, for the reason the heap lines are quiet while
+    the heap is ordinary: a service that reported a working cache every minute
+    would bury the minute it stopped working.
+
+    One line rather than one per failed lookup. Every request failed the same
+    way at the same address, and a minute of identical lines is a minute whose
+    two informative words nobody reaches.
+    """
+    unreachable = [
+        served.cache_failure for served in outcomes if served.cache_failure is not None
+    ]
+
+    if not unreachable:
+        return ()
+
+    return (
+        f"{minute_id} ERROR io-shop: summary cache lookup failed - "
+        f"{unreachable[0]} ({len(unreachable)} of {len(outcomes)} requests)",
     )
 
 
@@ -497,6 +695,26 @@ def _the_heap_at(minute: datetime,
         MEMORY_LIMIT_BYTES,
         BASELINE_MEMORY_BYTES + int(minutes_climbing * LEAK_CLIMB_BYTES_PER_MINUTE),
     )
+
+
+def _wobble_around(entropy: random.Random,
+                   baseline_ms: int,
+                   as_fraction_of_baseline: float) -> int:
+    """How far this minute's figure sits from its baseline.
+
+    One draw, so that expressing the spread as a fraction left the sequence of
+    draws exactly as long as it was - each minute seeds one generator, and a
+    draw added or removed shifts every draw after it.
+
+    At least a millisecond, whatever the fraction works out to. Latency is
+    reported in whole milliseconds, so a small enough baseline rounds its own
+    spread away and reports the identical figure every minute - and a series
+    with no spread at all is one every later reading departs from infinitely
+    far, which is the one shape a baseline must never have.
+    """
+    spread = max(1, round(baseline_ms * as_fraction_of_baseline))
+
+    return entropy.randint(-spread, spread)
 
 
 def _how_much_slower_under(pressure: float) -> float:
@@ -628,21 +846,36 @@ def _decoy_evaluation_line(
 @dataclass(frozen=True)
 class _ServedPage:
     """What serving one account page produced: how the flag evaluated for it,
-    and the failure's own words if it failed.
+    the failure's own words if it failed, and what the request cost.
 
     The flag value is carried out rather than discarded because it is what the
     request was actually decided by, and a service that routes on a flag logs
     the value it routed on.
+
+    `latency_ms` is `None` for a shop with no cache configured, and that is not
+    a missing measurement - it is this generator saying the request's cost was
+    not composed from the path it took. Such a minute reports the baseline
+    latency model the other scenarios use, because nothing about them turns on
+    which requests were fast.
+
+    `cache_failure` is carried for the same reason the flag value is: the shop
+    said it, and a minute's log lines are assembled from what the shop said.
     """
 
     flag_is_on: bool
     failure: str | None
+    latency_ms: int | None = None
+    from_cache: bool = False
+    cache_failure: str | None = None
 
 
 def _serve_one_account_page(
     entropy: random.Random,
     share_of_minute_flagged: float,
     share_of_minute_refused: float = 0.0,
+    cache_entropy: random.Random | None = None,
+    share_of_minute_without_the_cache: float = 0.0,
+    cache_endpoint: CacheEndpoint | None = None,
 ) -> _ServedPage:
     """Puts one request through the shop and records how it went.
 
@@ -665,6 +898,13 @@ def _serve_one_account_page(
     figure this generator produced before there was a provider exactly where it
     was: one generator is seeded per minute, and a draw inserted into the
     sequence shifts every draw after it.
+
+    The cache draws from a generator of its own, seeded separately, rather than
+    from the one above. That is a stronger arrangement than drawing
+    conditionally: a separate sequence cannot disturb the shared one however
+    many values it takes, so the cache can be consulted on every request of
+    every scenario - which is what lets a hit ratio be reported everywhere -
+    without moving a single figure this generator already produced.
     """
     flag_is_on = entropy.random() < share_of_minute_flagged
     use_monthly_summary = flag_is_on and entropy.random() < CANARY_SHARE
@@ -676,11 +916,17 @@ def _serve_one_account_page(
     page = serve_account_page(
         _an_account(entropy),
         use_monthly_summary=use_monthly_summary,
-        ask_the_provider=_the_provider_answering(refusing=provider_refused)
+        ask_the_provider=_the_provider_answering(refusing=provider_refused),
+        look_up_summary=_the_cache_answering(
+            cache_entropy, share_of_minute_without_the_cache
+        ),
+        cache_endpoint=cache_endpoint
     )
+    cost = _what_the_page_cost(cache_entropy, page.served_from_cache)
 
     if page.failure is not None:
-        return _ServedPage(flag_is_on, page.failure)
+        return _ServedPage(flag_is_on, page.failure, cost, page.served_from_cache,
+                           page.cache_failure)
 
     if entropy.random() < _BASELINE_ERROR_RATE + entropy.uniform(
         -_BASELINE_ERROR_RATE_WOBBLE, _BASELINE_ERROR_RATE_WOBBLE
@@ -695,10 +941,71 @@ def _serve_one_account_page(
         # a standing accusation against a third party in incidents that have
         # nothing to do with one.
         return _ServedPage(
-            flag_is_on, "ClientDisconnected: the shopper closed the connection"
+            flag_is_on, "ClientDisconnected: the shopper closed the connection",
+            cost, page.served_from_cache, page.cache_failure
         )
 
-    return _ServedPage(flag_is_on, None)
+    return _ServedPage(flag_is_on, None, cost, page.served_from_cache,
+                       page.cache_failure)
+
+
+def _the_cache_answering(cache_entropy: random.Random | None,
+                         share_of_minute_without_the_cache: float) -> LookUpSummary | None:
+    """The cache, as this request finds it.
+
+    `None` where the deployment configured no cache at all, which is what every
+    scenario staged before there was one looks like - the page then computes as
+    it always did, and no draw is taken.
+
+    Whether this request was served depends on two things: whether the shop
+    could reach the cache at all this minute, and, if it could, whether this
+    shopper's figure happened to be in it. Both are draws rather than
+    decisions, because a hit ratio is a property of traffic rather than of any
+    one request.
+    """
+    if cache_entropy is None:
+        return None
+
+    unreachable = cache_entropy.random() < share_of_minute_without_the_cache
+    held_it = cache_entropy.random() < _HEALTHY_HIT_SHARE
+
+    def look_up(shopper_id: str) -> CacheAnswer:
+        if unreachable:
+            return CacheAnswer(reached=False)
+
+        return CacheAnswer(
+            reached=True,
+            summary_cents=_A_CACHED_FIGURE_CENTS if held_it else None
+        )
+
+    return look_up
+
+
+def _what_the_page_cost(cache_entropy: random.Random | None,
+                        served_from_cache: bool) -> int | None:
+    """How long this request took, in milliseconds.
+
+    `None` where there is no cache, because then the request's cost was never
+    composed from the path it took - the minute reports the baseline latency
+    model instead, exactly as it did before there was a cache.
+
+    Where there is one, the cost follows the path: a cached page skips walking
+    the shopper's purchase history, and that walk is the expensive part. The
+    two paths are drawn around different centres and both wobble, so a minute's
+    quantiles are real percentiles over a real mixture rather than two numbers
+    somebody decided on.
+    """
+    if cache_entropy is None:
+        return None
+
+    centre = _CACHED_PAGE_MS if served_from_cache else _RECOMPUTED_PAGE_MS
+
+    return max(
+        1,
+        centre + cache_entropy.randint(
+            -_PAGE_LATENCY_WOBBLE_MS, _PAGE_LATENCY_WOBBLE_MS
+        )
+    )
 
 
 def _the_provider_answering(refusing: bool) -> AskTheProvider:
@@ -759,6 +1066,7 @@ def _log_lines_for(
     flag: str | None,
     decoy: str | None = None,
     heap: tuple[str, ...] = (),
+    cache: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     evaluations = (
         *(
@@ -768,6 +1076,7 @@ def _log_lines_for(
         ),
         *((decoy,) if decoy is not None else ()),
         *heap,
+        *cache,
     )
 
     if not failures:

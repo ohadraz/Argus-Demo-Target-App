@@ -4,9 +4,15 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
+from io_shop.summary_cache import CacheEndpoint
 from io_shop.visits import forget_every_visit
 from target_app.flags import FlagClient, FlagProviderUnavailable
-from target_app.generator import SETTLED_UPTIME, FlagTimeline, ProviderOutage
+from target_app.generator import (
+    SETTLED_UPTIME,
+    CacheOutage,
+    FlagTimeline,
+    ProviderOutage,
+)
 from target_app.history import forget_the_changes_to
 from target_app.scenarios import (
     FALLBACK_FLAG,
@@ -16,7 +22,11 @@ from target_app.scenarios import (
     quiet_state_for,
     utc_now,
 )
-from target_app.settings import get_scenario_settings
+from target_app.settings import (
+    LAST_KNOWN_GOOD_CACHE_PORT,
+    get_scenario_settings,
+    the_deployed_cache_endpoint,
+)
 
 """What is currently staged, and keeping it honest against the live flag.
 
@@ -134,6 +144,20 @@ class ActiveScenario:
     # whose condition is not Io's to change. `None` everywhere else, which is
     # what keeps the provider answering in every other scenario.
     provider_outage: ProviderOutage | None = None
+    # The stretch the shop spent unable to reach its summary cache, and the
+    # address it was dialling over that stretch. `None` everywhere else, which
+    # is what keeps every other scenario's shop without a cache at all rather
+    # than with one that happens to be working - a scenario reporting a hit
+    # ratio it never staged would be a fixture volunteering a signal.
+    #
+    # The address is carried beside the outage because it is the diagnosis: the
+    # port here is the one the deployed revision configured, and setting it
+    # against the previous revision's is what names the change. That is also
+    # why it is state rather than the values file the shop ships - git holds
+    # what was asked for, this holds what is actually running, and a rollback
+    # is precisely the act of making the second agree with an earlier first.
+    cache_outage: CacheOutage | None = None
+    cache_endpoint: CacheEndpoint | None = None
     # Every time somebody has brought the process back since. A list rather
     # than a latest value, because a restart has to stay in the window it
     # happened in: the minutes before it kept the heap they had, and a single
@@ -169,6 +193,9 @@ class ScenarioState:
         self._active: ActiveScenario | None = None
         self._moments: list[FlagMoment] = []
         self._last_seen: dict[str, bool] = {}
+        # A GitOps deployment reconciles itself unless somebody has stopped it,
+        # so this starts on. See `syncs_itself`.
+        self._syncs_itself = True
 
     def _flags_for(self, scenario: Scenario) -> FlagClient:
         return (
@@ -275,6 +302,27 @@ class ScenarioState:
             )
             return
 
+        if scenario.cache_is_misconfigured:
+            # No flag, no process, and nothing wrong with the cache either -
+            # it is up and answering whoever dials it correctly. What is staged
+            # is the deployed configuration being applied: the shop starts
+            # dialling the port the values file at this revision names, which
+            # is not where the cache is. Backdated like the others, so the
+            # incident is diagnosable the instant this returns.
+            self._remember_where_the_flags_are_now()
+            self._active = ActiveScenario(
+                scenario=scenario,
+                seeded_at=now,
+                process_started_at=now - SETTLED_UPTIME,
+                cache_endpoint=the_deployed_cache_endpoint(),
+                cache_outage=CacheOutage(
+                    began_at=now - timedelta(
+                        minutes=get_scenario_settings().onset_backdate_minutes
+                    )
+                ),
+            )
+            return
+
         if scenario.leaks:
             # No flag is touched, because no flag is involved. The condition
             # this stages is the process's own accumulation, which has been
@@ -329,6 +377,63 @@ class ScenarioState:
             ),
             process_started_at=now - SETTLED_UPTIME,
         )
+
+    @property
+    def syncs_itself(self) -> bool:
+        """Whether the platform is reconciling this application on its own.
+
+        On by default, which is how a GitOps deployment normally runs and is
+        what makes suspending it a real step rather than a formality. Process
+        state rather than per-scenario state: it describes the platform's
+        arrangement with the application, not any incident, and a scenario
+        seeding would no more reset it than it would reset the cluster.
+        """
+        return self._syncs_itself
+
+    def set_automated_sync(self, enabled: bool) -> None:
+        """Turns the platform's own reconciliation on or off.
+
+        Both directions, because a mitigation that suspends it has to be able
+        to put it back - and putting it back is the half of the undo that
+        matters, since an application left un-reconciling is an application
+        quietly not receiving anything anybody deploys to it.
+        """
+        self._syncs_itself = enabled
+
+    def roll_the_configuration_back(self) -> datetime:
+        """Puts the shop back on the cache address the previous revision named,
+        and says when.
+
+        What a platform rollback does, and all it does: the running
+        configuration is made to agree with an earlier revision. Nothing in the
+        repository changes - the values file still names the port that broke
+        this - which is why the incident is mitigated rather than resolved, and
+        why re-enabling automated sync would bring it straight back.
+
+        Ends the outage rather than clearing it, for the reason a restart is
+        recorded rather than erasing the climb: the minutes the shop spent
+        unreachable are what happened, and a window that lost them the moment
+        somebody fixed it would take the incident out of the record exactly
+        when a mitigation wants to be judged against it.
+
+        Free on a shop that is not misconfigured, which is what makes it safe
+        for anybody to call: there is no outage to end, and the answer is
+        simply when they asked.
+        """
+        at = utc_now()
+        active = self._active
+
+        if active is not None and active.cache_outage is not None:
+            self._active = replace(
+                active,
+                cache_outage=replace(active.cache_outage, ended_at=at),
+                cache_endpoint=CacheEndpoint(
+                    host=the_deployed_cache_endpoint().host,
+                    port=LAST_KNOWN_GOOD_CACHE_PORT,
+                ),
+            )
+
+        return at
 
     def restart_the_shop(self) -> datetime:
         """Brings the serving process back, and says when.
@@ -613,6 +718,17 @@ class ScenarioState:
             # one, so there is never a recovery to hold the window open around.
             # A reset is what stops it, which is a person deciding to stop it.
             return None, utc_now()
+
+        if active is not None and active.scenario.cache_is_misconfigured:
+            # No flag here either. What ends this one is the rollback, settled
+            # the same way a revert is: the point of watching a few minutes
+            # past it is to see the median come back down and stay there,
+            # which is the only evidence the mitigation worked - and the tail
+            # will not confirm it, having never moved.
+            if active.cache_outage is None or active.cache_outage.ended_at is None:
+                return None, utc_now()
+
+            return None, min(utc_now(), _settled_at(active.cache_outage.ended_at))
 
         if active is not None and active.scenario.leaks:
             if not active.restarts:
