@@ -22,4 +22,4 @@ resources:
 # address is right.
 cache:
   host: cache.io-shop.svc.cluster.local
-  port: 6379
+  port: 6380
