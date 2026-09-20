@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import PurePath
 
 from io_shop.accounts import Account
+from io_shop.payment_provider import AskTheProvider, card_on_file
 from io_shop.spend_summary import render_spend_summary
 from io_shop.visits import record_visit
 
@@ -23,20 +24,29 @@ rate somebody can alert on.
 class RenderedPage:
     """How serving one account page went.
 
-    Exactly one of the two is set. `failure` carries the error's own words and
-    the line they were raised on, because those are what reach the log and what
-    a reader diagnoses from - a generic "request failed" would describe every
-    incident equally, and the error's words alone name a fault without naming
-    where it lives.
+    Either the page rendered, in which case both of the things it shows are
+    here, or it failed, in which case neither is and `failure` carries the
+    error's own words and the line they were raised on - because those are what
+    reach the log and what a reader diagnoses from. A generic "request failed"
+    would describe every incident equally, and the error's words alone name a
+    fault without naming where it lives.
     """
 
     figure_cents: int | None
+    card_last_four: str | None
     failure: str | None
 
 
-def serve_account_page(account: Account, use_monthly_summary: bool) -> RenderedPage:
-    """Renders the account page's spend figure, reporting a failure rather than
-    raising one.
+def serve_account_page(account: Account,
+                       use_monthly_summary: bool,
+                       ask_the_provider: AskTheProvider) -> RenderedPage:
+    """Renders the account page, reporting a failure rather than raising one.
+
+    Two things are shown and both are needed: what the shopper averages per
+    item, which Io works out for itself, and the card it would charge, which
+    only the payment provider knows. The second is a call to another company
+    from inside a page render, which is ordinary and is also why an outage over
+    there arrives here as Io's own error rate.
 
     `use_monthly_summary` is the rollout decision already made - whether this
     request is one of the ones the new figure is live for. The page does not
@@ -47,15 +57,18 @@ def serve_account_page(account: Account, use_monthly_summary: bool) -> RenderedP
         figure_cents = render_spend_summary(
             account, use_monthly_summary=use_monthly_summary
         )
+        card = card_on_file(account.shopper_id, ask_the_provider)
     except Exception as error:  # noqa: BLE001 - the boundary records anything
         failure = f"{type(error).__name__}: {error} at {_where_it_was_raised(error)}"
         record_visit(account.shopper_id, failure)
 
-        return RenderedPage(figure_cents=None, failure=failure)
+        return RenderedPage(figure_cents=None, card_last_four=None, failure=failure)
 
     record_visit(account.shopper_id, str(figure_cents))
 
-    return RenderedPage(figure_cents=figure_cents, failure=None)
+    return RenderedPage(figure_cents=figure_cents,
+                        card_last_four=card.last_four,
+                        failure=None)
 
 
 def _where_it_was_raised(error: BaseException) -> str:

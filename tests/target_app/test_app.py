@@ -15,7 +15,7 @@ from target_app import app as app_module
 from target_app.app import RESTART_ACTION, app
 from target_app.flags import FlagClient
 from target_app.generator import BASELINE_MEMORY_BYTES
-from target_app.scenarios import RESOURCE_LEAK
+from target_app.scenarios import RESOURCE_LEAK, UPSTREAM_DEPENDENCY_FAILURE
 from target_app.state import ScenarioState
 
 """The service's own endpoints, asked the way anybody actually asks them.
@@ -195,3 +195,77 @@ def test_the_platform_restart_needs_nothing_but_the_action(client: TestClient) -
     ran = client.post(RESTART_ACTION_PATH, json={"action": RESTART_ACTION})
 
     assert ran.status_code == 200
+
+
+def a_staged_upstream_failure(client: TestClient) -> None:
+    seeded = client.post(
+        "/scenario/seed", json={"scenario_id": UPSTREAM_DEPENDENCY_FAILURE}
+    )
+
+    assert seeded.status_code == 200
+
+
+def test_the_upstream_failure_is_offered_in_the_console() -> None:
+    # Worth watching: it is the scenario where the right answer is that Argus
+    # does nothing, and an audience seeing that happen is the point of showing
+    # it at all.
+    offered = [
+        entry["id"] for entry in TestClient(app).get("/scenario/catalog").json()["scenarios"]
+    ]
+
+    assert UPSTREAM_DEPENDENCY_FAILURE in offered
+
+
+def test_the_upstream_failure_offers_no_flag_to_watch() -> None:
+    # No flag is in play, so none may be badged. A page naming one would be
+    # pointing an audience at a suspect the fixture invented, and offering a
+    # control that changes nothing.
+    catalog = TestClient(app).get("/scenario/catalog").json()
+    upstream = next(
+        entry for entry in catalog["scenarios"]
+        if entry["id"] == UPSTREAM_DEPENDENCY_FAILURE
+    )
+
+    assert upstream["flags"] == []
+
+
+def test_an_upstream_failure_fails_the_shops_account_pages(client: TestClient) -> None:
+    a_staged_upstream_failure(client)
+
+    assert the_newest_minute(client)["error_rate"] > 0.2
+
+
+def test_an_upstream_failure_leaves_the_heap_where_it_was(client: TestClient) -> None:
+    # Flat memory is half of what tells this apart from a leak, and the shop
+    # has to report it that way for the distinction to be readable at all.
+    a_staged_upstream_failure(client)
+
+    assert the_newest_minute(client)["memory_used_bytes"] < BASELINE_MEMORY_BYTES * 1.5
+
+
+def test_restarting_the_shop_leaves_an_upstream_failure_failing(
+    client: TestClient,
+) -> None:
+    # The mitigation that answers a leak reaches nothing here: a new process
+    # still cannot get an answer out of the provider. This is the assertion
+    # that keeps the scenario gradeable - an agent that restarted to see what
+    # would happen is told, by the telemetry, that nothing happened.
+    a_staged_upstream_failure(client)
+
+    restarted = client.post("/scenario/restart")
+
+    assert restarted.status_code == 200
+    assert the_newest_minute(client)["error_rate"] > 0.2
+
+
+def test_resetting_ends_the_outage(client: TestClient) -> None:
+    # The only thing that ends it, and it is a person's doing rather than
+    # Argus's. A shop with nothing staged serves no telemetry at all - which is
+    # how every scenario here ends, not something about this one.
+    a_staged_upstream_failure(client)
+
+    reset = client.post("/scenario/reset")
+
+    assert reset.status_code == 200
+    assert client.get("/scenario/status").json()["active_scenario"] is None
+    assert client.get("/metrics").json() == []

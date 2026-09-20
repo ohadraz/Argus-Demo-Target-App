@@ -361,7 +361,10 @@ def _the_flags_in_play_for(scenario: Scenario) -> list[ScenarioFlag]:
 
     An authored scenario moves none: its telemetry is a fixed list of minutes
     with no live condition behind it, and offering a flag to watch would be
-    offering a control that does nothing.
+    offering a control that does nothing. Nor do the two generated scenarios
+    whose condition is not a flag's value - a heap that climbs and a provider
+    that stopped answering - and for a sharper reason: a flag named beside
+    either would be a suspect the fixture invented.
 
     A breaking position is claimed only where reverting the flag really does
     end the incident. Two scenarios stage a flag that moved and did not matter
@@ -373,7 +376,7 @@ def _the_flags_in_play_for(scenario: Scenario) -> list[ScenarioFlag]:
     Ordered by the shop's own flags rather than by role, so the culprit is not
     given away by which badge comes first.
     """
-    if not scenario.is_generated:
+    if not scenario.stages_a_flag:
         return []
 
     breaking_position = {
@@ -758,6 +761,7 @@ def _generated_minutes() -> list[GeneratedMinute]:
         process_started_at=active.process_started_at if active else None,
         leak_started_at=active.leak_started_at if active else None,
         restarts=active.restarts if active else (),
+        provider_outage=active.provider_outage if active else None,
     )
 
 

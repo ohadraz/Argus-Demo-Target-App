@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from io_shop.payment_provider import PROVIDER_HOST
 from target_app.generator import (
     BASELINE_MEMORY_BYTES,
     LEAK_CLIMB_BYTES_PER_MINUTE,
     MEMORY_LIMIT_BYTES,
     FlagTimeline,
     GeneratedMinute,
+    ProviderOutage,
     generate,
 )
 
@@ -520,3 +522,86 @@ def test_a_leaking_shop_still_serves_most_of_its_traffic() -> None:
     minutes = a_leaking_window(began_minutes_ago=30)
 
     assert minute_at(1, minutes).error_rate < CLEARLY_HEALTHY
+
+
+def a_window_with_the_provider_down(began_minutes_ago: int,
+                                    now: datetime = SOME_NOW) -> list[GeneratedMinute]:
+    """A window in which the payment provider stopped answering that long ago.
+
+    No flag and no leak, because neither is what is wrong: the whole point of
+    the scenario is a window in which nothing Io owns has changed.
+    """
+    return generate(
+        None,
+        now,
+        SOME_SPAN_MINUTES,
+        provider_outage=ProviderOutage(began_at=now - timedelta(minutes=began_minutes_ago))
+    )
+
+
+def test_a_minute_before_the_provider_failed_reads_as_healthy() -> None:
+    minutes = a_window_with_the_provider_down(began_minutes_ago=5)
+
+    assert minute_at(10, minutes).error_rate < CLEARLY_HEALTHY
+
+
+def test_every_page_fails_while_the_provider_is_refusing() -> None:
+    # Every account page asks for the card, so a provider that answers none of
+    # them fails all of them. That is what a hard dependency being down looks
+    # like, and it is what makes this incident legible in one glance at a graph.
+    minutes = a_window_with_the_provider_down(began_minutes_ago=5)
+
+    assert minute_at(2, minutes).error_rate > CLEARLY_DEGRADED
+
+
+def test_latency_moves_with_the_errors_rather_than_staying_flat() -> None:
+    # Both signals together are this scenario's signature, and what tells it
+    # apart from a bad flag - where the error rate moves and latency does not.
+    minutes = a_window_with_the_provider_down(began_minutes_ago=5)
+
+    calm = minute_at(10, minutes)
+    failing = minute_at(2, minutes)
+
+    assert failing.p95_ms > calm.p95_ms * 4
+    assert failing.p50_ms > calm.p50_ms * 4
+
+
+def test_the_heap_stays_where_it_was_while_the_provider_is_down() -> None:
+    # Nothing is accumulating: an outage somewhere else is not a leak here, and
+    # memory that moved with it would send a reader to restart the shop.
+    minutes = a_window_with_the_provider_down(began_minutes_ago=5)
+
+    calm = minute_at(10, minutes)
+    failing = minute_at(2, minutes)
+
+    assert abs(failing.memory_used_bytes - calm.memory_used_bytes) < MEMORY_LIMIT_BYTES // 10
+
+
+def test_the_failures_name_the_provider_and_the_status_it_gave() -> None:
+    # The host and the status are the evidence that the fault is not Io's, and
+    # the log is the only channel carrying them.
+    minutes = a_window_with_the_provider_down(began_minutes_ago=5)
+
+    said = " ".join(minute_at(2, minutes).log_lines)
+
+    assert PROVIDER_HOST in said
+    assert "503" in said
+
+
+def test_the_minute_the_outage_began_in_lands_between_the_two() -> None:
+    # An outage starts mid-minute like everything else, so that minute is part
+    # served and part failed. Reporting it as either whole would put a step
+    # where the telemetry has a slope.
+    minutes = a_window_with_the_provider_down(began_minutes_ago=5)
+
+    began_in = minute_at(5, minutes)
+
+    assert CLEARLY_HEALTHY < began_in.error_rate < 1.0
+
+
+def test_a_scenario_with_no_outage_leaves_the_provider_answering() -> None:
+    # Which is every other scenario: a window that failed pages for a provider
+    # nobody staged would put a third party in every incident.
+    minutes = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES)
+
+    assert PROVIDER_HOST not in " ".join(minute_at(5, minutes).log_lines)

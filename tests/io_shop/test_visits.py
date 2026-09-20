@@ -4,6 +4,7 @@ import pytest
 
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
+from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
 from io_shop.visits import (
     forget_every_visit,
     how_many_shoppers_are_remembered,
@@ -30,6 +31,14 @@ def a_shop_that_has_just_started() -> None:
     thing to also have in the tests about it.
     """
     forget_every_visit()
+
+
+def a_provider_holding_a_card() -> AskTheProvider:
+    """The provider answering, which is what it does in every case here - these
+    are about what the page remembers, not about who it asks."""
+    return lambda dont_care_shopper: ProviderAnswer(
+        status=200, card=StoredCard(brand="visa", last_four="4242")
+    )
 
 
 def an_account(shopper_id: str, *prices: int) -> Account:
@@ -80,7 +89,9 @@ def test_a_shopper_coming_back_adds_nothing() -> None:
 
 
 def test_serving_a_page_records_the_visit() -> None:
-    serve_account_page(an_account("shopper-1", 1000, 3000), use_monthly_summary=False)
+    serve_account_page(an_account("shopper-1", 1000, 3000),
+                       use_monthly_summary=False,
+                       ask_the_provider=a_provider_holding_a_card())
 
     assert what_they_saw_last_time("shopper-1") == "2000"
 
@@ -89,7 +100,9 @@ def test_a_page_that_failed_is_a_visit_too() -> None:
     # The shopper was here. A store that only grew on success would leave the
     # shop leaking at a rate that depended on how well it was working, which is
     # not how retained state behaves.
-    serve_account_page(an_account("shopper-1"), use_monthly_summary=False)
+    serve_account_page(an_account("shopper-1"),
+                       use_monthly_summary=False,
+                       ask_the_provider=a_provider_holding_a_card())
 
     remembered = what_they_saw_last_time("shopper-1")
 
@@ -100,7 +113,9 @@ def test_a_page_that_failed_is_a_visit_too() -> None:
 def test_serving_pages_to_many_shoppers_holds_one_entry_each() -> None:
     for shopper in range(20):
         serve_account_page(
-            an_account(f"shopper-{shopper}", 1000, 3000), use_monthly_summary=False
+            an_account(f"shopper-{shopper}", 1000, 3000),
+            use_monthly_summary=False,
+            ask_the_provider=a_provider_holding_a_card()
         )
 
     assert how_many_shoppers_are_remembered() == 20

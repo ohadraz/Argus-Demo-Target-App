@@ -21,6 +21,7 @@ from target_app.scenarios import (
     FLAG_TOGGLE_RED_HERRING,
     RESOURCE_LEAK,
     SCENARIOS,
+    UPSTREAM_DEPENDENCY_FAILURE,
 )
 from target_app.settings import get_scenario_settings
 from target_app.state import (
@@ -708,3 +709,76 @@ def test_resetting_a_leak_moves_no_flag() -> None:
 
     assert flags.enable.call_count == 0
     assert flags.disable.call_count == 0
+
+
+def an_upstream_scenario_state(flags: Mock | None = None) -> ScenarioState:
+    """A state object for the scenario whose condition belongs to somebody else.
+
+    Stubbed like the leaking one and for the same reason: staging still puts
+    the shop back together first, and that step asks the provider about flags
+    whether or not the scenario has any.
+    """
+    return a_scenario_state(flags or a_flag_client_reporting(False))
+
+
+def test_staging_an_upstream_failure_records_when_the_provider_went_down() -> None:
+    # Backdated the way a flag's onset is, so a diagnosable incident exists the
+    # instant seeding returns.
+    state = an_upstream_scenario_state()
+
+    state.seed(SCENARIOS[UPSTREAM_DEPENDENCY_FAILURE])
+
+    active = state.active
+
+    assert active is not None
+    assert active.provider_outage is not None
+    assert utc_now() - active.provider_outage.began_at >= timedelta(
+        minutes=get_scenario_settings().onset_backdate_minutes
+    )
+
+
+def test_staging_an_upstream_failure_moves_no_flag() -> None:
+    # The fault is another company's service. A flag toggled while staging it
+    # would hand the investigation a suspect inside Io.
+    flags = a_flag_client_reporting(False)
+    state = an_upstream_scenario_state(flags)
+
+    flags.enable.reset_mock()
+    state.seed(SCENARIOS[UPSTREAM_DEPENDENCY_FAILURE])
+
+    assert flags.enable.call_count == 0
+
+
+def test_an_upstream_failure_keeps_running_however_long_it_is_left() -> None:
+    # Nothing anybody may do here ends it, so there is no recovering phase to
+    # reach and no window to freeze. It runs until somebody resets it.
+    state = an_upstream_scenario_state()
+
+    state.seed(SCENARIOS[UPSTREAM_DEPENDENCY_FAILURE])
+
+    assert state.phase() == RUNNING
+
+
+def test_restarting_the_shop_does_not_end_an_upstream_failure() -> None:
+    # The mitigation that answers a leak reaches nothing here: a new process
+    # still cannot get an answer out of the provider.
+    state = an_upstream_scenario_state()
+    state.seed(SCENARIOS[UPSTREAM_DEPENDENCY_FAILURE])
+
+    state.restart_the_shop()
+
+    assert state.phase() == RUNNING
+    active = state.active
+    assert active is not None
+    assert active.provider_outage is not None
+
+
+def test_resetting_ends_the_outage() -> None:
+    # A person deciding to stop it, which is the only thing that does.
+    state = an_upstream_scenario_state()
+    state.seed(SCENARIOS[UPSTREAM_DEPENDENCY_FAILURE])
+
+    state.reset()
+
+    assert state.active is None
+    assert state.phase() == IDLE

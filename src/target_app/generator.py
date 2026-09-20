@@ -6,15 +6,18 @@ from datetime import UTC, datetime, timedelta
 
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
+from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
 from io_shop.rollout import CANARY_SHARE
 from target_app.settings import get_unleash_settings
 
-"""Telemetry generated from live flag state, at the moment it is asked for.
+"""Telemetry generated from live state, at the moment it is asked for.
 
-The service's metrics and logs are a pure function of two things: what time it
-is, and when the flag went on and off. Nothing runs between requests - no
-ticker, no rolling buffer, no traffic generator - and yet the answer tracks the
-flag, because the answer is recomputed every time anybody asks.
+The service's metrics and logs are a pure function of what time it is and of
+whatever condition is staged - when the flag went on and off, when the heap
+began climbing, when the payment provider stopped answering. Nothing runs
+between requests - no ticker, no rolling buffer, no traffic generator - and yet
+the answer tracks the world, because the answer is recomputed every time
+anybody asks.
 
 That is what makes an incident here recoverable. A fixture authored in advance
 describes a past that has already finished; this describes a present that is
@@ -82,6 +85,22 @@ _MEMORY_WOBBLE_BYTES = 12 * 1024**2
 # exists to report.
 SETTLED_UPTIME = timedelta(hours=6)
 
+# What the payment provider answers with when it is not answering. A status
+# rather than a dropped connection, because a status is what the shop's failure
+# line quotes and what tells a reader the provider was reachable and refusing.
+_PROVIDER_IS_UNAVAILABLE = 503
+# What it answers with when it is well.
+_PROVIDER_ANSWERED = 200
+# What the provider hands back when it is well. One card for every shopper: the
+# page shows the last four digits, and which four they are decides nothing.
+_A_CARD = StoredCard(brand="visa", last_four="4242")
+
+# How long a request spends waiting on a provider that is not answering before
+# giving up. The shop's own work is tens of milliseconds, so a minute spent
+# waiting on somebody else is visible in the latency long before anybody reads
+# a log - which is what makes errors *and* latency this scenario's signature.
+_PROVIDER_TIMEOUT_MS = 2000
+
 # How fast a leaking shop's heap grows. Fast enough that the climb is a climb
 # within a few minutes of anybody looking, and slow enough that the whole of it
 # fits in the window: from the baseline this reaches the limit in a little under
@@ -115,8 +134,9 @@ _BYTES_PER_MIB = 1024**2
 class FlagTimeline:
     """When the flag went on, and when it went off if it has.
 
-    The whole of the generator's state. `turned_off_at` being `None` means the
-    flag is still on - so an incident with no end recorded is one still
+    One of the three conditions a scenario can stage, beside a climbing heap
+    and a provider that stopped answering. `turned_off_at` being `None` means
+    the flag is still on - so an incident with no end recorded is one still
     happening, which is exactly the reading a caller wants.
     """
 
@@ -151,6 +171,46 @@ class FlagTimeline:
         )
 
         return max(0, int((on_until - on_from).total_seconds()))
+
+
+@dataclass(frozen=True)
+class ProviderOutage:
+    """When the payment provider stopped answering, and when it started again.
+
+    Shaped like the flag's timeline and kept apart from it, because they are
+    timelines of different things: one is a value somebody set on Io's own
+    provider and can set back, the other is another company's service being
+    down. Nothing Io does moves this one, which is the entire point of the
+    scenario it stages.
+
+    `ended_at` being `None` means the provider is still down - an outage with no
+    end recorded is one still going on.
+    """
+
+    began_at: datetime
+    ended_at: datetime | None = None
+
+    def share_of(self, minute: datetime, elapsed_seconds: int) -> float:
+        """How much of this minute's first `elapsed_seconds` the provider spent
+        refusing.
+
+        A share rather than a count of seconds, because it is what both of the
+        things that follow are scaled by: how many of the minute's requests
+        failed, and how long the minute's requests spent waiting. The minute an
+        outage begins in is partly served and partly failed, and reporting it as
+        either whole would put a step where the telemetry has a slope.
+        """
+        if elapsed_seconds <= 0:
+            return 0.0
+
+        window_end = minute + timedelta(seconds=elapsed_seconds)
+        down_from = max(minute, self.began_at)
+        down_until = window_end if self.ended_at is None else min(
+            window_end, self.ended_at
+        )
+        seconds_down = max(0.0, (down_until - down_from).total_seconds())
+
+        return min(1.0, seconds_down / elapsed_seconds)
 
 
 @dataclass(frozen=True)
@@ -215,7 +275,8 @@ def generate(timeline: FlagTimeline | None,
              decoy_timeline: FlagTimeline | None = None,
              process_started_at: datetime | None = None,
              leak_started_at: datetime | None = None,
-             restarts: tuple[datetime, ...] = ()) -> list[GeneratedMinute]:
+             restarts: tuple[datetime, ...] = (),
+             provider_outage: ProviderOutage | None = None) -> list[GeneratedMinute]:
     """Every minute from `span_minutes` ago up to and including the one in
     progress, once any of it has happened.
 
@@ -258,6 +319,10 @@ def generate(timeline: FlagTimeline | None,
     reclaims the heap and starts the climb again from the baseline, because the
     fault is still in the code when the new process comes up - which is exactly
     why a restart mitigates a leak and does not resolve it.
+
+    `provider_outage` is the stretch the payment provider spent refusing. Left
+    unsaid, it answers every request, which is what every scenario that is not
+    about somebody else's outage looks like.
     """
     current_minute = now.replace(second=0, microsecond=0)
     elapsed_in_current = int((now - current_minute).total_seconds())
@@ -282,6 +347,7 @@ def generate(timeline: FlagTimeline | None,
             decoy_timeline=decoy_timeline,
             lifetime=lifetime,
             leak_started_at=leak_started_at,
+            provider_outage=provider_outage,
         )
         for offset in range(span_minutes, 0, -1)
     ]
@@ -304,6 +370,7 @@ def generate(timeline: FlagTimeline | None,
                 decoy_timeline=decoy_timeline,
                 lifetime=lifetime,
                 leak_started_at=leak_started_at,
+                provider_outage=provider_outage,
             )
         )
 
@@ -320,6 +387,7 @@ def _generate_minute(
     decoy_flag: str | None = None,
     decoy_timeline: FlagTimeline | None = None,
     leak_started_at: datetime | None = None,
+    provider_outage: ProviderOutage | None = None,
 ) -> GeneratedMinute:
     minute_id = minute.strftime(TIMESTAMP_FORMAT)
     entropy = random.Random(minute_id)
@@ -332,9 +400,14 @@ def _generate_minute(
     share_of_minute_flagged = (
         seconds_on / elapsed_seconds if elapsed_seconds > 0 else 0.0
     )
+    share_of_minute_refused = (
+        provider_outage.share_of(minute, elapsed_seconds)
+        if provider_outage is not None
+        else 0.0
+    )
 
     outcomes = [
-        _serve_one_account_page(entropy, share_of_minute_flagged)
+        _serve_one_account_page(entropy, share_of_minute_flagged, share_of_minute_refused)
         for _ in range(_SAMPLE_SIZE)
     ]
     failures = [served.failure for served in outcomes if served.failure is not None]
@@ -365,10 +438,12 @@ def _generate_minute(
         p50_ms=round(
             (_BASELINE_P50_MS + entropy.randint(-_LATENCY_WOBBLE_MS, _LATENCY_WOBBLE_MS))
             * under_pressure
+            + _waiting_on_the_provider(share_of_minute_refused)
         ),
         p95_ms=round(
             (_BASELINE_P95_MS + entropy.randint(-_LATENCY_WOBBLE_MS, _LATENCY_WOBBLE_MS))
             * under_pressure
+            + _waiting_on_the_provider(share_of_minute_refused)
         ),
         request_volume=_REPORTED_VOLUME_PER_MINUTE,
         # Drawn after the latencies, so that adding memory to the bucket left
@@ -440,6 +515,21 @@ def _how_much_slower_under(pressure: float) -> float:
     how_far_in = (pressure - _PRESSURE_BEGINS_AT) / (1.0 - _PRESSURE_BEGINS_AT)
 
     return 1.0 + how_far_in * (_SLOWEST_UNDER_PRESSURE - 1.0)
+
+
+def _waiting_on_the_provider(share_of_minute_refused: float) -> float:
+    """How much of this minute's latency was spent waiting on somebody else.
+
+    Added to the shop's own time rather than multiplying it, because that is
+    what waiting is: the request does its own work at the speed it always did
+    and then sits on a socket until the timeout. A multiplier would make the
+    wait proportional to how fast Io happens to be, which is the wrong way
+    round - the provider's timeout is the provider's.
+
+    Scaled by how much of the minute the provider was refusing, so the minute an
+    outage starts in reads as part of one and not as the whole of it.
+    """
+    return _PROVIDER_TIMEOUT_MS * share_of_minute_refused
 
 
 def _with_the_allocations_that_failed(failures: list[str], pressure: float) -> list[str]:
@@ -550,27 +640,43 @@ class _ServedPage:
 
 
 def _serve_one_account_page(
-    entropy: random.Random, share_of_minute_flagged: float
+    entropy: random.Random,
+    share_of_minute_flagged: float,
+    share_of_minute_refused: float = 0.0,
 ) -> _ServedPage:
     """Puts one request through the shop and records how it went.
 
-    The two decisions above the call are the ones a real request would arrive
-    with already made - which cohort the flag evaluated to for this shopper, and
-    whether they fall inside the rollout's canary share. The shop itself is
-    handed the answer, exactly as `io_shop.account_page` is handed it in
+    The decisions above the call are the ones a real request would arrive with
+    already made - which cohort the flag evaluated to for this shopper, whether
+    they fall inside the rollout's canary share, and what the payment provider
+    is doing at the moment the page asks it for their card. The shop itself is
+    handed the answers, exactly as `io_shop.account_page` is handed them in
     production; nothing about the page's behaviour is simulated here.
 
-    The flag is not consulted per request - `share_of_minute_flagged` already
-    carries how much of this minute it was on for, so a minute the flag was on
-    for half of routes half as much traffic to the canary as one it was on
-    throughout. That is the whole mechanism by which a mid-minute revert shows
-    up as a falling error rate.
+    Neither the flag nor the provider is consulted per request - the two shares
+    already carry how much of this minute each was in force for, so a minute the
+    flag was on for half of routes half as much traffic to the canary as one it
+    was on throughout. That is the whole mechanism by which a mid-minute revert
+    shows up as a falling error rate, and it is why an outage that began
+    mid-minute does not read as a step.
+
+    The provider is only drawn for when there is an outage to draw from. A
+    scenario that stages none takes no draw at all, which is what keeps every
+    figure this generator produced before there was a provider exactly where it
+    was: one generator is seeded per minute, and a draw inserted into the
+    sequence shifts every draw after it.
     """
     flag_is_on = entropy.random() < share_of_minute_flagged
     use_monthly_summary = flag_is_on and entropy.random() < CANARY_SHARE
+    provider_refused = (
+        share_of_minute_refused > 0.0
+        and entropy.random() < share_of_minute_refused
+    )
 
     page = serve_account_page(
-        _an_account(entropy), use_monthly_summary=use_monthly_summary
+        _an_account(entropy),
+        use_monthly_summary=use_monthly_summary,
+        ask_the_provider=_the_provider_answering(refusing=provider_refused)
     )
 
     if page.failure is not None:
@@ -582,11 +688,35 @@ def _serve_one_account_page(
         # Every real service fails a little without anything being wrong. Some
         # baseline noise is what makes "departed from baseline" a judgement
         # rather than a comparison against zero.
+        #
+        # A shopper who went away mid-response, and deliberately nothing that
+        # names a dependency: the shop's ordinary noise is read in every window
+        # of every scenario, and noise that named the payment provider would be
+        # a standing accusation against a third party in incidents that have
+        # nothing to do with one.
         return _ServedPage(
-            flag_is_on, "UpstreamTimeout: payment authorization timed out"
+            flag_is_on, "ClientDisconnected: the shopper closed the connection"
         )
 
     return _ServedPage(flag_is_on, None)
+
+
+def _the_provider_answering(refusing: bool) -> AskTheProvider:
+    """The payment provider, as this request finds it.
+
+    A function rather than a client, because the shop is rendered two hundred
+    times a minute across a ninety-minute window and a socket per render would
+    be tens of thousands of requests for one read of `/metrics`. What is real is
+    the shape of the answer and what Io does with it - the status comes back
+    here and the failure is composed in the shop, where a client's is.
+    """
+    def ask(shopper_id: str) -> ProviderAnswer:
+        if refusing:
+            return ProviderAnswer(status=_PROVIDER_IS_UNAVAILABLE)
+
+        return ProviderAnswer(status=_PROVIDER_ANSWERED, card=_A_CARD)
+
+    return ask
 
 
 def _an_account(entropy: random.Random) -> Account:

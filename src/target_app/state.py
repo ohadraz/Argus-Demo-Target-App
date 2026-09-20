@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 
 from io_shop.visits import forget_every_visit
 from target_app.flags import FlagClient, FlagProviderUnavailable
-from target_app.generator import SETTLED_UPTIME, FlagTimeline
+from target_app.generator import SETTLED_UPTIME, FlagTimeline, ProviderOutage
 from target_app.history import forget_the_changes_to
 from target_app.scenarios import (
     FALLBACK_FLAG,
@@ -130,6 +130,10 @@ class ActiveScenario:
     # flat in all of them - a fixture that moved every signal at once would
     # leave a reader unable to say which one the incident is about.
     leak_started_at: datetime | None = None
+    # The stretch the payment provider spent refusing, for the one scenario
+    # whose condition is not Io's to change. `None` everywhere else, which is
+    # what keeps the provider answering in every other scenario.
+    provider_outage: ProviderOutage | None = None
     # Every time somebody has brought the process back since. A list rather
     # than a latest value, because a restart has to stay in the window it
     # happened in: the minutes before it kept the heap they had, and a single
@@ -249,6 +253,25 @@ class ScenarioState:
                 scenario=scenario,
                 seeded_at=now,
                 process_started_at=now - SETTLED_UPTIME,
+            )
+            return
+
+        if scenario.upstream_fails:
+            # No flag is touched, because no flag is involved, and no process
+            # is either: what is wrong is another company's service, and the
+            # only thing staged here is the moment it stopped answering.
+            # Backdated like a flag's onset, so a diagnosable incident exists
+            # the instant this returns.
+            self._remember_where_the_flags_are_now()
+            self._active = ActiveScenario(
+                scenario=scenario,
+                seeded_at=now,
+                process_started_at=now - SETTLED_UPTIME,
+                provider_outage=ProviderOutage(
+                    began_at=now - timedelta(
+                        minutes=get_scenario_settings().onset_backdate_minutes
+                    )
+                ),
             )
             return
 
@@ -490,10 +513,12 @@ class ScenarioState:
             self._forget_what_the_flags_did()
             return
 
-        if active.scenario.leaks:
-            # Nothing to put back: a leaking scenario moved no flag, and
-            # toggling one here would plant a change for the next
-            # investigation to find.
+        if active.scenario.leaks or active.scenario.upstream_fails:
+            # Nothing to put back: neither of these moved a flag - one was the
+            # process's own accumulation and the other was somebody else's
+            # service - and toggling one here would plant a change for the next
+            # investigation to find. Clearing the active scenario is what ends
+            # the outage, since the provider answers whenever none is staged.
             self._forget_what_the_flags_did()
             return
 
@@ -531,6 +556,11 @@ class ScenarioState:
         running phase is a restart rather than a flag going back, and what it
         settles into is a reclaimed heap climbing again rather than a rate that
         stayed down. Both are worth watching for the same few minutes.
+
+        An upstream failure reaches only one of them. Nothing anybody may do
+        here ends it, so it is `running` from the moment it is staged until
+        somebody resets it - which is the phase telling the truth about a
+        scenario whose condition belongs to another company.
         """
         active = self._active
 
@@ -576,6 +606,13 @@ class ScenarioState:
         incident was mitigated and not fixed.
         """
         active = self._active
+
+        if active is not None and active.scenario.upstream_fails:
+            # It runs up to now for as long as it is staged, and there is no
+            # settling instant to freeze it at: nothing Argus may do ends this
+            # one, so there is never a recovery to hold the window open around.
+            # A reset is what stops it, which is a person deciding to stop it.
+            return None, utc_now()
 
         if active is not None and active.scenario.leaks:
             if not active.restarts:

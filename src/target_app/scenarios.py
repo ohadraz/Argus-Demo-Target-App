@@ -128,6 +128,13 @@ class Scenario:
     climb begins again. That is what makes it the first scenario Argus can
     mitigate without resolving.
 
+    `upstream_fails` stages the third generated kind, and the only one whose
+    live condition belongs to somebody else: the payment provider the account
+    page asks for a shopper's card stops answering. No flag is touched and no
+    restart reclaims anything, because neither the value nor the process is
+    what is wrong - which is what makes it the one scenario where the correct
+    outcome is that Argus takes nothing and hands the incident to a person.
+
     `offered_in_console` is presentation only. A scenario kept for the capability
     it pins down is not automatically one worth showing an audience; hiding it
     leaves it seedable by id, which is how the e2e suite stages it.
@@ -142,11 +149,24 @@ class Scenario:
     recovers_when_flag_reverts: bool = True
     decoy_flag_role: str | None = None
     leaks: bool = False
+    upstream_fails: bool = False
     offered_in_console: bool = True
 
     @property
     def is_generated(self) -> bool:
         return not self.minutes
+
+    @property
+    def stages_a_flag(self) -> bool:
+        """Whether this scenario's incident is a flag's doing.
+
+        Two generated scenarios are not: a leak is the process's own
+        accumulation, and an upstream failure is another company's service. A
+        page offering a flag to watch for either would be offering a control
+        that changes nothing, and naming a flag as the thing that breaks the
+        shop would be pointing at a suspect the fixture invented.
+        """
+        return self.is_generated and not (self.leaks or self.upstream_fails)
 
     @property
     def healthy_flag_state(self) -> bool:
@@ -158,6 +178,7 @@ class Scenario:
 FEATURE_FLAG_TOGGLE = "feature-flag-toggle"
 BAD_DEPLOYMENT = "bad-deployment"
 RESOURCE_LEAK = "resource-leak"
+UPSTREAM_DEPENDENCY_FAILURE = "upstream-dependency-failure"
 FALLBACK_DISABLED = "fallback-disabled"
 FLAG_TOGGLE_RED_HERRING = "flag-toggle-red-herring"
 COMPETING_FLAG_CHANGES = "competing-flag-changes"
@@ -243,6 +264,23 @@ SCENARIOS: dict[str, Scenario] = {
         ),
         leaks=True,
         offered_in_console=False,
+    ),
+    UPSTREAM_DEPENDENCY_FAILURE: Scenario(
+        id=UPSTREAM_DEPENDENCY_FAILURE,
+        title="The payment provider is down",
+        description=(
+            "Io's account page shows the card a shopper will be charged with, "
+            "and Io does not hold that card - the payment provider does, and "
+            "the page asks for it while it renders. The provider starts "
+            "refusing, so every account page waits on it and then fails. The "
+            "error rate and the latency move together, memory stays where it "
+            "was, no flag was touched and nothing was deployed. Nothing Argus "
+            "may do reaches it: the flag is not the problem, the process is "
+            "not the problem, and a restart returns a shop that still cannot "
+            "reach the provider. The correct outcome is that Argus says what "
+            "happened and escalates it to somebody who can call them."
+        ),
+        upstream_fails=True,
     ),
     BAD_DEPLOYMENT: Scenario(
         id=BAD_DEPLOYMENT,
