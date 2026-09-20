@@ -263,7 +263,6 @@ SCENARIOS: dict[str, Scenario] = {
             "mitigated, never resolved, and what ends it is a fix."
         ),
         leaks=True,
-        offered_in_console=False,
     ),
     UPSTREAM_DEPENDENCY_FAILURE: Scenario(
         id=UPSTREAM_DEPENDENCY_FAILURE,

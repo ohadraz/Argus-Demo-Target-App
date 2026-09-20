@@ -77,17 +77,27 @@ def test_the_leak_is_seedable_by_id(client: TestClient) -> None:
     assert client.get("/scenario/status").json()["active_scenario"] == RESOURCE_LEAK
 
 
-def test_the_leak_is_kept_out_of_the_console_until_it_plays_well(
-    client: TestClient,
-) -> None:
-    # Hidden, not absent. A scenario kept for the capability it pins down is
-    # not automatically one worth putting in front of an audience, and hiding
-    # it leaves it seedable by id - which is how the e2e suite stages it.
+def test_the_leak_is_offered_in_the_console(client: TestClient) -> None:
+    # It was hidden while the catalog badged a flag for any generated scenario,
+    # which named a suspect for an incident no flag is part of. The catalog
+    # asks whether a scenario stages a flag now, so there is nothing left to
+    # hide it from.
     offered = [
         entry["id"] for entry in client.get("/scenario/catalog").json()["scenarios"]
     ]
 
-    assert RESOURCE_LEAK not in offered
+    assert RESOURCE_LEAK in offered
+
+
+def test_the_leak_offers_no_flag_to_watch(client: TestClient) -> None:
+    # A heap climbing is nobody's toggle. A badge here would be a control that
+    # changes nothing, beside an incident no flag can end.
+    catalog = client.get("/scenario/catalog").json()
+    leak = next(
+        entry for entry in catalog["scenarios"] if entry["id"] == RESOURCE_LEAK
+    )
+
+    assert leak["flags"] == []
 
 
 def test_a_leaking_shop_reports_a_heap_above_its_baseline(client: TestClient) -> None:
