@@ -15,6 +15,7 @@ from io_shop.visits import (
 )
 from target_app.scenarios import (
     BAD_DEPLOYMENT,
+    CACHE_MISCONFIGURED,
     COMPETING_FLAG_CHANGES,
     FALLBACK_DISABLED,
     FEATURE_FLAG_TOGGLE,
@@ -782,3 +783,79 @@ def test_resetting_ends_the_outage() -> None:
 
     assert state.active is None
     assert state.phase() == IDLE
+
+
+def a_staged_cache_misconfiguration(state: ScenarioState) -> None:
+    state.seed(SCENARIOS[CACHE_MISCONFIGURED])
+
+
+def test_a_misconfigured_cache_is_running_until_it_is_rolled_back() -> None:
+    state = a_scenario_state(a_flag_client_reporting(False))
+
+    a_staged_cache_misconfiguration(state)
+
+    assert state.phase() == RUNNING
+
+
+def test_rolling_the_configuration_back_moves_it_into_recovering() -> None:
+    # Without this the scenario reports `running` for ever: it has no flag to
+    # go back and no restart to settle from, so nothing else in the phase
+    # derivation can see that it ended.
+    state = a_scenario_state(a_flag_client_reporting(False))
+    a_staged_cache_misconfiguration(state)
+
+    state.roll_the_configuration_back()
+
+    assert state.phase() == RECOVERING
+
+
+def test_a_rollback_puts_the_shop_back_on_the_address_that_answers() -> None:
+    state = a_scenario_state(a_flag_client_reporting(False))
+    a_staged_cache_misconfiguration(state)
+    broken = state.active.cache_endpoint
+
+    state.roll_the_configuration_back()
+
+    assert state.active.cache_endpoint != broken
+    assert state.active.cache_outage.ended_at is not None
+
+
+def test_a_deployment_reconciles_itself_until_somebody_stops_it() -> None:
+    state = a_scenario_state(a_flag_client_reporting(False))
+
+    assert state.syncs_itself
+
+    state.set_automated_sync(False)
+
+    assert not state.syncs_itself
+
+
+def test_a_reset_puts_automated_sync_back_on() -> None:
+    # A run abandoned between the rollback and its undo leaves sync suspended,
+    # and the next scenario would then be staged onto a deployment that
+    # reconciles nothing - with its rollback accepted first time for reasons
+    # belonging to the previous run.
+    state = a_scenario_state(a_flag_client_reporting(False))
+    a_staged_cache_misconfiguration(state)
+    state.set_automated_sync(False)
+
+    state.reset()
+
+    assert state.syncs_itself
+
+
+def test_resetting_a_cache_scenario_touches_no_flag() -> None:
+    # No flag staged it, so putting one back would plant a change for the next
+    # investigation to find - the provider records every toggle, and an agent
+    # identifies a culprit by asking what recently changed.
+    flags = a_flag_client_reporting(False)
+    fallback = a_flag_client_reporting(True)
+    state = a_scenario_state(flags, fallback)
+    a_staged_cache_misconfiguration(state)
+    flags.reset_mock()
+    fallback.reset_mock()
+
+    state.reset()
+
+    assert not flags.enable.called and not flags.disable.called
+    assert not fallback.enable.called and not fallback.disable.called

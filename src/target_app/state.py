@@ -612,18 +612,29 @@ class ScenarioState:
         # reset that left it behind would hand the next run a heap it did not
         # start.
         forget_every_visit()
+        # The platform's arrangement with the application goes back too. A
+        # rollback suspends automated sync and a withdrawal puts it back, but a
+        # run abandoned between the two leaves it off - and the next scenario
+        # would then be staged onto a deployment that silently reconciles
+        # nothing, with its rollback accepted on the first try for reasons
+        # belonging to the previous run.
+        self._syncs_itself = True
 
         if active is None:
             self._put_the_flags_back_where_they_rest()
             self._forget_what_the_flags_did()
             return
 
-        if active.scenario.leaks or active.scenario.upstream_fails:
-            # Nothing to put back: neither of these moved a flag - one was the
-            # process's own accumulation and the other was somebody else's
-            # service - and toggling one here would plant a change for the next
+        if (
+            active.scenario.leaks
+            or active.scenario.upstream_fails
+            or active.scenario.cache_is_misconfigured
+        ):
+            # Nothing to put back: none of these moved a flag - the process's
+            # own accumulation, somebody else's service, and a value in a file
+            # - and toggling one here would plant a change for the next
             # investigation to find. Clearing the active scenario is what ends
-            # the outage, since the provider answers whenever none is staged.
+            # the condition, since nothing is staged for the generator to read.
             self._forget_what_the_flags_did()
             return
 
@@ -666,6 +677,11 @@ class ScenarioState:
         here ends it, so it is `running` from the moment it is staged until
         somebody resets it - which is the phase telling the truth about a
         scenario whose condition belongs to another company.
+
+        A misconfigured cache reaches all three, and what ends its running
+        phase is the rollback: the moment the shop is put back on the address
+        the cache actually listens on. Worth watching afterwards for the same
+        reason a revert is - to see the median come back down and stay there.
         """
         active = self._active
 
@@ -680,6 +696,12 @@ class ScenarioState:
         timeline, _ = window
         if active.scenario.leaks:
             ended_at = active.restarts[-1] if active.restarts else None
+        elif active.scenario.cache_is_misconfigured:
+            ended_at = (
+                active.cache_outage.ended_at
+                if active.cache_outage is not None
+                else None
+            )
         else:
             ended_at = timeline.turned_off_at if timeline is not None else None
 
