@@ -23,9 +23,9 @@ from target_app.scenarios import (
     utc_now,
 )
 from target_app.settings import (
-    LAST_KNOWN_GOOD_CACHE_PORT,
     get_scenario_settings,
     the_deployed_cache_endpoint,
+    the_working_cache_endpoint,
 )
 
 """What is currently staged, and keeping it honest against the live flag.
@@ -376,6 +376,22 @@ class ScenarioState:
                 else None
             ),
             process_started_at=now - SETTLED_UPTIME,
+            # A flag scenario like the four above it, and the only one that
+            # needs anything beside the timeline. The other four break the shop
+            # by what the flag routes traffic to; this one changes only what
+            # those requests cost, and a cost is composed per request from the
+            # path it took - which needs a cache for there to be a path to be
+            # off. Staged working, and left working: nothing in this scenario
+            # is wrong with the cache.
+            #
+            # The rollout itself is not stored. It is the flag's own timeline
+            # said another way - out from the minute the flag went on, back the
+            # minute it goes off - and a second record of one fact is a record
+            # that comes to disagree with the first about when somebody
+            # reverted.
+            cache_endpoint=(
+                the_working_cache_endpoint() if scenario.rollout_is_slow else None
+            ),
         )
 
     @property
@@ -427,10 +443,7 @@ class ScenarioState:
             self._active = replace(
                 active,
                 cache_outage=replace(active.cache_outage, ended_at=at),
-                cache_endpoint=CacheEndpoint(
-                    host=the_deployed_cache_endpoint().host,
-                    port=LAST_KNOWN_GOOD_CACHE_PORT,
-                ),
+                cache_endpoint=the_working_cache_endpoint(),
             )
 
         return at

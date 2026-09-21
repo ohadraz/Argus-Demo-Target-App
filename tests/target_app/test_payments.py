@@ -31,9 +31,11 @@ A_WINDOW_AROUND_IT = (SOME_MINUTE - timedelta(minutes=1),
 SOME_VOLUME = 1_000
 NOTHING_FAILED = 0.0
 
-# Takings come from traffic and failures. What the shop's memory was doing is
-# required on a bucket and decides nothing here.
+# Takings come from traffic and failures. What the shop's memory was doing, and
+# how slow its slowest requests were, are required on a bucket and decide
+# nothing here.
 DONT_CARE_MEMORY_BYTES = 400 * 1024**2
+DONT_CARE_P99_MS = 380
 DONT_CARE_STARTED_AT = SOME_MINUTE.timestamp()
 
 
@@ -140,6 +142,7 @@ def _a_minute(error_rate: float,
         error_rate=error_rate,
         p50_ms=40,
         p95_ms=90,
+        p99_ms=DONT_CARE_P99_MS,
         request_volume=request_volume,
         memory_used_bytes=DONT_CARE_MEMORY_BYTES,
         process_start_time_seconds=DONT_CARE_STARTED_AT,

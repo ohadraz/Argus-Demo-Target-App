@@ -28,6 +28,7 @@ from target_app.scenarios import (
     BAD_DEPLOYMENT,
     CACHE_MISCONFIGURED,
     RESOURCE_LEAK,
+    SLOW_CANARY_ROLLOUT,
     TIMESTAMP_FORMAT,
     utc_now,
 )
@@ -67,6 +68,14 @@ _WHAT_FIRED: dict[str, tuple[str, str]] = {
     # would never fire on this at all.
     CACHE_MISCONFIGURED: (
         _HIGH_LATENCY, "p50 latency above threshold for 5m"
+    ),
+    # The other percentile most latency alerting is not written against, and
+    # the other half of the same lesson. Three requests in a hundred is below
+    # the 95th by arithmetic and fails nothing, so a rule on p95 never fires
+    # here and a rule on the error rate never fires either. Saying which
+    # percentile moved is most of what the responder is being told.
+    SLOW_CANARY_ROLLOUT: (
+        _HIGH_LATENCY, "p99 latency above threshold for 5m"
     ),
     RESOURCE_LEAK: (
         _HIGH_MEMORY_USAGE,

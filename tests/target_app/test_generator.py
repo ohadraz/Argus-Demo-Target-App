@@ -13,6 +13,7 @@ from target_app.generator import (
     FlagTimeline,
     GeneratedMinute,
     ProviderOutage,
+    SlowRollout,
     generate,
 )
 
@@ -762,3 +763,269 @@ def test_the_cache_changes_nothing_for_a_scenario_that_stages_none() -> None:
 
     assert [(m.p50_ms, m.p95_ms, m.error_rate) for m in without] == \
            [(m.p50_ms, m.p95_ms, m.error_rate) for m in again]
+
+
+def test_every_minute_reports_a_tail_whatever_is_staged() -> None:
+    # Reported on every minute of every scenario, for the reason memory is: a
+    # series that appeared when it mattered would be a signal by its presence,
+    # and a quantile nobody has seen quiet is not one anything can be said to
+    # have departed from.
+    minutes = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES)
+
+    assert all(minute.p99_ms > 0 for minute in minutes)
+
+
+def test_a_calm_shops_tail_sits_above_its_p95() -> None:
+    # Its own baseline rather than a multiple of the p95's. A tail pinned to
+    # the p95 is a fifth series that can only say what the fourth already said.
+    minutes = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES)
+
+    calm = minute_at(15, minutes)
+
+    assert calm.p99_ms > calm.p95_ms
+
+
+def test_a_flag_fault_leaves_the_tail_alone() -> None:
+    # A flag fault moves the error rate and nothing else, which is what
+    # distinguishes it from a bad deploy. The tail is no exception to that.
+    minutes = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES)
+
+    calm = minute_at(15, minutes)
+    degraded = minute_at(5, minutes)
+
+    assert degraded.p99_ms < calm.p99_ms * 1.5
+
+
+def test_waiting_on_the_provider_moves_the_tail_with_the_rest() -> None:
+    # A request that sits on a socket until the timeout sits there whichever
+    # percentile it lands in, so the tail climbs alongside the p95 rather than
+    # independently of it.
+    minutes = a_window_with_the_provider_down(began_minutes_ago=10)
+
+    calm = minute_at(15, minutes)
+    degraded = minute_at(3, minutes)
+
+    assert degraded.p99_ms > calm.p99_ms * 2
+    assert degraded.p95_ms > calm.p95_ms * 2
+
+
+def test_a_shop_with_a_cache_reads_its_tail_off_what_it_served() -> None:
+    # Not the baseline model: a mixture of a fast path and a slow one has
+    # quantiles that cannot be written down as a baseline and a multiplier.
+    # With nine requests in ten served from cache, the slowest one in a
+    # hundred is a recomputed page and so is the slowest one in twenty - so
+    # the two sit close together, which is the arrangement that later lets a
+    # small slow cohort move one of them and not the other.
+    minutes = a_window_with_a_working_cache()
+
+    calm = minute_at(5, minutes)
+
+    assert calm.p99_ms >= calm.p95_ms
+    assert calm.p99_ms < calm.p95_ms * 1.5
+
+
+def a_window_with_the_rollout_out(began_minutes_ago: int) -> list[GeneratedMinute]:
+    """A shop whose cache is answering throughout, and whose newest feature has
+    been out to a few requests in a hundred since then.
+
+    The cache is staged and healthy on purpose. A shop without one reports the
+    baseline quantile model, and a model has no sample for a percentile to be
+    taken over - which is the only thing this condition is visible in.
+    """
+    return generate(
+        None,
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="dont-care-flag",
+        cache_endpoint=SOME_CACHE_ENDPOINT,
+        slow_rollout=SlowRollout(
+            began_at=SOME_NOW - timedelta(minutes=began_minutes_ago)
+        ),
+    )
+
+
+def test_the_rollout_moves_the_tail_and_nothing_else() -> None:
+    # The property the whole scenario exists for, and the mirror of the cache's.
+    # Three requests in a hundred is below the 95th percentile by arithmetic, so
+    # the aggregate a monitoring stack watches most confidently is the one that
+    # does not see this - and the error rate never moves at all, because the
+    # pages are correct and merely expensive.
+    minutes = a_window_with_the_rollout_out(began_minutes_ago=10)
+
+    calm = minute_at(15, minutes)
+    degraded = minute_at(3, minutes)
+
+    assert degraded.p99_ms > calm.p99_ms * 2
+    assert degraded.p95_ms < calm.p95_ms * 1.5
+    assert degraded.p50_ms < calm.p50_ms * 1.5
+    assert degraded.error_rate < CLEARLY_HEALTHY
+
+
+def test_the_rollout_leaves_the_heap_where_it_was() -> None:
+    # Nothing is accumulating. A restart reclaims nothing and ends nothing,
+    # which is what separates this from the leak.
+    minutes = a_window_with_the_rollout_out(began_minutes_ago=10)
+
+    assert minute_at(3, minutes).memory_used_bytes < BASELINE_MEMORY_BYTES * 1.5
+
+
+def test_the_minutes_before_the_rollout_report_an_ordinary_tail() -> None:
+    # A quantile nobody has seen quiet is not one anything can be said to have
+    # departed from, so the window has to open with a tail worth comparing to.
+    minutes = a_window_with_the_rollout_out(began_minutes_ago=10)
+
+    calm = minute_at(15, minutes)
+
+    assert calm.p99_ms < calm.p95_ms * 1.5
+
+
+def test_every_minute_of_the_rollout_shows_it_in_the_tail() -> None:
+    # Every minute, not most of them. The cohort is an exact count of the
+    # sample rather than a draw per request, because at three in a hundred a
+    # draw is wrong about which percentile this appears in often enough to cost
+    # the scenario the only thing it demonstrates.
+    minutes = a_window_with_the_rollout_out(began_minutes_ago=10)
+
+    calm = minute_at(15, minutes)
+    while_it_was_out = [minute_at(ago, minutes) for ago in range(1, 9)]
+
+    assert all(
+        minute.p99_ms > calm.p99_ms * 2 for minute in while_it_was_out
+    )
+
+
+def test_a_rollout_landing_in_the_last_seconds_of_a_minute_reaches_nobody_in_it() -> None:
+    # A rollout arriving partway through a minute reaches proportionally fewer
+    # of that minute's requests, so the onset is a slope and not a step. Three
+    # seconds of a minute rounds to no requests at all, which is the end of that
+    # slope worth asserting: the other end is a percentile over six pages and
+    # moves with which shoppers they belonged to, not with how many there were.
+    three_seconds_before_the_hour = (
+        SOME_NOW.replace(second=0) - timedelta(minutes=5) + timedelta(seconds=57)
+    )
+    minutes = generate(
+        None,
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="dont-care-flag",
+        cache_endpoint=SOME_CACHE_ENDPOINT,
+        slow_rollout=SlowRollout(began_at=three_seconds_before_the_hour),
+    )
+
+    the_minute_it_landed_in = minute_at(5, minutes)
+    the_first_whole_minute_after = minute_at(4, minutes)
+
+    assert the_minute_it_landed_in.p99_ms < the_minute_it_landed_in.p95_ms * 1.5
+    assert the_first_whole_minute_after.p99_ms > the_minute_it_landed_in.p99_ms * 2
+
+
+def test_the_rollout_barely_touches_the_hit_ratio() -> None:
+    # A page the rollout reached is a miss by construction - the cache holds the
+    # figure the old rendering produced - so the ratio dips by the rollout's own
+    # share, which over two hundred requests is inside the noise it already has.
+    with_it = minute_at(3, a_window_with_the_rollout_out(began_minutes_ago=10))
+    without_it = minute_at(3, a_window_with_a_working_cache())
+
+    assert with_it.cache_hit_ratio is not None
+    assert without_it.cache_hit_ratio is not None
+    assert without_it.cache_hit_ratio - with_it.cache_hit_ratio < 0.1
+
+
+def a_window_staged_as_the_service_stages_it(
+    began_minutes_ago: int
+) -> list[GeneratedMinute]:
+    """The rollout with its flag on, which is the only way it is ever served.
+
+    Every other case in this section passes no timeline, and that is how the
+    scenario came to stage two faults at once without anything noticing: the
+    flag this rollout ships behind is the same flag four other scenarios ship
+    the monthly summary behind, so turning it on used to route two in five
+    requests into a divisor that is empty for most shoppers. Measured alone the
+    condition looked right; measured as the service wires it, the error rate
+    moved and the logs filled with `ZeroDivisionError`.
+
+    So these cases stage it the way `app.py` does - flag *and* rollout - and
+    they are the ones that would have caught it.
+    """
+    return generate(
+        FlagTimeline(turned_on_at=SOME_NOW - timedelta(minutes=began_minutes_ago)),
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="dont-care-flag",
+        cache_endpoint=SOME_CACHE_ENDPOINT,
+        slow_rollout=SlowRollout(
+            began_at=SOME_NOW - timedelta(minutes=began_minutes_ago)
+        ),
+    )
+
+
+def test_the_flag_that_ships_the_rollout_ships_no_failing_path() -> None:
+    # One flag, and what it ships depends on the scenario. A rollout that also
+    # switched on the monthly summary would stage two faults: the error rate
+    # would move, and the incident that is meant to be invisible in every
+    # aggregate but the tail would be visible in the first one anybody looks at.
+    minutes = a_window_staged_as_the_service_stages_it(began_minutes_ago=10)
+
+    assert all(
+        minute.error_rate < CLEARLY_HEALTHY for minute in minutes
+    )
+
+
+def test_the_rollout_never_quotes_the_monthly_summarys_failure() -> None:
+    # The logs are the other channel a reader has, and a scenario whose pages
+    # all render must not be describing a divisor that was empty.
+    minutes = a_window_staged_as_the_service_stages_it(began_minutes_ago=10)
+
+    said = " ".join(line for minute in minutes for line in minute.log_lines)
+
+    assert "ZeroDivisionError" not in said
+
+
+def test_the_rollout_still_moves_only_the_tail_with_its_flag_on() -> None:
+    # The scenario's property, asserted against the arrangement it is actually
+    # served in rather than against the condition in isolation.
+    minutes = a_window_staged_as_the_service_stages_it(began_minutes_ago=10)
+
+    calm = minute_at(15, minutes)
+    degraded = minute_at(3, minutes)
+
+    assert degraded.p99_ms > calm.p99_ms * 2
+    assert degraded.p95_ms < calm.p95_ms * 1.5
+    assert degraded.p50_ms < calm.p50_ms * 1.5
+
+
+def test_the_cheapest_page_the_rollout_serves_is_slower_than_a_miss() -> None:
+    # The path walks the history once to collect the prices and only then
+    # begins scanning, so even a shopper who has bought one thing pays for both.
+    # A page that cost what a miss costs would sort in among the misses.
+    minutes = a_window_staged_as_the_service_stages_it(began_minutes_ago=10)
+
+    calm = minute_at(15, minutes)
+    degraded = minute_at(3, minutes)
+
+    assert degraded.p99_ms > calm.p95_ms * 2
+
+
+def test_a_scenario_with_no_rollout_is_exactly_as_it_was() -> None:
+    # The condition is threaded through every scenario and staged by one. A
+    # scenario that stages none takes the same draws in the same order and
+    # reports the same figures it always did.
+    without = a_window_with_a_working_cache()
+    again = a_window_with_a_working_cache()
+
+    assert [(m.p50_ms, m.p95_ms, m.p99_ms, m.error_rate, m.cache_hit_ratio)
+            for m in without] == \
+           [(m.p50_ms, m.p95_ms, m.p99_ms, m.error_rate, m.cache_hit_ratio)
+            for m in again]
+
+
+def test_losing_the_cache_leaves_the_tail_alone_too() -> None:
+    # The scenario's property, restated for the quantile that was not being
+    # reported when it was built: the tail described a recomputed page before
+    # the cache went and describes one after it.
+    minutes = a_window_with_the_cache_lost(began_minutes_ago=10)
+
+    calm = minute_at(15, minutes)
+    degraded = minute_at(3, minutes)
+
+    assert degraded.p99_ms < calm.p99_ms * 1.5

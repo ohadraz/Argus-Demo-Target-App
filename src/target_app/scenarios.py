@@ -46,6 +46,7 @@ class ScenarioMinute:
     error_rate: float
     p50_ms: int
     p95_ms: int
+    p99_ms: int
     request_volume: int
     deploy: ScenarioDeploy | None = None
 
@@ -146,6 +147,25 @@ class Scenario:
     and the one whose fix is a value rather than a toggle, a restart or a
     commit.
 
+    `rollout_is_slow` stages the fifth generated kind, and the only one where
+    the shop is neither broken nor slow. It is slow for three requests in a
+    hundred: the account page's newest figure went out to a small canary, and
+    the path it takes walks the shopper's purchase history once per item. Those
+    pages are correct - it is the same figure, worked out the long way - so the
+    error rate never moves, and three in a hundred is below the 95th percentile
+    by arithmetic, so neither does the tail a monitoring stack watches. What
+    moves is the 99th percentile, by an order of magnitude.
+
+    That makes it the mirror of `cache_is_misconfigured`, deliberately. One
+    incident hides in the tail because the tail already described a slow
+    request; the other hides in the p95 because it never reaches that far down
+    the distribution. Neither is visible in the other's aggregate, and both are
+    served by the same cache mixture. What separates them is what ends them: a
+    rollout is a flag somebody moved, so this one is put right by the first
+    mitigation Argus ever had - and unlike the leak and the misconfiguration, it
+    is resolved as well as mitigated, because nothing is left behind for a new
+    process or a re-sync to find.
+
     `offered_in_console` is presentation only. A scenario kept for the capability
     it pins down is not automatically one worth showing an audience; hiding it
     leaves it seedable by id, which is how the e2e suite stages it.
@@ -162,6 +182,7 @@ class Scenario:
     leaks: bool = False
     upstream_fails: bool = False
     cache_is_misconfigured: bool = False
+    rollout_is_slow: bool = False
     # The deploy a *generated* scenario stages, for the one whose cause is a
     # change rather than a state. An authored scenario carries its deploys on
     # its minutes; a generated one has no minutes to hang them on, and a
@@ -215,6 +236,7 @@ THE_COMMIT_BEFORE_IT = "544cef36a8eaf45c5b030c3d5c21473d8176cef3"
 FALLBACK_DISABLED = "fallback-disabled"
 FLAG_TOGGLE_RED_HERRING = "flag-toggle-red-herring"
 COMPETING_FLAG_CHANGES = "competing-flag-changes"
+SLOW_CANARY_ROLLOUT = "slow-canary-rollout"
 
 SCENARIOS: dict[str, Scenario] = {
     FEATURE_FLAG_TOGGLE: Scenario(
@@ -342,6 +364,32 @@ SCENARIOS: dict[str, Scenario] = {
             initiated_by="kuki",
         ),
     ),
+    SLOW_CANARY_ROLLOUT: Scenario(
+        id=SLOW_CANARY_ROLLOUT,
+        title="A slow feature, out to a few percent",
+        description=(
+            "Io's account page is getting a third figure: the shopper's "
+            "typical purchase - the middle of their history rather than the "
+            "average, so one expensive buy stops distorting it. It ships "
+            "behind 'monthly-spend-feature' at three percent of traffic. The "
+            "figure is right every time. What is wrong is how it is worked "
+            "out: the code takes the cheapest purchase that is left, over and "
+            "over, until the middle remains, so it walks the history once per "
+            "item and a shopper who has bought a dozen things waits more than "
+            "two seconds for their page. Nothing fails, so the error rate "
+            "never moves. Three requests in a hundred is below the 95th "
+            "percentile by arithmetic, so the tail a monitoring stack watches "
+            "does not move either - and neither does the median, because "
+            "ninety-seven requests in a hundred are served exactly as they "
+            "were. The only place this incident exists is the 99th percentile, "
+            "where it is ten times its baseline. It is the mirror of the cache "
+            "scenario: that one hides in the tail, this one hides behind it. "
+            "Turning the flag back off ends it, and ends it completely - "
+            "there is nothing left in a heap or in a file for anything to "
+            "bring back."
+        ),
+        rollout_is_slow=True,
+    ),
     BAD_DEPLOYMENT: Scenario(
         id=BAD_DEPLOYMENT,
         title="Bad version deployed",
@@ -364,6 +412,13 @@ SCENARIOS: dict[str, Scenario] = {
                 error_rate=0.01,
                 p50_ms=40,
                 p95_ms=220,
+                # The tail tracks the p95 all the way up, because a deployment
+                # that made the whole service slower made every request
+                # slower. That is the ordinary shape, and it is worth
+                # authoring rather than leaving out: a scenario whose tail sat
+                # still while its p95 climbed would be a second incident
+                # nobody staged.
+                p99_ms=420,
                 request_volume=1150,
                 deploy=ScenarioDeploy(
                     revision="9f4c1e7b2a3d5c8e1f0b6a4d2c9e7b5a3f1d8c6e",
@@ -377,6 +432,7 @@ SCENARIOS: dict[str, Scenario] = {
                 error_rate=0.02,
                 p50_ms=95,
                 p95_ms=900,
+                p99_ms=1600,
                 request_volume=1120,
             ),
             ScenarioMinute(
@@ -387,6 +443,7 @@ SCENARIOS: dict[str, Scenario] = {
                 error_rate=0.04,
                 p50_ms=180,
                 p95_ms=1800,
+                p99_ms=3400,
                 request_volume=1090,
             ),
             ScenarioMinute(
@@ -397,7 +454,12 @@ SCENARIOS: dict[str, Scenario] = {
                 ),
                 error_rate=0.12,
                 p50_ms=320,
+                # Both at the timeout, because the timeout is where a request
+                # stops getting slower and starts being given up on. A tail
+                # authored above it would be a figure no request could have
+                # produced.
                 p95_ms=5000,
+                p99_ms=5000,
                 request_volume=1050,
             ),
         ),

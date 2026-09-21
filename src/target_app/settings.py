@@ -135,6 +135,26 @@ def the_deployed_cache_endpoint(values_file: Path = VALUES_FILE) -> CacheEndpoin
     return CacheEndpoint(host=cache[_HOST], port=int(cache[_PORT]))
 
 
+def the_working_cache_endpoint(values_file: Path = VALUES_FILE) -> CacheEndpoint:
+    """Where the cache actually listens - the deployment's host, at the port the
+    revision before the current one named.
+
+    What a rollback produces, and what a scenario stages when it wants a shop
+    whose cache is simply working. Named here rather than composed at each of
+    those two places, because they are the same address for the same reason and
+    two spellings of it would eventually disagree about which port a healthy
+    shop dials.
+
+    The host still comes from the values file. Only the port was moved, so
+    inventing a host here would be inventing a fact the configuration already
+    holds.
+    """
+    return CacheEndpoint(
+        host=the_deployed_cache_endpoint(values_file).host,
+        port=LAST_KNOWN_GOOD_CACHE_PORT
+    )
+
+
 @lru_cache
 def get_unleash_settings() -> UnleashSettings:
     return UnleashSettings()

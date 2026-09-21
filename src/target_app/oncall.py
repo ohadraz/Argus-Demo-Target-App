@@ -62,6 +62,15 @@ ACKNOWLEDGED_AFTER: dict[str, timedelta] = {
 # errors never move the latency.
 _A_TROUBLED_ERROR_RATE = 0.05
 _A_TROUBLED_P95_MS = 400
+# And the tail, because an incident reaching a few requests in a hundred is
+# below the p95 by arithmetic and fails nothing - so a provider reading the two
+# measures above would hold no incident at all for it, and every figure counted
+# from person-minutes would be counted over a night nobody was woken for.
+#
+# Twice the quiet tail and under every staged phase: a calm minute reports
+# about 380ms, and the mildest minute of an incident that lives here reports
+# well over a second.
+_A_TROUBLED_P99_MS = 800
 
 # How long monitoring takes to notice, where nothing fired an alert through this
 # service. A suite drives the whole incident itself - it stages the scenario and
@@ -138,13 +147,15 @@ def an_incident(incident_id: str,
 def _is_troubled(bucket: Any) -> bool:
     """Whether this is a minute the shop was broken in.
 
-    Either measure, because the scenarios break in different ways: one climbs in
-    latency while its error rate stays ordinary, and the others throw errors at
-    a latency nobody would notice.
+    Any of the three, because the scenarios break in different ways: one climbs
+    in latency while its error rate stays ordinary, others throw errors at a
+    latency nobody would notice, and one is slow for so few requests that it
+    shows up in neither.
     """
     return (
         bucket.error_rate > _A_TROUBLED_ERROR_RATE
         or bucket.p95_ms > _A_TROUBLED_P95_MS
+        or bucket.p99_ms > _A_TROUBLED_P99_MS
     )
 
 

@@ -16,7 +16,9 @@ from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.generator import (
     BASELINE_MEMORY_BYTES,
     MEMORY_LIMIT_BYTES,
+    FlagTimeline,
     GeneratedMinute,
+    SlowRollout,
     generate,
 )
 from target_app.history import FlagHistoryUnavailable
@@ -262,6 +264,12 @@ class MetricBucket(BaseModel):
     error_rate: float
     p50_ms: int
     p95_ms: int
+    # The slowest one request in a hundred. Reported on every bucket of every
+    # scenario, and required rather than optional: no deployment lacks a tail,
+    # so an absent one would be a measurement that went missing rather than a
+    # fact about the service - which is what separates it from the hit ratio
+    # below, where absence says something a zero could not.
+    p99_ms: int
     request_volume: int
     # The resource fields, reported by every bucket of every scenario. Gauges
     # where the four above are rates and quantiles, so each minute takes the
@@ -660,6 +668,7 @@ def metrics() -> list[MetricBucket]:
                 error_rate=minute.error_rate,
                 p50_ms=minute.p50_ms,
                 p95_ms=minute.p95_ms,
+                p99_ms=minute.p99_ms,
                 request_volume=minute.request_volume,
                 memory_used_bytes=minute.memory_used_bytes,
                 memory_limit_bytes=minute.memory_limit_bytes,
@@ -949,6 +958,29 @@ def _generated_minutes() -> list[GeneratedMinute]:
         provider_outage=active.provider_outage if active else None,
         cache_endpoint=active.cache_endpoint if active else None,
         cache_outage=active.cache_outage if active else None,
+        slow_rollout=_the_rollout_in(scenario, timeline),
+    )
+
+
+def _the_rollout_in(scenario: Scenario,
+                    timeline: FlagTimeline | None) -> SlowRollout | None:
+    """The stretch a slow feature has been out over, read off the flag's own
+    history.
+
+    Derived rather than stored, because it is that history said another way:
+    the feature went out the minute the flag went on and came back the minute
+    it went off. A second record of it would be one that comes to disagree with
+    the first about when somebody reverted - and the flag is the record
+    everything else in this service already reconciles against.
+
+    `None` for every scenario that is not this one, which is what keeps the rest
+    of them serving pages on the two paths they always took.
+    """
+    if not scenario.rollout_is_slow or timeline is None:
+        return None
+
+    return SlowRollout(
+        began_at=timeline.turned_on_at, ended_at=timeline.turned_off_at
     )
 
 
@@ -998,6 +1030,7 @@ def _authored_metrics(scenario: Scenario,
             error_rate=entry.error_rate,
             p50_ms=entry.p50_ms,
             p95_ms=entry.p95_ms,
+            p99_ms=entry.p99_ms,
             request_volume=entry.request_volume,
             memory_used_bytes=BASELINE_MEMORY_BYTES,
             memory_limit_bytes=MEMORY_LIMIT_BYTES,

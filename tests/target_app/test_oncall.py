@@ -42,9 +42,15 @@ A_TROUBLED_ERROR_RATE = 0.33
 A_CALM_ERROR_RATE = 0.01
 A_TROUBLED_P95_MS = 1_800
 A_CALM_P95_MS = 215
+# The tail, which bounds an incident on its own. A minute whose slowest one
+# request in a hundred takes a second and a half is a minute somebody is awake
+# for, even where the other two measures say the shop is fine - which is the
+# whole of what a scenario reaching three requests in a hundred looks like.
+A_TROUBLED_P99_MS = 1_500
+A_CALM_P99_MS = 380
 
-# What an incident is bounded by is the error rate and the latency. Memory is
-# required on a bucket and decides nothing here.
+# What an incident is bounded by is the error rate and the two latencies. Memory
+# is required on a bucket and decides nothing here.
 DONT_CARE_MEMORY_BYTES = 400 * 1024**2
 DONT_CARE_STARTED_AT = SOME_MINUTE.timestamp()
 
@@ -183,6 +189,25 @@ def test_a_shop_that_was_never_troubled_is_no_incident_at_all() -> None:
     ) is None
 
 
+def test_a_shop_slow_only_in_its_tail_is_still_an_incident() -> None:
+    # The error rate and the p95 are a calm shop's, because the rollout that
+    # caused this reached too few requests to appear in either. Bounding the
+    # incident on those two alone would report that nobody was ever paged, and
+    # every figure a postmortem counts from person-minutes would be counted
+    # over a night that did not happen.
+    broke_at = SOME_MINUTE
+    lasted = timedelta(minutes=20)
+
+    incident = an_incident(
+        SOME_INCIDENT,
+        _minutes_slow_only_in_the_tail(broke_at, lasted),
+        broke_at
+    )
+
+    assert incident is not None
+    assert incident["resolved_at"] == _as_text(broke_at + lasted)
+
+
 def test_an_incident_nothing_alerted_through_here_is_paged_by_the_monitoring() -> None:
     # A suite drives the whole incident itself: it stages the scenario and posts
     # the alert straight at whatever is listening, so this service is never told
@@ -216,24 +241,43 @@ def test_a_user_nobody_holds_is_answered_as_unknown() -> None:
 
 def _troubled_minutes_from(began_at: datetime, span: timedelta) -> list[MetricBucket]:
     """One broken minute a minute, from `began_at` to `began_at + span`."""
-    return _minutes_from(began_at, span, A_TROUBLED_ERROR_RATE, A_TROUBLED_P95_MS)
+    return _minutes_from(
+        began_at, span, A_TROUBLED_ERROR_RATE, A_TROUBLED_P95_MS, A_TROUBLED_P99_MS
+    )
+
+
+def _minutes_slow_only_in_the_tail(began_at: datetime,
+                                   span: timedelta) -> list[MetricBucket]:
+    """Minutes a handful of requests were very slow in, and nothing else was.
+
+    What a rollout reaching a few requests in a hundred produces: the error
+    rate and the p95 are the ones a calm shop reports, because the requests it
+    reached are too few to appear in either.
+    """
+    return _minutes_from(
+        began_at, span, A_CALM_ERROR_RATE, A_CALM_P95_MS, A_TROUBLED_P99_MS
+    )
 
 
 def _calm_minutes_from(began_at: datetime, span: timedelta) -> list[MetricBucket]:
     """The same, for a shop that is working."""
-    return _minutes_from(began_at, span, A_CALM_ERROR_RATE, A_CALM_P95_MS)
+    return _minutes_from(
+        began_at, span, A_CALM_ERROR_RATE, A_CALM_P95_MS, A_CALM_P99_MS
+    )
 
 
 def _minutes_from(began_at: datetime,
                   span: timedelta,
                   error_rate: float,
-                  p95_ms: int) -> list[MetricBucket]:
+                  p95_ms: int,
+                  p99_ms: int) -> list[MetricBucket]:
     return [
         MetricBucket(
             bucket_id=_as_text(began_at + timedelta(minutes=minute)),
             error_rate=error_rate,
             p50_ms=100,
             p95_ms=p95_ms,
+            p99_ms=p99_ms,
             request_volume=DONT_CARE_VOLUME,
             memory_used_bytes=DONT_CARE_MEMORY_BYTES,
             process_start_time_seconds=DONT_CARE_STARTED_AT

@@ -68,6 +68,18 @@ _BASELINE_ERROR_RATE = 0.01
 _BASELINE_ERROR_RATE_WOBBLE = 0.005
 _BASELINE_P50_MS = 45
 _BASELINE_P95_MS = 215
+# What the slowest one request in a hundred costs when nothing is wrong.
+#
+# Given its own baseline rather than pinned to a multiple of the p95, because a
+# tail that can only move when the p95 moves is a fifth series saying what the
+# fourth already said - and the whole reason to report a tail is that a fault
+# reaching three requests in a hundred moves it and moves nothing else.
+#
+# Reported on every minute of every scenario, not only the ones about the tail,
+# for the reason memory is: a series that appeared when it mattered would be
+# read as a signal by its presence, and a quantile nobody has seen quiet is not
+# one anything can be said to have departed from.
+_BASELINE_P99_MS = 380
 # How far each latency figure wobbles minute to minute, as a fraction of the
 # figure itself rather than as a count of milliseconds. One absolute spread
 # across both quantiles is a different claim about each: ±8ms is 4% of a 215ms
@@ -138,6 +150,42 @@ _PAGE_LATENCY_WOBBLE_MS = 12
 # Raise it past about nineteen in twenty and the tail moves too, which makes
 # the scenario ordinary and costs it the only thing it demonstrates.
 _HEALTHY_HIT_SHARE = 0.9
+
+# How much of the shop's traffic the newest feature is rolled out to, and the
+# number the tail scenario's whole claim rests on.
+#
+# The band is narrow and both edges are arithmetic. The 95th percentile of a
+# two-hundred-request sample is the 190th value, so anything past five in a
+# hundred displaces it and the incident becomes an ordinary latency regression
+# that any monitoring stack sees. The 99th is the 198th, so anything under one
+# in a hundred is invisible there too and there is no incident left to detect.
+# Three in a hundred sits between them with room either side.
+_SLOW_ROLLOUT_SHARE = 0.03
+
+# Which requests of a minute's sample the rollout reached - an exact count,
+# where every other condition here is a per-request draw.
+#
+# Deliberate, and the reason is arithmetic rather than taste. At three in a
+# hundred of two hundred requests a binomial draw has a mean of six and a spread
+# of about two and a half: four minutes in a hundred draw eleven or more and
+# show the incident in the p95, and six in a hundred draw two or fewer and hide
+# it from the p99. A scenario whose entire claim is that the p95 never sees this
+# cannot be wrong about it one minute in twenty-five.
+#
+# It is also the more faithful of the two. A percentage rollout in a real
+# provider buckets by user hash; it does not flip a coin per request. And the
+# precedent is already here - `_with_the_allocations_that_failed` takes an exact
+# share of the sample for the same kind of reason.
+#
+# What the rollout costs is not a constant, because the expensive path's cost
+# follows the shopper: it collects the prices once and then walks what is left
+# again per item, so one of these pages takes a recompute *plus* a recompute
+# for every item bought. The slowest pages therefore belong to the heaviest
+# accounts, which is what a tail is - not "three in a hundred requests are
+# slow" but "the slowest requests belong to the best customers" - and the
+# cheapest of them, a shopper who has bought one thing, still costs twice what
+# an ordinary miss costs.
+_RECOMPUTE_PER_ITEM_MS = _RECOMPUTED_PAGE_MS
 
 # What the cache hands back when it holds a shopper's figure. Which figure it
 # is decides nothing - the page shows it and no metric reads it - and a cached
@@ -302,6 +350,51 @@ class CacheOutage:
 
 
 @dataclass(frozen=True)
+class SlowRollout:
+    """When the shop began serving a few of its requests the expensive way, and
+    when it stopped.
+
+    Shaped like the two outages above and staging something that is not an
+    outage at all: nothing here is failing, unreachable, or down. A feature went
+    out to a slice of traffic, and for the shoppers in that slice the page does
+    more work than it needs to. The pages are correct, the shop is up, and the
+    only thing wrong is how long a few of them take.
+
+    That is why it is its own condition rather than a share on the flag
+    timeline. What the flag decides is which cohort a request is in; what this
+    decides is over which minutes being in that cohort cost anything.
+
+    `ended_at` being `None` means the rollout is still out there.
+    """
+
+    began_at: datetime
+    ended_at: datetime | None = None
+
+    def share_of(self, minute: datetime, elapsed_seconds: int) -> float:
+        """How much of this minute's first `elapsed_seconds` the rollout was
+        live for.
+
+        A share for the reason the other two conditions have one: the minute a
+        rollout lands in is partly served the old way and partly the new, and
+        reporting it as either whole would put a step where the telemetry has a
+        slope. Here it scales how many of the minute's requests reached the
+        expensive path, so the onset ramps over one minute rather than
+        appearing entire.
+        """
+        if elapsed_seconds <= 0:
+            return 0.0
+
+        window_end = minute + timedelta(seconds=elapsed_seconds)
+        live_from = max(minute, self.began_at)
+        live_until = window_end if self.ended_at is None else min(
+            window_end, self.ended_at
+        )
+        seconds_live = max(0.0, (live_until - live_from).total_seconds())
+
+        return min(1.0, seconds_live / elapsed_seconds)
+
+
+@dataclass(frozen=True)
 class ProcessLifetime:
     """When the shop's process came up, and every time it has come up since.
 
@@ -347,6 +440,7 @@ class GeneratedMinute:
     error_rate: float
     p50_ms: int
     p95_ms: int
+    p99_ms: int
     request_volume: int
     memory_used_bytes: int
     memory_limit_bytes: int | None
@@ -369,7 +463,8 @@ def generate(timeline: FlagTimeline | None,
              restarts: tuple[datetime, ...] = (),
              provider_outage: ProviderOutage | None = None,
              cache_endpoint: CacheEndpoint | None = None,
-             cache_outage: CacheOutage | None = None) -> list[GeneratedMinute]:
+             cache_outage: CacheOutage | None = None,
+             slow_rollout: SlowRollout | None = None) -> list[GeneratedMinute]:
     """Every minute from `span_minutes` ago up to and including the one in
     progress, once any of it has happened.
 
@@ -426,6 +521,13 @@ def generate(timeline: FlagTimeline | None,
     Left unsaid, a configured cache answers throughout - which is what a shop
     with a working cache looks like, and what the minutes before this
     scenario's onset are.
+
+    `slow_rollout` is the stretch over which a few of the shop's requests were
+    served the expensive way. Left unsaid, nothing is rolled out and every page
+    takes one of the two paths it always took. It needs a cache endpoint beside
+    it, because a shop with no cache reports the baseline quantile model and a
+    model has no sample for a percentile to be taken over - which is the whole
+    of what this condition is visible in.
     """
     current_minute = now.replace(second=0, microsecond=0)
     elapsed_in_current = int((now - current_minute).total_seconds())
@@ -453,6 +555,7 @@ def generate(timeline: FlagTimeline | None,
             provider_outage=provider_outage,
             cache_endpoint=cache_endpoint,
             cache_outage=cache_outage,
+            slow_rollout=slow_rollout,
         )
         for offset in range(span_minutes, 0, -1)
     ]
@@ -478,6 +581,7 @@ def generate(timeline: FlagTimeline | None,
                 provider_outage=provider_outage,
                 cache_endpoint=cache_endpoint,
                 cache_outage=cache_outage,
+                slow_rollout=slow_rollout,
             )
         )
 
@@ -497,6 +601,7 @@ def _generate_minute(
     provider_outage: ProviderOutage | None = None,
     cache_endpoint: CacheEndpoint | None = None,
     cache_outage: CacheOutage | None = None,
+    slow_rollout: SlowRollout | None = None,
 ) -> GeneratedMinute:
     minute_id = minute.strftime(TIMESTAMP_FORMAT)
     entropy = random.Random(minute_id)
@@ -527,6 +632,18 @@ def _generate_minute(
         else 0.0
     )
 
+    # An exact count of the sample rather than a draw per request - see
+    # `_SLOW_ROLLOUT_SHARE`. Scaled by how much of the minute the rollout was
+    # live for, so the minute it lands in is partly served each way and the
+    # onset is a slope rather than a step, exactly as the two outages above are.
+    reached_by_the_rollout = round(
+        _SLOW_ROLLOUT_SHARE * _SAMPLE_SIZE * (
+            slow_rollout.share_of(minute, elapsed_seconds)
+            if slow_rollout is not None
+            else 0.0
+        )
+    )
+
     outcomes = [
         _serve_one_account_page(
             entropy,
@@ -535,8 +652,10 @@ def _generate_minute(
             cache_entropy,
             share_of_minute_without_the_cache,
             cache_endpoint,
+            the_rollout_reached_it=index < reached_by_the_rollout,
+            the_flag_ships_the_slow_feature=slow_rollout is not None,
         )
-        for _ in range(_SAMPLE_SIZE)
+        for index in range(_SAMPLE_SIZE)
     ]
     failures = [served.failure for served in outcomes if served.failure is not None]
     served_the_broken_path = sum(1 for served in outcomes if served.flag_is_on)
@@ -598,6 +717,20 @@ def _generate_minute(
         ),
         memory_limit_bytes=MEMORY_LIMIT_BYTES,
         process_start_time_seconds=serving_since.timestamp(),
+        # Out of field order, and after the memory draw on purpose. Each minute
+        # seeds one generator, so a draw inserted beside the other two
+        # quantiles would shift the memory wobble and move a figure in every
+        # scenario that has nothing to do with the tail. Taken last, adding the
+        # tail left every number this generator already produced exactly where
+        # it was - which is the same reason memory itself is drawn after the
+        # latencies.
+        p99_ms=_the_quantile_at(measured, 0.99) if measured else round(
+            (_BASELINE_P99_MS + _wobble_around(
+                entropy, _BASELINE_P99_MS, _TAIL_WOBBLE_AS_FRACTION_OF_BASELINE
+            ))
+            * under_pressure
+            + _waiting_on_the_provider(share_of_minute_refused)
+        ),
         log_lines=_log_lines_for(
             minute_id,
             failures,
@@ -876,6 +1009,8 @@ def _serve_one_account_page(
     cache_entropy: random.Random | None = None,
     share_of_minute_without_the_cache: float = 0.0,
     cache_endpoint: CacheEndpoint | None = None,
+    the_rollout_reached_it: bool = False,
+    the_flag_ships_the_slow_feature: bool = False,
 ) -> _ServedPage:
     """Puts one request through the shop and records how it went.
 
@@ -905,24 +1040,62 @@ def _serve_one_account_page(
     many values it takes, so the cache can be consulted on every request of
     every scenario - which is what lets a hit ratio be reported everywhere -
     without moving a single figure this generator already produced.
+
+    `the_rollout_reached_it` is decided by the caller rather than drawn here,
+    and it is the one cohort decision in this module that is not a draw. Which
+    requests the newest feature reached is an exact count of the minute's
+    sample, for the reason written where that share is declared: at three in a
+    hundred, a draw is wrong about which percentile the incident appears in
+    often enough to cost the scenario the only thing it demonstrates.
+
+    `the_flag_ships_the_slow_feature` says which feature the flag is shipping,
+    because the shop has one flag and five scenarios behind it. Four ship the
+    monthly summary, whose divisor is empty for a shopper who has bought
+    nothing this month; one ships the typical purchase, which is correct for
+    everybody and merely slow. Shipping both at once is not a second scenario,
+    it is a scenario staging two faults: the error rate moves, and the incident
+    that is meant to be invisible in every aggregate but the tail becomes
+    visible in the first one anybody looks at. It is a parameter rather than an
+    inference from `the_rollout_reached_it`, because that one is true only for
+    the cohort and this has to hold for every request of the minute.
     """
     flag_is_on = entropy.random() < share_of_minute_flagged
-    use_monthly_summary = flag_is_on and entropy.random() < CANARY_SHARE
+    in_the_canary = flag_is_on and entropy.random() < CANARY_SHARE
+    # One flag, and what it ships depends on which scenario is staged. Four of
+    # them ship the monthly summary, whose divisor is empty for a shopper who
+    # has bought nothing this month; one ships the typical purchase, which is
+    # correct for everybody and merely slow. A scenario that shipped both would
+    # be staging two faults at once - the error rate would move, and the
+    # incident that is invisible in every aggregate but the tail would be
+    # visible in the first one anybody looks at.
+    #
+    # The canary is still drawn either way, so that suppressing it here cannot
+    # shift a single figure in the four scenarios that do ship it.
+    use_monthly_summary = in_the_canary and not the_flag_ships_the_slow_feature
     provider_refused = (
         share_of_minute_refused > 0.0
         and entropy.random() < share_of_minute_refused
     )
+    an_account_of_theirs = _an_account(entropy)
 
     page = serve_account_page(
-        _an_account(entropy),
+        an_account_of_theirs,
         use_monthly_summary=use_monthly_summary,
         ask_the_provider=_the_provider_answering(refusing=provider_refused),
         look_up_summary=_the_cache_answering(
-            cache_entropy, share_of_minute_without_the_cache
+            cache_entropy,
+            share_of_minute_without_the_cache,
+            could_hold_this_figure=not the_rollout_reached_it
         ),
-        cache_endpoint=cache_endpoint
+        cache_endpoint=cache_endpoint,
+        use_typical_spend=the_rollout_reached_it
     )
-    cost = _what_the_page_cost(cache_entropy, page.served_from_cache)
+    cost = _what_the_page_cost(
+        cache_entropy,
+        page.served_from_cache,
+        walked_once_per_item=the_rollout_reached_it,
+        items_bought=len(an_account_of_theirs.purchases)
+    )
 
     if page.failure is not None:
         return _ServedPage(flag_is_on, page.failure, cost, page.served_from_cache,
@@ -950,7 +1123,8 @@ def _serve_one_account_page(
 
 
 def _the_cache_answering(cache_entropy: random.Random | None,
-                         share_of_minute_without_the_cache: float) -> LookUpSummary | None:
+                         share_of_minute_without_the_cache: float,
+                         could_hold_this_figure: bool = True) -> LookUpSummary | None:
     """The cache, as this request finds it.
 
     `None` where the deployment configured no cache at all, which is what every
@@ -962,12 +1136,23 @@ def _the_cache_answering(cache_entropy: random.Random | None,
     shopper's figure happened to be in it. Both are draws rather than
     decisions, because a hit ratio is a property of traffic rather than of any
     one request.
+
+    `could_hold_this_figure` is false for a request the newest feature reached,
+    and it is a miss by construction rather than by luck: what the cache holds
+    is the figure the old rendering produced, and this request is asking for a
+    different one. That is why a rollout costs what it costs - every page it
+    reaches computes - and it is also why the hit ratio dips by the rollout's
+    own share, which over two hundred sampled requests is inside the noise the
+    ratio already has.
+
+    Both draws are taken either way, so that a request skipping the cache
+    cannot shift the sequence for the requests after it.
     """
     if cache_entropy is None:
         return None
 
     unreachable = cache_entropy.random() < share_of_minute_without_the_cache
-    held_it = cache_entropy.random() < _HEALTHY_HIT_SHARE
+    held_it = cache_entropy.random() < _HEALTHY_HIT_SHARE and could_hold_this_figure
 
     def look_up(shopper_id: str) -> CacheAnswer:
         if unreachable:
@@ -982,7 +1167,9 @@ def _the_cache_answering(cache_entropy: random.Random | None,
 
 
 def _what_the_page_cost(cache_entropy: random.Random | None,
-                        served_from_cache: bool) -> int | None:
+                        served_from_cache: bool,
+                        walked_once_per_item: bool = False,
+                        items_bought: int = 0) -> int | None:
     """How long this request took, in milliseconds.
 
     `None` where there is no cache, because then the request's cost was never
@@ -991,14 +1178,45 @@ def _what_the_page_cost(cache_entropy: random.Random | None,
 
     Where there is one, the cost follows the path: a cached page skips walking
     the shopper's purchase history, and that walk is the expensive part. The
-    two paths are drawn around different centres and both wobble, so a minute's
-    quantiles are real percentiles over a real mixture rather than two numbers
+    three paths are drawn around different centres and all wobble, so a minute's
+    quantiles are real percentiles over a real mixture rather than three numbers
     somebody decided on.
+
+    The third path is the one the newest feature takes, and it is the only one
+    whose centre is not a constant: it collects the prices once and then walks
+    what is left again per item, so it costs a recompute plus a recompute for
+    every item bought. A shopper with one purchase already costs twice what an
+    ordinary miss costs, and a shopper with a dozen waits more than two seconds
+    - which is why the requests at the top of this minute's tail are the ones
+    belonging to the best customers, and why none of these pages ever lands in
+    the band a recomputed page occupies.
+
+    One draw whichever path was taken, so that adding the third left the
+    sequence exactly as long as it was.
     """
     if cache_entropy is None:
         return None
 
-    centre = _CACHED_PAGE_MS if served_from_cache else _RECOMPUTED_PAGE_MS
+    if walked_once_per_item:
+        # A recompute *and then* the repeated scans, because that is what the
+        # code does: it walks the history once to collect the prices, and only
+        # then starts taking the cheapest that is left. So the cheapest page
+        # this path can serve - a shopper who has bought one thing - already
+        # costs twice what a miss costs and never lands in the band a
+        # recomputed page occupies.
+        #
+        # Faithfulness rather than arithmetic: it leaves the 95th percentile
+        # where it was. That quantile moves from 189ms to 196ms across the onset
+        # whatever this floor is, and the cause is structural rather than a
+        # question of centres - the requests the rollout takes are no longer
+        # cacheable, so the remaining traffic has fewer of them and the 190th
+        # value sits higher up the same band of misses. Well inside the calm
+        # range either way, and nowhere near a departure.
+        centre = _RECOMPUTED_PAGE_MS + _RECOMPUTE_PER_ITEM_MS * items_bought
+    elif served_from_cache:
+        centre = _CACHED_PAGE_MS
+    else:
+        centre = _RECOMPUTED_PAGE_MS
 
     return max(
         1,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from unittest.mock import Mock
 
 import pytest
@@ -18,6 +18,7 @@ from target_app.generator import BASELINE_MEMORY_BYTES
 from target_app.scenarios import (
     CACHE_MISCONFIGURED,
     RESOURCE_LEAK,
+    SLOW_CANARY_ROLLOUT,
     UPSTREAM_DEPENDENCY_FAILURE,
 )
 from target_app.state import ScenarioState
@@ -374,3 +375,128 @@ def test_the_cache_scenario_reports_a_hit_ratio_and_a_flat_error_rate(
 
     assert newest["cache_hit_ratio"] == 0.0
     assert newest["error_rate"] < 0.05
+
+
+# What tells the rollout's minutes from the shop's own, and how far the other
+# two quantiles are allowed to drift across that split. The same figures the
+# e2e case uses, for the same reason: the tail sits near 200ms while nothing is
+# rolled out and well over a second while it is, so doubling is a partition and
+# not a threshold.
+THE_TAIL_AT_LEAST_DOUBLES = 2.0
+THE_AGGREGATES_GROW_BY_NO_MORE_THAN = 1.25
+A_CALM_ERROR_RATE = 0.05
+
+
+@pytest.fixture
+def a_shop_whose_flag_is_on() -> Iterator[TestClient]:
+    """The service with its feature flag reading on, for one test.
+
+    The `client` fixture's provider answers off, which is the *healthy* state
+    for a scenario staged through the feature flag - so a rollout seeded against
+    it reconciles to recovered on the first read and the window holds no slow
+    minutes to compare. This one answers where seeding left it.
+    """
+    flags = Mock(spec=FlagClient)
+    flags.is_enabled.return_value = True
+    flags.name = "monthly-spend-feature"
+    fallback_flags = Mock(spec=FlagClient)
+    fallback_flags.is_enabled.return_value = True
+    fallback_flags.name = "legacy-checkout-fallback"
+
+    was = app_module.state
+    app_module.state = ScenarioState(flags, fallback_flags, Mock())
+    forget_every_visit()
+
+    yield TestClient(app)
+
+    app_module.state = was
+    forget_every_visit()
+
+
+def a_staged_slow_rollout(client: TestClient) -> None:
+    seeded = client.post("/scenario/seed", json={"scenario_id": SLOW_CANARY_ROLLOUT})
+
+    assert seeded.status_code == 200
+
+
+def the_shops_window(client: TestClient) -> list[dict]:
+    buckets = client.get("/metrics").json()
+
+    assert buckets
+
+    return buckets
+
+
+def the_middle_of(figures: Iterable[float]) -> float:
+    """The median of a window's readings, without the import.
+
+    A plain sort rather than `statistics.median`: the window is small, and what
+    an assertion needs from the middle of it is a figure the shop actually
+    reported rather than an average of two.
+    """
+    ordered = sorted(figures)
+
+    assert ordered
+
+    return float(ordered[len(ordered) // 2])
+
+
+def test_the_rollout_scenario_is_seedable_by_id(
+    a_shop_whose_flag_is_on: TestClient
+) -> None:
+    a_staged_slow_rollout(a_shop_whose_flag_is_on)
+
+    status = a_shop_whose_flag_is_on.get("/scenario/status").json()
+
+    assert status["active_scenario"] == SLOW_CANARY_ROLLOUT
+
+
+def test_the_rollout_moves_only_the_tail_as_the_service_serves_it(
+    a_shop_whose_flag_is_on: TestClient
+) -> None:
+    # The claim this scenario exists for, asserted where the *arrangement* is
+    # made rather than where the condition is. `test_generator.py` proves a
+    # rollout handed to the generator moves one series; this proves `app.py`
+    # hands it the arrangement that condition belongs to, deriving the rollout
+    # from the flag's own timeline. That half is what was wrong when the
+    # scenario shipped two faults instead of one, and only a 30-minute e2e run
+    # was checking it.
+    a_staged_slow_rollout(a_shop_whose_flag_is_on)
+
+    window = the_shops_window(a_shop_whose_flag_is_on)
+    quietest = min(minute["p99_ms"] for minute in window)
+    a_moved_tail = quietest * THE_TAIL_AT_LEAST_DOUBLES
+    slow = [minute for minute in window if minute["p99_ms"] > a_moved_tail]
+    ordinary = [minute for minute in window if minute["p99_ms"] <= a_moved_tail]
+
+    # Both halves, so a window where nothing was ever staged fails here rather
+    # than passing on an empty comparison.
+    assert slow
+    assert ordinary
+
+    tail_before = the_middle_of(minute["p99_ms"] for minute in ordinary)
+    tail_after = the_middle_of(minute["p99_ms"] for minute in slow)
+    median_before = the_middle_of(minute["p50_ms"] for minute in ordinary)
+    median_after = the_middle_of(minute["p50_ms"] for minute in slow)
+    p95_before = the_middle_of(minute["p95_ms"] for minute in ordinary)
+    p95_after = the_middle_of(minute["p95_ms"] for minute in slow)
+
+    assert tail_after >= tail_before * THE_TAIL_AT_LEAST_DOUBLES
+    assert median_after <= median_before * THE_AGGREGATES_GROW_BY_NO_MORE_THAN
+    assert p95_after <= p95_before * THE_AGGREGATES_GROW_BY_NO_MORE_THAN
+
+
+def test_the_rollout_fails_no_request_as_the_service_serves_it(
+    a_shop_whose_flag_is_on: TestClient
+) -> None:
+    # The regression for the two faults. The flag this scenario stages is the
+    # same one the `ZeroDivisionError` canary sits behind, so an arrangement
+    # shipping the monthly summary alongside the rollout puts the error rate at
+    # several times its idle - and this is the one incident in which nothing
+    # fails. Read across the whole window, not its newest minute: a rate that
+    # moved and came back is still a second fault.
+    a_staged_slow_rollout(a_shop_whose_flag_is_on)
+
+    window = the_shops_window(a_shop_whose_flag_is_on)
+
+    assert max(minute["error_rate"] for minute in window) < A_CALM_ERROR_RATE

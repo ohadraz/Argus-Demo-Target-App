@@ -59,7 +59,8 @@ def serve_account_page(account: Account,
                        use_monthly_summary: bool,
                        ask_the_provider: AskTheProvider,
                        look_up_summary: LookUpSummary | None = None,
-                       cache_endpoint: CacheEndpoint | None = None) -> RenderedPage:
+                       cache_endpoint: CacheEndpoint | None = None,
+                       use_typical_spend: bool = False) -> RenderedPage:
     """Renders the account page, reporting a failure rather than raising one.
 
     Two things are shown and both are needed: what the shopper averages per
@@ -68,10 +69,12 @@ def serve_account_page(account: Account,
     from inside a page render, which is ordinary and is also why an outage over
     there arrives here as Io's own error rate.
 
-    `use_monthly_summary` is the rollout decision already made - whether this
-    request is one of the ones the new figure is live for. The page does not
-    make that decision itself; it is told, the way a handler is told by the flag
-    SDK that evaluated for this user.
+    `use_monthly_summary` and `use_typical_spend` are the rollout decisions
+    already made - whether this request is one of the ones each new figure is
+    live for. The page does not make those decisions itself; it is told, the way
+    a handler is told by the flag SDK that evaluated for this user. Two of them
+    because there are two rollouts running, and a page carrying one boolean for
+    both would be a page that cannot say which feature a request got.
 
     `look_up_summary` and `cache_endpoint` are how the figure is looked for
     before it is worked out. Both optional and both absent together, because a
@@ -81,7 +84,8 @@ def serve_account_page(account: Account,
     """
     try:
         figure_cents, from_cache, cache_failure = _the_figure_for(
-            account, use_monthly_summary, look_up_summary, cache_endpoint
+            account, use_monthly_summary, look_up_summary, cache_endpoint,
+            use_typical_spend
         )
         card = card_on_file(account.shopper_id, ask_the_provider)
     except Exception as error:  # noqa: BLE001 - the boundary records anything
@@ -103,7 +107,8 @@ def _the_figure_for(
     account: Account,
     use_monthly_summary: bool,
     look_up_summary: LookUpSummary | None,
-    cache_endpoint: CacheEndpoint | None
+    cache_endpoint: CacheEndpoint | None,
+    use_typical_spend: bool
 ) -> tuple[int, bool, str | None]:
     """The figure to show, whether it came from the cache, and what the cache
     said if it could not be reached.
@@ -119,7 +124,9 @@ def _the_figure_for(
     """
     if look_up_summary is None or cache_endpoint is None:
         return render_spend_summary(
-            account, use_monthly_summary=use_monthly_summary
+            account,
+            use_monthly_summary=use_monthly_summary,
+            use_typical_spend=use_typical_spend
         ), False, None
 
     cache_failure: str | None = None
@@ -133,7 +140,9 @@ def _the_figure_for(
         return found, True, cache_failure
 
     return render_spend_summary(
-        account, use_monthly_summary=use_monthly_summary
+        account,
+        use_monthly_summary=use_monthly_summary,
+        use_typical_spend=use_typical_spend
     ), False, cache_failure
 
 

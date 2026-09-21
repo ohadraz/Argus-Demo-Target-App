@@ -245,7 +245,7 @@ PAGE = """<!doctype html>
 <h2>Metrics <span class="note">- per minute, newest last</span></h2>
 <div class="scroll" id="metrics-scroll">
   <table>
-    <thead><tr><th>minute</th><th>error rate</th><th>p50 ms</th><th>p95 ms</th><th>requests</th></tr></thead>
+    <thead><tr><th>minute</th><th>error rate</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>requests</th></tr></thead>
     <tbody id="metrics"></tbody>
   </table>
 </div>
@@ -463,6 +463,7 @@ function renderMetrics(buckets) {
         bucket.bucket_id === recoveredAt ? ' class="recovered"' : '';
       return '<tr' + marker + '><td>' + bucket.bucket_id + notes + '</td>' + cell +
              '<td>' + bucket.p50_ms + '</td><td>' + bucket.p95_ms + '</td>' +
+             '<td>' + bucket.p99_ms + '</td>' +
              '<td>' + bucket.request_volume + '</td></tr>';
     })
     .join(''));

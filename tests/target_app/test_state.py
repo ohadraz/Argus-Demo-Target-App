@@ -22,9 +22,10 @@ from target_app.scenarios import (
     FLAG_TOGGLE_RED_HERRING,
     RESOURCE_LEAK,
     SCENARIOS,
+    SLOW_CANARY_ROLLOUT,
     UPSTREAM_DEPENDENCY_FAILURE,
 )
-from target_app.settings import get_scenario_settings
+from target_app.settings import get_scenario_settings, the_working_cache_endpoint
 from target_app.state import (
     COMPLETE,
     IDLE,
@@ -859,3 +860,80 @@ def test_resetting_a_cache_scenario_touches_no_flag() -> None:
 
     assert not flags.enable.called and not flags.disable.called
     assert not fallback.enable.called and not fallback.disable.called
+
+
+def a_staged_slow_rollout(flags: Mock | None = None) -> ScenarioState:
+    """A state object with the slow feature out to a few percent of traffic.
+
+    A flag scenario like the first four, so the flag is reported on from the
+    start and the staging turns it on exactly as those do. What is different is
+    only what the requests it reaches cost.
+    """
+    state = a_scenario_state(flags or a_flag_client_reporting(True))
+    state.seed(SCENARIOS[SLOW_CANARY_ROLLOUT])
+
+    return state
+
+
+def test_staging_a_slow_rollout_turns_its_flag_on() -> None:
+    # A rollout is a flag somebody moved, which is the whole reason this
+    # scenario costs no new mitigation: the lever that ends it is the first one
+    # Argus ever had.
+    flags = a_flag_client_reporting(True)
+
+    a_staged_slow_rollout(flags)
+
+    assert where_it_was_left(flags)
+
+
+def test_staging_a_slow_rollout_puts_the_shop_on_a_working_cache() -> None:
+    # Not a detail. A shop with no cache reports the baseline quantile model,
+    # which has no sample for a percentile to be taken over - and the mixture
+    # of a cached path and a recomputed one is what puts the 95th percentile on
+    # a recomputed page, which is why the 95th does not move.
+    state = a_staged_slow_rollout()
+
+    active = state.active
+
+    assert active is not None
+    assert active.cache_endpoint == the_working_cache_endpoint()
+    assert active.cache_outage is None
+
+
+def test_a_slow_rollout_nobody_has_reverted_is_still_running() -> None:
+    state = a_staged_slow_rollout()
+
+    assert state.phase() == RUNNING
+
+
+def test_a_restart_does_not_end_a_slow_rollout() -> None:
+    # Nothing is accumulating, so there is nothing for a restart to reclaim.
+    # The new process comes up reading the same flag and serving the same few
+    # requests the expensive way.
+    state = a_staged_slow_rollout()
+
+    state.restart_the_shop()
+
+    assert state.phase() == RUNNING
+
+
+def test_reverting_the_flag_ends_a_slow_rollout() -> None:
+    flags = a_flag_client_reporting(True)
+    state = a_staged_slow_rollout(flags)
+
+    flags.is_enabled.return_value = False
+
+    assert state.phase() == RECOVERING
+
+
+def test_resetting_a_slow_rollout_puts_its_own_flag_back() -> None:
+    # Unlike the leak and the misconfiguration, this one did move a flag, so a
+    # reset has one to put back - and putting it back is also what ends the
+    # incident, which is why it is the only generated scenario that is resolved
+    # as well as mitigated.
+    flags = a_flag_client_reporting(True)
+    state = a_staged_slow_rollout(flags)
+
+    state.reset()
+
+    assert not where_it_was_left(flags)
