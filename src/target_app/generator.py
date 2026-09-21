@@ -1089,9 +1089,16 @@ def _log_lines_for(
         f"{minute_id} ERROR io-shop: account page request failed - {failure}"
         for failure in failures[:_MAX_FAILURE_LINES_PER_MINUTE]
     ]
-    rate_percent = round(100 * len(failures) / sample_size)
+    # Two decimals, always - and the width fixed at the render site rather than
+    # left to the value. To the nearest whole percent a single failure in 200 is
+    # 0.5% and rounds to 0, which would put "error rate at 0%" directly beneath
+    # the ERROR line that failure produced; this is the line a reader scans and
+    # the line the model is handed, and the two must not disagree. Rounding up
+    # instead would fix the zero by lying the other way - 1 in 2000 is not 1% -
+    # and the model reads this figure as the incident's severity.
+    rate_percent = 100 * len(failures) / sample_size
     aggregate = (
-        f"{minute_id} WARN io-shop: account page error rate at {rate_percent}% "
+        f"{minute_id} WARN io-shop: account page error rate at {rate_percent:.2f}% "
         f"over the last minute"
     )
 

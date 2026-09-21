@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 
 from io_shop.payment_provider import PROVIDER_HOST
@@ -238,6 +239,34 @@ def test_a_degraded_minute_says_so_in_both_channels() -> None:
     assert degraded.error_rate > CLEARLY_DEGRADED
     assert any("ERROR" in line for line in degraded.log_lines)
     assert all(line.startswith(degraded.minute_id) for line in degraded.log_lines)
+
+
+def _rate_quoted_in(minute: GeneratedMinute) -> float:
+    """The percentage the minute's aggregate WARN line puts on its failures."""
+    said = next(line for line in minute.log_lines if "error rate at" in line)
+    quoted = re.search(r"error rate at ([\d.]+)% ", said)
+
+    assert quoted is not None, f"no error rate to read in {said!r}"
+
+    return float(quoted.group(1))
+
+
+def test_a_minute_with_failures_never_quotes_a_zero_error_rate() -> None:
+    # Quoted to the nearest whole percent, one failure in 200 is 0.5% and
+    # rounds to 0 - and that 0% sits directly beneath the ERROR line the
+    # failure produced. The aggregate is the line a reader scans and the line
+    # the model is handed, so a minute something happened in must not summarise
+    # itself as a minute nothing happened in.
+    minutes = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES)
+
+    failing = [
+        minute
+        for minute in minutes
+        if any("ERROR" in line for line in minute.log_lines)
+    ]
+
+    assert failing
+    assert all(_rate_quoted_in(minute) > 0 for minute in failing)
 
 
 def test_a_healthy_minute_carries_none_of_the_seeded_fault() -> None:
