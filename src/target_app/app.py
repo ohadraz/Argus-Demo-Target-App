@@ -43,10 +43,22 @@ from target_app.scenarios import (
 from target_app.settings import get_scenario_settings, get_unleash_settings
 from target_app.state import ScenarioState
 
-# How much history the generated channels serve. Wide enough that a reader
-# looking for the service's calm baseline finds plenty of it either side of an
-# incident, and narrow enough that generating it stays cheap.
-GENERATED_SPAN_MINUTES = 90
+# How much history the generated channels serve. Six hours, because that is
+# the window a responder actually asks for: Argus fetches its metrics summary
+# over a fixed six-hour span anchored on the alert, and a shop serving ninety
+# minutes answered a quarter of it.
+#
+# The quarter that was missing was not missing data a reader could notice - it
+# simply was not there to ask for. So every prompt measured against this
+# fixture was a quarter the size of the one production would send, and any
+# bound calibrated from those measurements was a quarter of the number it
+# needed to be.
+#
+# Cost is not what decides this figure, and used to be. A finished minute is
+# generated once and remembered (`generator._a_whole_minute`), so a longer
+# window costs one pass rather than one per request - which is what let this
+# become a question about what a window means instead of what it costs.
+GENERATED_SPAN_MINUTES = 360
 
 # How long before the change that broke it the previous revision went out. Far
 # enough back to be outside the incident and plainly not its cause, close
@@ -959,6 +971,7 @@ def _generated_minutes() -> list[GeneratedMinute]:
         cache_endpoint=active.cache_endpoint if active else None,
         cache_outage=active.cache_outage if active else None,
         slow_rollout=_the_rollout_in(scenario, timeline),
+        ships_the_statement=scenario.ships_the_statement,
     )
 
 

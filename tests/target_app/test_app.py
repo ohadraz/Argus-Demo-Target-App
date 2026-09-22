@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Iterable, Iterator
+from datetime import timedelta
 from unittest.mock import Mock
 
 import pytest
 from fastapi.testclient import TestClient
+from httpx import Response
 
 from io_shop.visits import (
     forget_every_visit,
@@ -12,11 +15,12 @@ from io_shop.visits import (
     record_visit,
 )
 from target_app import app as app_module
-from target_app.app import RESTART_ACTION, app
+from target_app.app import GENERATED_SPAN_MINUTES, RESTART_ACTION, app
 from target_app.flags import FlagClient
-from target_app.generator import BASELINE_MEMORY_BYTES
+from target_app.generator import BASELINE_MEMORY_BYTES, SETTLED_UPTIME
 from target_app.scenarios import (
     CACHE_MISCONFIGURED,
+    MONTHLY_STATEMENT_PANEL,
     RESOURCE_LEAK,
     SLOW_CANARY_ROLLOUT,
     UPSTREAM_DEPENDENCY_FAILURE,
@@ -74,6 +78,45 @@ def the_newest_minute(client: TestClient) -> dict:
     assert buckets
 
     return buckets[-1]
+
+
+def the_minute_of(client: TestClient, restarted: Response) -> dict:
+    """The bucket covering the minute the shop came back in, once there is one.
+
+    Not simply the newest bucket, and not read on the first try. The minute in
+    progress is reported only once a whole second of it has elapsed - see
+    `generator.generate`, which says why a zero-second minute is no reading at
+    all - so a restart landing in the first second of a minute is not in any
+    bucket yet, and the newest one describes the minute *before* it, whose heap
+    had not been reclaimed because at that moment it had not been.
+
+    That bucket is right and asserting a restart against it is wrong, which is
+    a failure about once in every sixty runs. So this waits for the minute the
+    restart actually happened in, which is at most the second the shop needs
+    before it will report it.
+    """
+    came_back = restarted.json()["restarted_at"][:len("0000-00-00T00:00")]
+    deadline = time.monotonic() + A_MINUTE_BECOMES_READABLE_SECONDS
+
+    while True:
+        buckets = client.get("/metrics").json()
+        covering = [
+            bucket for bucket in buckets if bucket["bucket_id"].startswith(came_back)
+        ]
+
+        if covering:
+            return covering[-1]
+
+        assert time.monotonic() < deadline, (
+            f"no bucket covers {came_back}, the newest being "
+            f"{buckets[-1]['bucket_id']}"
+        )
+
+
+# How long the shop may take to start reporting the minute it is in. One whole
+# second of a minute has to elapse before it is a reading, and a little more
+# than that covers the request that asks.
+A_MINUTE_BECOMES_READABLE_SECONDS = 3.0
 
 
 def test_the_leak_is_seedable_by_id(client: TestClient) -> None:
@@ -135,7 +178,9 @@ def test_restarting_through_the_console_reclaims_the_heap(client: TestClient) ->
     restarted = client.post("/scenario/restart")
 
     assert restarted.status_code == 200
-    assert the_newest_minute(client)["memory_used_bytes"] < BASELINE_MEMORY_BYTES * 1.2
+    assert the_minute_of(client, restarted)["memory_used_bytes"] < (
+        BASELINE_MEMORY_BYTES * 1.2
+    )
 
 
 def test_restarting_through_the_console_says_when(client: TestClient) -> None:
@@ -500,3 +545,35 @@ def test_the_rollout_fails_no_request_as_the_service_serves_it(
     window = the_shops_window(a_shop_whose_flag_is_on)
 
     assert max(minute["error_rate"] for minute in window) < A_CALM_ERROR_RATE
+
+
+def test_the_statement_scenario_is_seedable_by_id(client: TestClient) -> None:
+    seeded = client.post(
+        "/scenario/seed", json={"scenario_id": MONTHLY_STATEMENT_PANEL}
+    )
+
+    assert seeded.status_code == 200
+    assert client.get("/scenario/status").json()["active_scenario"] == (
+        MONTHLY_STATEMENT_PANEL
+    )
+
+
+def test_the_statement_scenario_is_not_offered_to_an_audience(
+    client: TestClient
+) -> None:
+    # It stages the monthly-summary incident with the fault in a different
+    # file, which is a distinction nothing an audience can see - so offering it
+    # beside the original would be offering the same demo twice.
+    catalogue = client.get("/scenario/catalog").json()["scenarios"]
+
+    assert MONTHLY_STATEMENT_PANEL not in [scenario["id"] for scenario in catalogue]
+
+
+def test_a_settled_shop_came_up_before_the_window_it_is_read_in() -> None:
+    # These two were level once: the uptime was six hours while the window was
+    # ninety minutes, and widening the window to six hours put a settled shop's
+    # start time exactly on the window's earliest minute. That is the one
+    # position which reads as "it came up just before all this", which is the
+    # single thing this field exists to report - so a shop nobody restarted
+    # would have been reporting a restart.
+    assert SETTLED_UPTIME > timedelta(minutes=GENERATED_SPAN_MINUTES)

@@ -166,6 +166,17 @@ class Scenario:
     is resolved as well as mitigated, because nothing is left behind for a new
     process or a re-sync to find.
 
+    `ships_the_statement` stages the same incident as `feature-flag-toggle` in
+    every respect a reader of the telemetry could name - the same flag, the same
+    cohort, the same shoppers failing for the same reason, the same error rate -
+    and differs in the one thing no telemetry shows: which file the fault is in.
+    The monthly summary's divisor lives in a sixty-line module; the statement's
+    empty month lives in the largest module the shop has. That is the whole
+    scenario. It exists so that a fix for it is a *large* fix, which is the one
+    shape nothing else here produces, and it is the reason this scenario is not
+    offered in the console: an audience shown two identical incidents learns
+    nothing from the second.
+
     `offered_in_console` is presentation only. A scenario kept for the capability
     it pins down is not automatically one worth showing an audience; hiding it
     leaves it seedable by id, which is how the e2e suite stages it.
@@ -183,6 +194,7 @@ class Scenario:
     upstream_fails: bool = False
     cache_is_misconfigured: bool = False
     rollout_is_slow: bool = False
+    ships_the_statement: bool = False
     # The deploy a *generated* scenario stages, for the one whose cause is a
     # change rather than a state. An authored scenario carries its deploys on
     # its minutes; a generated one has no minutes to hang them on, and a
@@ -237,6 +249,7 @@ FALLBACK_DISABLED = "fallback-disabled"
 FLAG_TOGGLE_RED_HERRING = "flag-toggle-red-herring"
 COMPETING_FLAG_CHANGES = "competing-flag-changes"
 SLOW_CANARY_ROLLOUT = "slow-canary-rollout"
+MONTHLY_STATEMENT_PANEL = "monthly-statement-panel"
 
 SCENARIOS: dict[str, Scenario] = {
     FEATURE_FLAG_TOGGLE: Scenario(
@@ -389,6 +402,27 @@ SCENARIOS: dict[str, Scenario] = {
             "bring back."
         ),
         rollout_is_slow=True,
+    ),
+    MONTHLY_STATEMENT_PANEL: Scenario(
+        id=MONTHLY_STATEMENT_PANEL,
+        title="Monthly statement panel switched on",
+        description=(
+            "The account page is getting a whole panel rather than a figure: "
+            "this month laid out - what was spent, across how many purchases, "
+            "in what sizes, by category, against the shopper's usual month. It "
+            "ships behind 'monthly-spend-feature' to the same canary the "
+            "monthly average went out to, and it breaks for the same shoppers, "
+            "because a month with nothing bought in it has no largest purchase "
+            "any more than it has an average. Turning the flag back off ends "
+            "it. Everything a reader of the telemetry can see is the same as "
+            "the monthly-summary incident; what differs is where the fault "
+            "lives. The statement is the largest module in the shop, so the "
+            "permanent fix is a large one - which is the only thing this "
+            "scenario is here to stage, and the reason it is not offered "
+            "alongside the others."
+        ),
+        ships_the_statement=True,
+        offered_in_console=False,
     ),
     BAD_DEPLOYMENT: Scenario(
         id=BAD_DEPLOYMENT,

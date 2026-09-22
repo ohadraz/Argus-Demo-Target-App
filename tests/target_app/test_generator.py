@@ -1029,3 +1029,97 @@ def test_losing_the_cache_leaves_the_tail_alone_too() -> None:
     degraded = minute_at(3, minutes)
 
     assert degraded.p99_ms < calm.p99_ms * 1.5
+
+
+def test_the_statement_panel_breaks_the_same_traffic_the_summary_did() -> None:
+    # The scenario is the monthly-summary incident with the fault moved to
+    # another file, so the shape a reader of the telemetry sees has to be the
+    # shape they already know. A panel that failed for a different share of
+    # traffic would be a second incident wearing the first one's clothes.
+    minutes = generate(
+        a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES, ships_the_statement=True
+    )
+
+    assert minute_at(5, minutes).error_rate > CLEARLY_DEGRADED
+    assert minute_at(15, minutes).error_rate < CLEARLY_HEALTHY
+
+
+def test_the_statement_panel_fails_in_the_file_the_fix_has_to_touch() -> None:
+    # The one assertion the recording rests on. Code-Fix is pointed at a file
+    # by the line the shop logged, so a fault that stopped naming
+    # `monthly_statement.py` would leave the scenario staging a large fix that
+    # nothing tells anybody to make.
+    minutes = generate(
+        a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES, ships_the_statement=True
+    )
+
+    failures = " ".join(minute_at(5, minutes).log_lines)
+
+    assert "src/io_shop/monthly_statement.py:" in failures
+
+
+def test_a_scenario_that_ships_no_statement_is_exactly_as_it_was() -> None:
+    # Threaded through every scenario and staged by one, like the rollout
+    # above: the flag still ships the monthly summary everywhere else, and the
+    # figures it produced are untouched.
+    without = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES)
+    again = generate(
+        a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES, ships_the_statement=False
+    )
+
+    assert [(m.error_rate, m.p50_ms, m.p95_ms, m.p99_ms) for m in without] == \
+           [(m.error_rate, m.p50_ms, m.p95_ms, m.p99_ms) for m in again]
+
+
+def test_a_window_asked_for_twice_reads_the_same() -> None:
+    # The property the whole service rests on, and the one a remembered minute
+    # is only allowed to make cheaper: two reads of the same incident have to
+    # be comparable, or nothing downstream can tell a change from a re-fetch.
+    once = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES)
+    again = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES)
+
+    assert [(m.minute_id, m.error_rate, m.p50_ms, m.p95_ms, m.p99_ms) for m in once] == \
+           [(m.minute_id, m.error_rate, m.p50_ms, m.p95_ms, m.p99_ms) for m in again]
+
+
+def test_a_reverted_flag_is_visible_the_next_time_the_window_is_asked_for() -> None:
+    # What a minute remembered under too small a key would hide: the flag goes
+    # off, the window is asked for again, and the same degraded minutes come
+    # back - so the mitigation that ended the incident appears to have done
+    # nothing. The recovery is the whole point of generating rather than
+    # authoring, and it has to survive being remembered.
+    while_it_was_on = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES)
+    reverted = FlagTimeline(
+        turned_on_at=SOME_NOW - timedelta(minutes=10),
+        turned_off_at=SOME_NOW - timedelta(minutes=4)
+    )
+
+    after_it_went_off = generate(reverted, SOME_NOW, SOME_SPAN_MINUTES)
+
+    assert minute_at(2, while_it_was_on).error_rate > CLEARLY_DEGRADED
+    assert minute_at(2, after_it_went_off).error_rate < CLEARLY_HEALTHY
+
+
+def test_the_minute_in_progress_still_moves_between_reads() -> None:
+    # The one minute that is *meant* to differ from read to read, and so the one
+    # a remembered answer must never be served for. The flag goes on halfway
+    # through the current minute, so how much of that minute it was on for - and
+    # therefore how much of the minute's traffic it broke - depends entirely on
+    # when the question was asked.
+    a_minute_that_has_begun = SOME_NOW.replace(second=0, microsecond=0)
+    flag_went_on_mid_minute = FlagTimeline(
+        turned_on_at=a_minute_that_has_begun + timedelta(seconds=20)
+    )
+
+    ten_seconds_later = generate(
+        flag_went_on_mid_minute,
+        a_minute_that_has_begun + timedelta(seconds=30),
+        SOME_SPAN_MINUTES
+    )
+    fifty_seconds_later = generate(
+        flag_went_on_mid_minute,
+        a_minute_that_has_begun + timedelta(seconds=55),
+        SOME_SPAN_MINUTES
+    )
+
+    assert ten_seconds_later[-1].error_rate < fifty_seconds_later[-1].error_rate

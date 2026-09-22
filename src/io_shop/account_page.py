@@ -5,6 +5,11 @@ from dataclasses import dataclass
 from pathlib import PurePath
 
 from io_shop.accounts import Account
+from io_shop.monthly_statement import (
+    MonthlyStatement,
+    StatementPeriod,
+    render_monthly_statement,
+)
 from io_shop.payment_provider import AskTheProvider, card_on_file
 from io_shop.spend_summary import render_spend_summary
 from io_shop.summary_cache import (
@@ -37,6 +42,12 @@ class RenderedPage:
     would describe every incident equally, and the error's words alone name a
     fault without naming where it lives.
 
+    `statement` is the monthly statement panel, on the pages the newest rollout
+    reached and absent everywhere else. It sits beside the figure rather than
+    replacing it: the statement is a second thing the page shows, so a request
+    outside the rollout renders the page it always rendered rather than a
+    shorter one.
+
     `served_from_cache` says whether the figure was read rather than worked out.
     It is reported on a page that rendered perfectly well, because it is the
     difference between the two ways of rendering perfectly well - and the share
@@ -53,6 +64,7 @@ class RenderedPage:
     failure: str | None
     served_from_cache: bool = False
     cache_failure: str | None = None
+    statement: MonthlyStatement | None = None
 
 
 def serve_account_page(account: Account,
@@ -60,7 +72,10 @@ def serve_account_page(account: Account,
                        ask_the_provider: AskTheProvider,
                        look_up_summary: LookUpSummary | None = None,
                        cache_endpoint: CacheEndpoint | None = None,
-                       use_typical_spend: bool = False) -> RenderedPage:
+                       use_typical_spend: bool = False,
+                       use_monthly_statement: bool = False,
+                       statement_period: StatementPeriod | None = None
+                       ) -> RenderedPage:
     """Renders the account page, reporting a failure rather than raising one.
 
     Two things are shown and both are needed: what the shopper averages per
@@ -81,11 +96,20 @@ def serve_account_page(account: Account,
     deployment that configured no cache has none - and a page that insisted on
     one would make an optimisation into a requirement, which is the very thing
     this shop's cache is not.
+
+    `use_monthly_statement` is the third rollout decision, and it arrives here
+    already made like the other two. `statement_period` is which month the
+    request is asking about, which the page is told rather than deriving: the
+    shop's purchase records carry a month flag and no date, so the only thing
+    here that knows the calendar is whoever handled the request.
     """
     try:
         figure_cents, from_cache, cache_failure = _the_figure_for(
             account, use_monthly_summary, look_up_summary, cache_endpoint,
             use_typical_spend
+        )
+        statement = _the_statement_for(
+            account, use_monthly_statement, statement_period
         )
         card = card_on_file(account.shopper_id, ask_the_provider)
     except Exception as error:  # noqa: BLE001 - the boundary records anything
@@ -100,7 +124,28 @@ def serve_account_page(account: Account,
                         card_last_four=card.last_four,
                         failure=None,
                         served_from_cache=from_cache,
-                        cache_failure=cache_failure)
+                        cache_failure=cache_failure,
+                        statement=statement)
+
+
+def _the_statement_for(account: Account,
+                       use_monthly_statement: bool,
+                       period: StatementPeriod | None) -> MonthlyStatement | None:
+    """The monthly statement panel, where this request is one the rollout
+    reached, and nothing where it is not.
+
+    Nothing also where the request arrived without a period. That is a
+    misconfigured caller rather than a shopper's month, and rendering a
+    statement titled with a month nobody named would put a wrong heading over
+    correct figures - see `io_shop.monthly_statement.StatementPeriod`, which is
+    where that argument is made at length. A missing panel is visible to
+    whoever configured the rollout; a wrongly titled one is visible only to the
+    shopper.
+    """
+    if not use_monthly_statement or period is None:
+        return None
+
+    return render_monthly_statement(account, period)
 
 
 def _the_figure_for(

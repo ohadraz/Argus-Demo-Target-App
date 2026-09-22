@@ -3,9 +3,11 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
+from io_shop.monthly_statement import StatementPeriod, period_for
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
 from io_shop.rollout import CANARY_SHARE
 from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
@@ -17,8 +19,8 @@ The service's metrics and logs are a pure function of what time it is and of
 whatever condition is staged - when the flag went on and off, when the heap
 began climbing, when the payment provider stopped answering. Nothing runs
 between requests - no ticker, no rolling buffer, no traffic generator - and yet
-the answer tracks the world, because the answer is recomputed every time
-anybody asks.
+the answer tracks the world, because the answer is derived from that world at
+the moment anybody asks.
 
 That is what makes an incident here recoverable. A fixture authored in advance
 describes a past that has already finished; this describes a present that is
@@ -30,6 +32,15 @@ its own identity, so a minute that has already elapsed reads the same however
 many times it is fetched, and two reads of the same incident can be compared.
 Only the minute in progress moves between reads - it has more seconds in it
 each time.
+
+That determinism is also why a finished minute is *remembered* rather than
+worked out again - see `_a_whole_minute`. It is an optimisation and nothing
+more: the answer is the same either way, because the property above says it
+must be. What it buys is the window's length. A six-hour window is 360 minutes
+and every one of them renders account pages for real, so recomputing the lot on
+every `/metrics` and every `/logs` call made the window a cost rather than a
+setting - and the window has to be six hours, because that is what a responder
+actually asks this service for.
 """
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -43,8 +54,8 @@ TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # The size is a noise decision, not a cost one. A sample of 50 resolves the
 # error rate only to the nearest 2%, which makes a calm baseline read as a
 # jagged 0-4% and gives a flag-on minute a spread wide enough to notice. At 200
-# the baseline is smooth enough to be a baseline, and the whole 90-minute window
-# still generates in well under a second.
+# the baseline is smooth enough to be a baseline, and a whole six-hour window
+# still generates in under a second - once, after which it is remembered.
 _SAMPLE_SIZE = 200
 _REPORTED_VOLUME_PER_MINUTE = 1200
 
@@ -110,7 +121,15 @@ _MEMORY_WOBBLE_BYTES = 12 * 1024**2
 # window served here reaches, on purpose: a start time *inside* the window
 # reads as a restart during the incident, which is the one thing this field
 # exists to report.
-SETTLED_UPTIME = timedelta(hours=6)
+#
+# Twice the window rather than a little over it. This was six hours while the
+# generated span was ninety minutes, and lengthening that span to six hours
+# put the two exactly level - a settled shop's start time landed on the
+# window's earliest minute, which is the one position that reads as "it came
+# up just before all this". Clear of the window by the window's own length
+# leaves no such reading, and leaves room for the span to grow again without
+# quietly re-creating it.
+SETTLED_UPTIME = timedelta(hours=12)
 
 # What the payment provider answers with when it is not answering. A status
 # rather than a dropped connection, because a status is what the shop's failure
@@ -464,7 +483,8 @@ def generate(timeline: FlagTimeline | None,
              provider_outage: ProviderOutage | None = None,
              cache_endpoint: CacheEndpoint | None = None,
              cache_outage: CacheOutage | None = None,
-             slow_rollout: SlowRollout | None = None) -> list[GeneratedMinute]:
+             slow_rollout: SlowRollout | None = None,
+             ships_the_statement: bool = False) -> list[GeneratedMinute]:
     """Every minute from `span_minutes` ago up to and including the one in
     progress, once any of it has happened.
 
@@ -528,6 +548,19 @@ def generate(timeline: FlagTimeline | None,
     it, because a shop with no cache reports the baseline quantile model and a
     model has no sample for a percentile to be taken over - which is the whole
     of what this condition is visible in.
+
+    `ships_the_statement` says which feature the flag is shipping this time.
+    The shop has one feature flag and several scenarios behind it: most ship
+    the monthly summary, one ships the typical purchase, and this one ships the
+    monthly statement panel. Left unsaid, the flag ships the summary, which is
+    what it shipped before there was anything else to choose.
+
+    It changes no figure this generator reports. The statement breaks for the
+    same shoppers the summary breaks for - a month with nothing bought in it
+    has no largest purchase any more than it has an average - so the error rate
+    and the latency are the summary scenario's. What it changes is the file the
+    shop's log names as having raised the failure, and that file is the whole
+    of what the scenario is for.
     """
     current_minute = now.replace(second=0, microsecond=0)
     elapsed_in_current = int((now - current_minute).total_seconds())
@@ -542,10 +575,9 @@ def generate(timeline: FlagTimeline | None,
     )
 
     minutes = [
-        _generate_minute(
+        _a_whole_minute(
             timeline,
             current_minute - timedelta(minutes=offset),
-            elapsed_seconds=_SECONDS_PER_MINUTE,
             flag=named_flag,
             breaks_when_flag_is_on=breaks_when_flag_is_on,
             decoy_flag=decoy_flag,
@@ -556,6 +588,7 @@ def generate(timeline: FlagTimeline | None,
             cache_endpoint=cache_endpoint,
             cache_outage=cache_outage,
             slow_rollout=slow_rollout,
+            ships_the_statement=ships_the_statement,
         )
         for offset in range(span_minutes, 0, -1)
     ]
@@ -582,10 +615,77 @@ def generate(timeline: FlagTimeline | None,
                 cache_endpoint=cache_endpoint,
                 cache_outage=cache_outage,
                 slow_rollout=slow_rollout,
+                ships_the_statement=ships_the_statement,
             )
         )
 
     return minutes
+
+
+# How many generated minutes to keep. A window is six hours, and a demo moves
+# between a handful of scenarios in a sitting - so this holds several whole
+# windows at once and still costs a few megabytes. Sized to be larger than the
+# working set rather than tuned: an entry evicted while it is still being asked
+# for is regenerated, which is exactly what used to happen every time.
+_MINUTES_WORTH_REMEMBERING = 4096
+
+
+@lru_cache(maxsize=_MINUTES_WORTH_REMEMBERING)
+def _a_whole_minute(
+    timeline: FlagTimeline | None,
+    minute: datetime,
+    flag: str,
+    breaks_when_flag_is_on: bool,
+    lifetime: ProcessLifetime,
+    decoy_flag: str | None = None,
+    decoy_timeline: FlagTimeline | None = None,
+    leak_started_at: datetime | None = None,
+    provider_outage: ProviderOutage | None = None,
+    cache_endpoint: CacheEndpoint | None = None,
+    cache_outage: CacheOutage | None = None,
+    slow_rollout: SlowRollout | None = None,
+    ships_the_statement: bool = False,
+) -> GeneratedMinute:
+    """One minute that has finished, generated once and then remembered.
+
+    The module's opening paragraph is what makes this sound rather than a
+    gamble: a minute that has already elapsed reads the same however many times
+    it is fetched, because it seeds its own generator from its own identity.
+    That is a property this service already promised, and remembering the
+    answer only stops it being recomputed to say the same thing.
+
+    Only whole minutes. The minute in progress has more seconds in it each time
+    anybody asks, which is the one thing here that is *meant* to change between
+    reads - so it goes to `_generate_minute` directly, every request, for ever.
+
+    The key is every value the minute is computed from, which is why they are
+    all parameters and none of them is read from anywhere. A flag toggled now
+    does not change a minute that has already finished, but it does change the
+    timeline - so the next request misses, regenerates the window once, and
+    hits from then on. That is the whole cost of a mitigation: one window, not
+    one per request.
+
+    What this is worth: a six-hour window is 360 minutes, and the account pages
+    behind it are rendered for real. Regenerating all of them on every
+    `/metrics` and every `/logs` call was most of what an e2e run spent its
+    time doing.
+    """
+    return _generate_minute(
+        timeline,
+        minute,
+        elapsed_seconds=_SECONDS_PER_MINUTE,
+        flag=flag,
+        breaks_when_flag_is_on=breaks_when_flag_is_on,
+        lifetime=lifetime,
+        decoy_flag=decoy_flag,
+        decoy_timeline=decoy_timeline,
+        leak_started_at=leak_started_at,
+        provider_outage=provider_outage,
+        cache_endpoint=cache_endpoint,
+        cache_outage=cache_outage,
+        slow_rollout=slow_rollout,
+        ships_the_statement=ships_the_statement,
+    )
 
 
 def _generate_minute(
@@ -602,6 +702,7 @@ def _generate_minute(
     cache_endpoint: CacheEndpoint | None = None,
     cache_outage: CacheOutage | None = None,
     slow_rollout: SlowRollout | None = None,
+    ships_the_statement: bool = False,
 ) -> GeneratedMinute:
     minute_id = minute.strftime(TIMESTAMP_FORMAT)
     entropy = random.Random(minute_id)
@@ -654,6 +755,13 @@ def _generate_minute(
             cache_endpoint,
             the_rollout_reached_it=index < reached_by_the_rollout,
             the_flag_ships_the_slow_feature=slow_rollout is not None,
+            the_flag_ships_the_statement=ships_the_statement,
+            # The month this minute falls in, which is what a request arriving
+            # in it would have been asking about. Taken from the minute rather
+            # than from the clock, so that a window fetched twice reads the
+            # same both times - the same reason every other figure here is
+            # seeded from the minute's own id.
+            statement_period=period_for(minute.month, minute.year),
         )
         for index in range(_SAMPLE_SIZE)
     ]
@@ -1011,6 +1119,8 @@ def _serve_one_account_page(
     cache_endpoint: CacheEndpoint | None = None,
     the_rollout_reached_it: bool = False,
     the_flag_ships_the_slow_feature: bool = False,
+    the_flag_ships_the_statement: bool = False,
+    statement_period: StatementPeriod | None = None,
 ) -> _ServedPage:
     """Puts one request through the shop and records how it went.
 
@@ -1048,30 +1158,41 @@ def _serve_one_account_page(
     hundred, a draw is wrong about which percentile the incident appears in
     often enough to cost the scenario the only thing it demonstrates.
 
-    `the_flag_ships_the_slow_feature` says which feature the flag is shipping,
-    because the shop has one flag and five scenarios behind it. Four ship the
-    monthly summary, whose divisor is empty for a shopper who has bought
-    nothing this month; one ships the typical purchase, which is correct for
-    everybody and merely slow. Shipping both at once is not a second scenario,
-    it is a scenario staging two faults: the error rate moves, and the incident
-    that is meant to be invisible in every aggregate but the tail becomes
-    visible in the first one anybody looks at. It is a parameter rather than an
-    inference from `the_rollout_reached_it`, because that one is true only for
-    the cohort and this has to hold for every request of the minute.
+    `the_flag_ships_the_slow_feature` and `the_flag_ships_the_statement` say
+    which feature the flag is shipping, because the shop has one flag and
+    several scenarios behind it. Most ship the monthly summary, whose divisor
+    is empty for a shopper who has bought nothing this month; one ships the
+    typical purchase, which is correct for everybody and merely slow; one ships
+    the monthly statement panel, which breaks for exactly the shoppers the
+    summary breaks for and does it in a far larger file.
+
+    At most one of them is true at a time, and that is a property of the
+    scenarios rather than something checked here. Shipping two at once would
+    not be a second scenario, it would be one scenario staging two faults: the
+    error rate would move, and the incident meant to be invisible in every
+    aggregate but the tail would become visible in the first one anybody looks
+    at.
+
+    Parameters rather than inferences from `the_rollout_reached_it`, because
+    that one is true only for the cohort and these have to hold for every
+    request of the minute.
     """
     flag_is_on = entropy.random() < share_of_minute_flagged
     in_the_canary = flag_is_on and entropy.random() < CANARY_SHARE
-    # One flag, and what it ships depends on which scenario is staged. Four of
-    # them ship the monthly summary, whose divisor is empty for a shopper who
-    # has bought nothing this month; one ships the typical purchase, which is
-    # correct for everybody and merely slow. A scenario that shipped both would
-    # be staging two faults at once - the error rate would move, and the
-    # incident that is invisible in every aggregate but the tail would be
-    # visible in the first one anybody looks at.
+    # One flag, and what it ships depends on which scenario is staged - see the
+    # docstring above for why at most one of the alternatives is ever true.
     #
-    # The canary is still drawn either way, so that suppressing it here cannot
-    # shift a single figure in the four scenarios that do ship it.
-    use_monthly_summary = in_the_canary and not the_flag_ships_the_slow_feature
+    # The canary is still drawn either way, so that suppressing the summary
+    # here cannot shift a single figure in the scenarios that do ship it.
+    use_monthly_summary = in_the_canary and not (
+        the_flag_ships_the_slow_feature or the_flag_ships_the_statement
+    )
+    # The third thing the one flag can ship. Same cohort as the monthly summary
+    # and the same shoppers break it - a month with nothing bought in it has no
+    # largest purchase any more than it has an average - but the fault is in a
+    # different file, and which file is the whole reason this scenario exists.
+    # See `io_shop.monthly_statement`.
+    use_monthly_statement = in_the_canary and the_flag_ships_the_statement
     provider_refused = (
         share_of_minute_refused > 0.0
         and entropy.random() < share_of_minute_refused
@@ -1088,7 +1209,9 @@ def _serve_one_account_page(
             could_hold_this_figure=not the_rollout_reached_it
         ),
         cache_endpoint=cache_endpoint,
-        use_typical_spend=the_rollout_reached_it
+        use_typical_spend=the_rollout_reached_it,
+        use_monthly_statement=use_monthly_statement,
+        statement_period=statement_period
     )
     cost = _what_the_page_cost(
         cache_entropy,
