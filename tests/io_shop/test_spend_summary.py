@@ -12,6 +12,11 @@ from io_shop.spend_summary import (
 
 The monthly figure is newer and ships behind a rollout flag, so the cases below
 cover the shape the page has had for years plus the one the flag adds.
+
+The case that matters most is the shopper who has bought before and not this
+month. That is not an edge: it is what every account looks like at the start of
+every month, and the monthly figure divided by that empty count until it was
+fixed.
 """
 
 
@@ -50,6 +55,39 @@ def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
     assert average_spend_per_item_this_month(an_active_shopper) == 3000
 
 
+def test_a_month_with_nothing_in_it_averages_to_nothing() -> None:
+    # The incident. The divisor here is the count of *this month's* purchases,
+    # which is empty for any shopper who has not bought yet this month - which
+    # at the start of a month is nearly all of them. It used to divide by that
+    # zero and take the page down with it.
+    account = an_account_with_no_purchases_this_month(1000, 3000)
+
+    assert average_spend_per_item_this_month(account) == 0
+
+
+def test_the_rollout_renders_for_a_shopper_who_bought_nothing_this_month() -> None:
+    # Through the flag rather than the function, because the flag is what
+    # selected the branch that failed, and this is what makes it safe to turn
+    # back on.
+    account = an_account_with_no_purchases_this_month(1000, 3000)
+
+    assert render_spend_summary(account, use_monthly_summary=True) == 0
+
+
+def test_the_monthly_figure_holds_up_for_a_shopper_with_no_history_at_all() -> None:
+    # No purchases anywhere, so none this month either. The monthly figure has
+    # nothing to divide and says so rather than raising - the month is empty in
+    # exactly the way every other empty month is.
+    a_shopper_who_never_bought_anything = Account(
+        shopper_id="shopper-with-no-history", purchases=(), total_cents=0,
+        total_this_month_cents=0
+    )
+
+    assert render_spend_summary(
+        a_shopper_who_never_bought_anything, use_monthly_summary=True
+    ) == 0
+
+
 def test_the_page_takes_the_stable_summary_when_the_rollout_is_off() -> None:
     account = an_account_with_no_purchases_this_month(1000, 3000)
 
@@ -59,6 +97,12 @@ def test_the_page_takes_the_stable_summary_when_the_rollout_is_off() -> None:
 def test_the_page_lets_a_failure_reach_its_caller() -> None:
     # Swallowing it here would render a wrong number instead of an error, and
     # there would be no error rate for anyone to alert on.
+    #
+    # The lifetime figure keeps its unguarded divisor deliberately: it is empty
+    # only for an account that has never bought anything at all, which is not a
+    # shopper the shop has, and the boundary above records it as the failure it
+    # is. That is a different situation from an empty *month*, which is what
+    # the cases above cover.
     a_shopper_who_never_bought_anything = Account(
         shopper_id="shopper-with-no-history", purchases=(), total_cents=0,
         total_this_month_cents=0

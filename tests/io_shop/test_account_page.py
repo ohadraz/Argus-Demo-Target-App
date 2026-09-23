@@ -60,6 +60,22 @@ def test_a_page_that_renders_carries_the_figure_and_no_failure() -> None:
     assert page.failure is None
 
 
+def test_the_monthly_rollout_renders_for_a_shopper_idle_this_month() -> None:
+    # The incident, end to end. The canary put ordinary shoppers - ones who had
+    # bought before and not yet this month - onto the monthly figure, whose
+    # divisor was the count of this month's purchases. Every one of those pages
+    # came back as a reported ZeroDivisionError instead of a page.
+    account = an_account_idle_this_month(1000, 3000)
+
+    page = serve_account_page(account,
+                              use_monthly_summary=True,
+                              ask_the_provider=a_provider_holding_a_card())
+
+    assert page.failure is None
+    assert page.figure_cents == 0
+    assert page.card_last_four == "4242"
+
+
 def test_a_page_that_breaks_is_reported_rather_than_raised() -> None:
     page = serve_account_page(
         an_account_that_never_bought_anything(),
