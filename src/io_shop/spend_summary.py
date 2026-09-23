@@ -1,60 +1,68 @@
 from __future__ import annotations
 
 from io_shop.accounts import Account
-from io_shop.typical_spend import typical_spend_per_item
 
-"""What a shopper has spent, and what that averages to.
+"""The account page's single-figure spend summaries.
 
-Three figures about one history. The lifetime average has been on the account
-page for years; the monthly one narrows it to the current month; the typical
-purchase abandons the average altogether for the middle of the history. The
-last two are the ones still behind a rollout, and which of them a request gets
-is decided before it reaches here.
+One number per function, each of them an average of something. The statement
+panel next door says the month in full - see `io_shop.monthly_statement` - and
+these are the figures that were on the page before it and are still on the page
+beside it.
+
+Every average here divides by a count that comes from the shopper's history,
+and a shopper who bought nothing this month makes that count zero. That is not
+an error, a corruption or a missing record: it is the single most ordinary
+thing an account can look like on the first of the month, and it is the shape
+that took the account page down when the panel behind `monthly-spend-feature`
+first saw real traffic. So every divisor below is checked, once, at the point
+it is used.
 """
 
+# What an average comes to when there is nothing to average. Zero rather than
+# `None`, because every caller of these functions formats the result as money
+# and a figure of nothing spent across nothing bought is nothing - and because
+# a page that has to check for `None` on four figures is a page that will one
+# day check on three.
+NOTHING_SPENT = 0
 
-def average_spend_per_item(account: Account) -> int:
-    """Average spend per item across everything this account has ever bought.
 
-    Live for years. Its divisor is empty only for an account that has never
-    bought anything at all, which no real shopper is.
+def purchases_this_month(account: Account) -> list:
+    """Everything this shopper bought in the current month.
+
+    The purchase carries the month rather than a date, because that is what the
+    query this account came back from selected on - see `io_shop.accounts`.
     """
-    return account.total_cents // len(account.purchases)
+    return [purchase for purchase in account.purchases if purchase.in_current_month]
 
 
 def average_spend_per_item_this_month(account: Account) -> int:
-    """Average spend per item this month.
+    """What the month's purchases averaged, in pence.
 
-    Narrows the lifetime figure to the current month, so the account page can
-    show what a shopper is spending now rather than what they averaged over
-    three years.
+    Floor division, so the figure is never a fraction of a penny.
+
+    A month with no purchases in it averages to nothing rather than raising.
+    There is genuinely no average to report - the divisor is zero - and the
+    honest reading of "spent nothing across nothing" is zero, not a failed
+    account page. Returning a figure here is what keeps a shopper who has not
+    bought anything yet this month able to see the rest of their account.
     """
-    bought_this_month = [
-        purchase for purchase in account.purchases if purchase.in_current_month
-    ]
-    return account.total_this_month_cents // len(bought_this_month)
+    bought = purchases_this_month(account)
+
+    if not bought:
+        return NOTHING_SPENT
+
+    return account.total_this_month_cents // len(bought)
 
 
-def render_spend_summary(account: Account,
-                         use_monthly_summary: bool,
-                         use_typical_spend: bool = False) -> int:
-    """The figure Io's account page shows, through whichever version the rollout
-    selects.
+def average_spend_per_item_lifetime(account: Account) -> int:
+    """What this shopper's purchases have averaged across their whole history.
 
-    Raises whatever the selected version raises. Catching belongs at the request
-    boundary - see `io_shop.account_page` - where there is a response to turn a
-    failure into and a log to record it in. A page that swallowed its own errors
-    would render a wrong number instead of an error, which is a worse incident
-    than the one it hid.
-
-    Two rollouts, so two flags to be told about, and the newer one wins where a
-    request is inside both. That is the ordinary arrangement: each is a slice of
-    traffic, the slices overlap, and the page has to render one figure.
+    Guarded the same way and for the same reason: a brand new account has no
+    purchases at all, which is every account for the few seconds between being
+    created and being used.
     """
-    if use_typical_spend:
-        return typical_spend_per_item(account)
+    if not account.purchases:
+        return NOTHING_SPENT
 
-    if use_monthly_summary:
-        return average_spend_per_item_this_month(account)
-
-    return average_spend_per_item(account)
+    return account.total_cents // len(account.purchases)
+</content>

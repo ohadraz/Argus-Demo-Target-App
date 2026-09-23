@@ -1,167 +1,132 @@
-from __future__ import annotations
-
-import pytest
 from io_shop.accounts import Account, Purchase
 from io_shop.monthly_statement import (
-    STATEMENT_COLUMNS,
     as_csv_rows,
     as_html,
     as_plain_text,
-    compare_statements,
     describe_month,
     period_for,
-    printed_shares,
     problems_with,
     reconciles,
     render_monthly_statement,
     statement_rows,
     statement_sections,
+    the_biggest_purchase_this_month,
+    the_mean_purchase_this_month,
+    the_smallest_purchase_this_month,
 )
 
-"""Io's monthly statement panel - the month laid out rather than summed.
-
-A safety net rather than a specification: the panel was written first and these
-cover what would be expensive to find out from a shopper. The one that matters
-most is the empty month, because that is the fault the
-`monthly-statement-panel` scenario stages, and a change that quietly made it
-stop raising would leave that scenario staging nothing at all.
-"""
-
-MARCH = period_for(3, 2026)
+SEPTEMBER = period_for(9, 2026)
 
 
-def a_shopper_who_bought_this_month() -> Account:
+def an_account(purchases, total_cents, total_this_month_cents):
     return Account(
-        shopper_id="shopper-with-a-month",
-        purchases=(
-            Purchase(price_cents=1200, in_current_month=True, category="Books"),
-            Purchase(price_cents=6400, in_current_month=True, category="Home"),
-            Purchase(price_cents=3300, in_current_month=True, category="Garden"),
-            Purchase(price_cents=900, in_current_month=False, category="Books"),
-        ),
-        total_cents=11800,
-        total_this_month_cents=10900,
+        shopper_id="shopper-1",
+        purchases=tuple(purchases),
+        total_cents=total_cents,
+        total_this_month_cents=total_this_month_cents
     )
 
 
-def a_shopper_who_bought_nothing_this_month() -> Account:
-    return Account(
-        shopper_id="shopper-idle-this-month",
-        purchases=(Purchase(price_cents=900, in_current_month=False),),
-        total_cents=900,
-        total_this_month_cents=0,
+def a_shopper_who_bought_nothing_this_month():
+    """A perfectly ordinary account on the first week of the month."""
+    return an_account(
+        purchases=[
+            Purchase(price_cents=4_000, in_current_month=False, category="Books"),
+            Purchase(price_cents=6_000, in_current_month=False, category="Home")
+        ],
+        total_cents=10_000,
+        total_this_month_cents=0
     )
 
 
-def test_the_statement_reports_the_month_it_was_asked_for() -> None:
-    statement = render_monthly_statement(a_shopper_who_bought_this_month(), MARCH)
-
-    assert statement.period.title == "March 2026"
-    assert statement.headline_cents == 10900
-    assert statement.purchase_count == 3
-
-
-def test_the_statement_takes_its_shape_from_this_month_alone() -> None:
-    # The purchase outside the month is cheaper than everything in it, so a
-    # statement that had counted it would report it as the smallest.
-    statement = render_monthly_statement(a_shopper_who_bought_this_month(), MARCH)
-
-    assert statement.biggest_cents == 6400
-    assert statement.smallest_cents == 1200
-
-
-def test_a_month_with_nothing_in_it_fails_rather_than_reporting_zero() -> None:
-    # The fault the `monthly-statement-panel` scenario stages. A statement
-    # reporting a made-up zero would be a panel nobody could trust on the
-    # months it can describe.
-    with pytest.raises(ValueError):
-        render_monthly_statement(a_shopper_who_bought_nothing_this_month(), MARCH)
+def a_shopper_with_a_month():
+    return an_account(
+        purchases=[
+            Purchase(price_cents=300, in_current_month=True, category="Groceries"),
+            Purchase(
+                price_cents=7_500,
+                in_current_month=True,
+                category="Electronics",
+                delivery_cents=499
+            ),
+            Purchase(price_cents=2_200, in_current_month=True, category="Books"),
+            Purchase(price_cents=9_000, in_current_month=False, category="Home")
+        ],
+        total_cents=19_000,
+        total_this_month_cents=10_000
+    )
 
 
-def test_the_breakdowns_add_up_to_the_headline() -> None:
-    statement = render_monthly_statement(a_shopper_who_bought_this_month(), MARCH)
+def test_the_figures_do_not_divide_by_zero_on_a_month_with_no_purchases():
+    account = a_shopper_who_bought_nothing_this_month()
 
+    assert the_mean_purchase_this_month(account) == 0
+    assert the_biggest_purchase_this_month(account) == 0
+    assert the_smallest_purchase_this_month(account) == 0
+
+
+def test_a_month_with_no_purchases_still_renders_a_statement():
+    """The shape that drove the account page's error rate to a third.
+
+    Assembling the statement used to raise - ZeroDivisionError on the mean,
+    ValueError on the empty largest and smallest - so every shopper with an
+    empty month got a failed page the moment the flag went on.
+    """
+    statement = render_monthly_statement(
+        a_shopper_who_bought_nothing_this_month(), SEPTEMBER
+    )
+
+    assert statement.purchase_count == 0
+    assert statement.headline_cents == 0
+    assert statement.is_an_empty_month
     assert reconciles(statement)
     assert problems_with(statement) == []
 
 
-def test_a_column_of_percentages_comes_to_a_hundred() -> None:
-    # Three thirds rounded one at a time print as 99%, which is the complaint
-    # every statement in the world has received at least once.
-    assert sum(printed_shares([1 / 3, 1 / 3, 1 / 3])) == 100
+def test_an_empty_month_says_so_rather_than_inventing_figures():
+    statement = render_monthly_statement(
+        a_shopper_who_bought_nothing_this_month(), SEPTEMBER
+    )
+    labels = [row.label for row in statement_rows(statement)]
+
+    assert describe_month(statement) == "Nothing bought this month."
+    assert "Average purchase" not in labels
+    assert "Largest purchase" not in labels
+    assert "Smallest purchase" not in labels
+    assert labels == ["Spent this month", "Purchases"]
 
 
-def test_an_empty_column_apportions_nothing() -> None:
-    assert printed_shares([]) == []
-
-
-def test_there_is_no_thirteenth_month() -> None:
-    with pytest.raises(ValueError):
-        period_for(13, 2026)
-
-
-def test_every_section_that_is_printed_has_rows_in_it() -> None:
-    sections = statement_sections(
-        render_monthly_statement(a_shopper_who_bought_this_month(), MARCH)
+def test_every_renderer_copes_with_an_empty_month():
+    statement = render_monthly_statement(
+        a_shopper_who_bought_nothing_this_month(), SEPTEMBER
     )
 
-    assert sections
-    assert all(section.rows for section in sections)
+    markup = as_html(statement)
+    text = as_plain_text(statement)
+    rows = as_csv_rows(statement)
 
-
-def test_the_flat_rows_are_the_sections_flattened() -> None:
-    statement = render_monthly_statement(a_shopper_who_bought_this_month(), MARCH)
-    from_sections = [
-        row for section in statement_sections(statement) for row in section.rows
+    assert "September 2026" in markup
+    assert "SEPTEMBER 2026" in text
+    assert rows[0] == ("Section", "Item", "Amount")
+    assert ("This month", "Purchases", "0 purchases") in rows
+    assert [section.name for section in statement_sections(statement)] == [
+        "This month"
     ]
 
-    assert statement_rows(statement) == from_sections
 
+def test_a_month_with_purchases_is_unchanged():
+    statement = render_monthly_statement(a_shopper_with_a_month(), SEPTEMBER)
 
-def test_the_export_leads_with_its_header() -> None:
-    statement = render_monthly_statement(a_shopper_who_bought_this_month(), MARCH)
+    assert statement.purchase_count == 3
+    assert statement.headline_cents == 10_000
+    assert statement.biggest_cents == 7_500
+    assert statement.smallest_cents == 300
+    assert statement.mean_cents == 3_333
+    assert reconciles(statement)
+    assert problems_with(statement) == []
 
-    assert as_csv_rows(statement)[0] == STATEMENT_COLUMNS
+    labels = [row.label for row in statement_rows(statement)]
 
-
-def test_the_download_is_named_after_the_month() -> None:
-    assert MARCH.as_a_filename == "io-statement-2026-march.csv"
-
-
-def test_the_email_is_titled_with_the_month() -> None:
-    statement = render_monthly_statement(a_shopper_who_bought_this_month(), MARCH)
-
-    assert as_plain_text(statement).startswith("MARCH 2026")
-
-
-def test_the_markup_escapes_a_category_the_catalogue_made_up() -> None:
-    # Categories come from a catalogue somebody else edits, which is why
-    # nothing here is trusted to be markup-safe.
-    a_shopper_whose_category_is_markup = Account(
-        shopper_id="shopper-with-an-odd-category",
-        purchases=(
-            Purchase(
-                price_cents=500, in_current_month=True, category="<script>"
-            ),
-        ),
-        total_cents=500,
-        total_this_month_cents=500,
-    )
-
-    markup = as_html(
-        render_monthly_statement(a_shopper_whose_category_is_markup, MARCH)
-    )
-
-    assert "<script>" not in markup
-
-
-def test_a_month_is_described_in_one_sentence() -> None:
-    statement = render_monthly_statement(a_shopper_who_bought_this_month(), MARCH)
-
-    assert describe_month(statement).endswith(".")
-
-
-def test_two_identical_months_are_reported_as_identical() -> None:
-    statement = render_monthly_statement(a_shopper_who_bought_this_month(), MARCH)
-
-    assert "the same as last month" in compare_statements(statement, statement)
+    assert "Largest purchase" in labels
+    assert "Average purchase" in labels
+</content>

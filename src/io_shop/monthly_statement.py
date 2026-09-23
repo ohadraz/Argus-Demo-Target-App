@@ -36,10 +36,12 @@ is how a shopper comes to see a section in their email that is not on their
 page.
 
 What it shares with everything else under `io_shop`: it raises rather than
-guessing. A statement that quietly reported zero for a month it could not
-describe would be a statement nobody could trust for the months it *could*
-describe, and the account page's boundary is where a failure becomes a rate
-somebody can alert on - see `io_shop.account_page`.
+guessing. That applies to a statement it cannot describe - a month whose
+figures contradict each other, a period outside the calendar. It does *not*
+apply to a month with nothing in it. A shopper who bought nothing this month is
+not a failure to describe; it is the most common month there is, and a panel
+that raised on it took the account page down the first time it saw real
+traffic. An empty month is a month, and it renders.
 """
 
 # The shop keeps money in pence and shows it in pounds, which is the ordinary
@@ -477,6 +479,18 @@ class MonthlyStatement:
         return self.headline_cents - self.refunds.refunded_cents
 
     @property
+    def is_an_empty_month(self) -> bool:
+        """Whether this shopper bought nothing at all in the month.
+
+        Distinguished from a quiet month because they are different documents:
+        a quiet month has a purchase to describe and an empty one does not.
+        Nothing about it is an error - it is what most accounts look like on
+        the first of the month - and the statement renders it rather than
+        refusing to.
+        """
+        return self.purchase_count == 0
+
+    @property
     def is_a_quiet_month(self) -> bool:
         """Whether this month is small enough to say so rather than break down.
 
@@ -610,6 +624,10 @@ def purchases_this_month(account: Account) -> tuple[Purchase, ...]:
     statement module that re-derived the month from a timestamp would be
     answering a question the query has already answered, and answering it in a
     different timezone.
+
+    Comes back empty for a shopper who bought nothing, which is an ordinary
+    month and not an error. Everything below that divides by the length of this
+    checks it first.
     """
     return tuple(
         purchase for purchase in account.purchases if purchase.in_current_month
@@ -622,8 +640,16 @@ def the_biggest_purchase_this_month(account: Account) -> int:
     The statement leads on this after the headline, because it is the figure a
     shopper checks first: a month that surprised them usually surprised them
     once, and this is the purchase that did it.
+
+    A month with no purchases has no largest one, and the figure comes back as
+    zero rather than raising on an empty `max`. Nothing prints it in that case
+    - see `_the_shape_of_the_month` - so the zero is never shown as if it were
+    a purchase; it exists so that assembling the statement cannot fail.
     """
-    return max(purchase.price_cents for purchase in purchases_this_month(account))
+    return max(
+        (purchase.price_cents for purchase in purchases_this_month(account)),
+        default=0
+    )
 
 
 def the_smallest_purchase_this_month(account: Account) -> int:
@@ -633,8 +659,13 @@ def the_smallest_purchase_this_month(account: Account) -> int:
     its own: the distance between them is what says whether this was a month of
     one big thing or a month of many similar things, before the band breakdown
     says it in detail.
+
+    Zero on a month with no purchases, for the same reason as the largest.
     """
-    return min(purchase.price_cents for purchase in purchases_this_month(account))
+    return min(
+        (purchase.price_cents for purchase in purchases_this_month(account)),
+        default=0
+    )
 
 
 def the_mean_purchase_this_month(account: Account) -> int:
@@ -644,8 +675,18 @@ def the_mean_purchase_this_month(account: Account) -> int:
     statement never shows a fraction of a penny. Rounding up would occasionally
     produce a mean above the largest purchase on a month of identical prices,
     which is the kind of figure that costs a support conversation.
+
+    The divisor is the count of this month's purchases, and that count is zero
+    for every shopper who has not bought anything yet this month - which is a
+    large share of the traffic on the first week of any month. Guarded here
+    rather than at the call site: the average of nothing is nothing, and a
+    ZeroDivisionError escaping this line is what takes the whole account page
+    down for those shoppers.
     """
     bought = purchases_this_month(account)
+
+    if not bought:
+        return 0
 
     return account.total_this_month_cents // len(bought)
 
@@ -907,12 +948,14 @@ def render_monthly_statement(account: Account,
     which is how two parts of a shop come to disagree about what a shopper
     spent.
 
-    Raises rather than returning an empty statement. A month with nothing in it
-    has no largest purchase, no smallest, no mean and no shape, and every one of
-    those is a row this panel promises. The page above catches it, records the
-    shopper it failed for and the line it failed on, and serves a failed
-    response - see `io_shop.account_page`, which is the only place in the shop
-    that catches broadly and the only place that should.
+    A month with nothing in it assembles like any other. It has no largest
+    purchase, no smallest and no mean, and the document says so by not printing
+    those rows rather than by failing: a shopper who bought nothing is not a
+    statement that could not be rendered, and treating them as one turns the
+    most ordinary account on the site into a failed request. What would still
+    raise here is a genuinely undescribable statement - a period outside the
+    calendar, for instance - and the page above catches that, records the
+    shopper it failed for, and serves a failed response.
     """
     bought = purchases_this_month(account)
     month_total_cents = account.total_this_month_cents
@@ -953,7 +996,8 @@ def statement_sections(statement: MonthlyStatement) -> list[StatementSection]:
 
     Empty sections are dropped here rather than by each renderer. A section
     with no rows is a heading over nothing, which is the one thing every one of
-    the three gets wrong in its own way.
+    the three gets wrong in its own way. On a month with no purchases every
+    section but the first drops out, which is the correct document for it.
     """
     sections = [
         StatementSection(
@@ -1003,11 +1047,19 @@ def statement_rows(statement: MonthlyStatement) -> list[StatementRow]:
 def _the_shape_of_the_month(statement: MonthlyStatement) -> list[StatementRow]:
     """The largest, the smallest and the average, where there is a spread to show.
 
-    Suppressed entirely on a quiet month rather than shown with three equal
-    figures. A month of one purchase would print that purchase three times under
-    three different labels, which reads as a rendering fault rather than as a
-    quiet month - and the row that follows says the true thing instead.
+    Nothing at all on a month with no purchases. There is no largest, smallest
+    or average of nothing, and the two rows above have already said the whole
+    truth about that month - a row reading "Average purchase £0.00" would be
+    inventing a figure for a month that does not have one.
+
+    Suppressed on a quiet month too, rather than shown with three equal
+    figures. A month of one purchase would print that purchase three times
+    under three different labels, which reads as a rendering fault rather than
+    as a quiet month - and the row that follows says the true thing instead.
     """
+    if statement.is_an_empty_month:
+        return []
+
     if statement.is_a_quiet_month:
         return [
             StatementRow(
@@ -1243,9 +1295,16 @@ def describe_month(statement: MonthlyStatement) -> str:
     Built from the same figures the rows are built from rather than from the
     rows themselves, because a sentence assembled by re-parsing formatted
     strings is a sentence that breaks the first time a currency symbol moves.
+
+    A month with nothing in it gets its own sentence rather than being called
+    quiet. "A quiet month: £0.00 across 0 purchases" reads as a figure that
+    failed to load; "nothing bought this month" reads as what happened.
     """
     spent = format_money(statement.headline_cents)
     purchases = format_count(statement.purchase_count, "purchase", "purchases")
+
+    if statement.is_an_empty_month:
+        return "Nothing bought this month."
 
     if statement.is_a_quiet_month:
         return f"A quiet month: {spent} across {purchases}."
@@ -1472,6 +1531,10 @@ def problems_with(statement: MonthlyStatement) -> list[StatementProblem]:
 
     Ordered by how badly each would mislead a reader, worst first, because the
     log line that gets read is the first one.
+
+    The range checks are skipped on a month with no purchases: there is no
+    largest, smallest or average to be out of order, and the zeroes standing in
+    for them are not figures anybody is shown.
     """
     found: list[StatementProblem] = []
 
