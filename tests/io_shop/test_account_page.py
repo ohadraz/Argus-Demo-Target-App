@@ -60,6 +60,21 @@ def test_a_page_that_renders_carries_the_figure_and_no_failure() -> None:
     assert page.failure is None
 
 
+def test_the_page_renders_for_an_idle_shopper_with_the_monthly_rollout_on(
+) -> None:
+    # The incident, as a request. This shopper has a history and has bought
+    # nothing this month, which is the commonest shape in the shop - and with
+    # `monthly-spend-feature` on it was every one of them failing on a division
+    # by zero. The page renders, so the flag is safe to turn back on.
+    page = serve_account_page(an_account_idle_this_month(1000, 3000),
+                              use_monthly_summary=True,
+                              ask_the_provider=a_provider_holding_a_card())
+
+    assert page.failure is None
+    assert page.figure_cents == 0
+    assert page.card_last_four == "4242"
+
+
 def test_a_page_that_breaks_is_reported_rather_than_raised() -> None:
     page = serve_account_page(
         an_account_that_never_bought_anything(),
