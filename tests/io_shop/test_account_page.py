@@ -60,6 +60,20 @@ def test_a_page_that_renders_carries_the_figure_and_no_failure() -> None:
     assert page.failure is None
 
 
+def test_the_monthly_figure_renders_for_a_shopper_idle_this_month() -> None:
+    # The incident, end to end. With the fallback flag on these requests took
+    # the lifetime figure and were fine; with it off they take the monthly one,
+    # and a shopper who simply has not been in this month is most of the shop.
+    # The page has to render for them.
+    page = serve_account_page(an_account_idle_this_month(1000, 3000),
+                              use_monthly_summary=True,
+                              ask_the_provider=a_provider_holding_a_card())
+
+    assert page.failure is None
+    assert page.figure_cents == 0
+    assert page.card_last_four == "4242"
+
+
 def test_a_page_that_breaks_is_reported_rather_than_raised() -> None:
     page = serve_account_page(
         an_account_that_never_bought_anything(),
