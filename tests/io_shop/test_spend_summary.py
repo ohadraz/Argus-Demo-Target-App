@@ -50,6 +50,24 @@ def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
     assert average_spend_per_item_this_month(an_active_shopper) == 3000
 
 
+def test_the_monthly_average_is_zero_for_a_shopper_idle_this_month() -> None:
+    # The incident. A shopper with a full history and nothing bought this month
+    # has an empty monthly divisor, which is most accounts early in a month -
+    # so the figure is 0 rather than a ZeroDivisionError that fails the page.
+    account = an_account_with_no_purchases_this_month(1000, 3000)
+
+    assert average_spend_per_item_this_month(account) == 0
+
+
+def test_the_rollout_renders_rather_than_fails_for_a_shopper_idle_this_month(
+) -> None:
+    # The same case through the flag the rollout actually flips, because that
+    # is the path the failing requests took.
+    account = an_account_with_no_purchases_this_month(1000, 3000)
+
+    assert render_spend_summary(account, use_monthly_summary=True) == 0
+
+
 def test_the_page_takes_the_stable_summary_when_the_rollout_is_off() -> None:
     account = an_account_with_no_purchases_this_month(1000, 3000)
 
