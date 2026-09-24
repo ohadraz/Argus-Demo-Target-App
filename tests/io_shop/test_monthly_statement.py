@@ -22,9 +22,10 @@ from io_shop.monthly_statement import (
 
 A safety net rather than a specification: the panel was written first and these
 cover what would be expensive to find out from a shopper. The one that matters
-most is the empty month, because that is the fault the
-`monthly-statement-panel` scenario stages, and a change that quietly made it
-stop raising would leave that scenario staging nothing at all.
+most is the empty month, because that is the shape that took the account page
+down when `monthly-spend-feature` was first turned on - the statement asked for
+the largest purchase of a month that had none, and the whole page failed around
+it.
 """
 
 MARCH = period_for(3, 2026)
@@ -70,12 +71,37 @@ def test_the_statement_takes_its_shape_from_this_month_alone() -> None:
     assert statement.smallest_cents == 1200
 
 
-def test_a_month_with_nothing_in_it_fails_rather_than_reporting_zero() -> None:
-    # The fault the `monthly-statement-panel` scenario stages. A statement
-    # reporting a made-up zero would be a panel nobody could trust on the
-    # months it can describe.
-    with pytest.raises(ValueError):
-        render_monthly_statement(a_shopper_who_bought_nothing_this_month(), MARCH)
+def test_a_month_with_nothing_in_it_renders_as_a_quiet_month() -> None:
+    # The incident: `max()` over a month with no purchases raised, and the
+    # account page failed around the panel. A shopper who has not bought
+    # anything yet this month has an ordinary month worth nothing, and the
+    # statement says so rather than raising.
+    statement = render_monthly_statement(
+        a_shopper_who_bought_nothing_this_month(), MARCH
+    )
+
+    assert statement.headline_cents == 0
+    assert statement.purchase_count == 0
+    assert statement.is_a_quiet_month
+    assert reconciles(statement)
+    assert problems_with(statement) == []
+    assert describe_month(statement) == "A quiet month: £0.00 across 0 purchases."
+
+
+def test_an_empty_month_prints_no_figures_it_does_not_have() -> None:
+    # No largest, smallest or average row: those figures do not exist for a
+    # month with no purchases, and a zero printed under one of those labels
+    # would read as a purchase of nothing.
+    statement = render_monthly_statement(
+        a_shopper_who_bought_nothing_this_month(), MARCH
+    )
+    labels = [row.label for row in statement_rows(statement)]
+
+    assert "Largest purchase" not in labels
+    assert "Smallest purchase" not in labels
+    assert "Average purchase" not in labels
+    assert "A quiet month" in labels
+    assert all(section.rows for section in statement_sections(statement))
 
 
 def test_the_breakdowns_add_up_to_the_headline() -> None:
@@ -132,6 +158,16 @@ def test_the_email_is_titled_with_the_month() -> None:
     statement = render_monthly_statement(a_shopper_who_bought_this_month(), MARCH)
 
     assert as_plain_text(statement).startswith("MARCH 2026")
+
+
+def test_an_empty_month_still_renders_every_way_the_panel_is_read() -> None:
+    statement = render_monthly_statement(
+        a_shopper_who_bought_nothing_this_month(), MARCH
+    )
+
+    assert as_plain_text(statement).startswith("MARCH 2026")
+    assert as_csv_rows(statement)[0] == STATEMENT_COLUMNS
+    assert "monthly-statement" in as_html(statement)
 
 
 def test_the_markup_escapes_a_category_the_catalogue_made_up() -> None:
