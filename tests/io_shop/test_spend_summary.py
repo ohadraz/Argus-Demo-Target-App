@@ -50,6 +50,22 @@ def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
     assert average_spend_per_item_this_month(an_active_shopper) == 3000
 
 
+def test_the_monthly_average_is_zero_for_a_shopper_idle_this_month() -> None:
+    # The case that took the account page down when the rollout flag moved
+    # traffic onto this figure: a shopper with a history who has bought nothing
+    # this month. Nothing spent, nothing to divide by, so zero - not a raise.
+    account = an_account_with_no_purchases_this_month(1000, 3000)
+
+    assert average_spend_per_item_this_month(account) == 0
+
+
+def test_the_page_renders_for_an_idle_shopper_when_the_rollout_is_on() -> None:
+    # The same case through the path the flag actually selects.
+    account = an_account_with_no_purchases_this_month(1000, 3000)
+
+    assert render_spend_summary(account, use_monthly_summary=True) == 0
+
+
 def test_the_page_takes_the_stable_summary_when_the_rollout_is_off() -> None:
     account = an_account_with_no_purchases_this_month(1000, 3000)
 
