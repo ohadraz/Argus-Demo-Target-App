@@ -26,6 +26,15 @@ decides whether a request gets the statement, and a request that does not get it
 renders exactly the page it rendered last month - which is what makes the panel
 withdrawable rather than a migration.
 
+Because it is behind a rollout it is also on the request path of every page the
+rollout reaches, which makes what it costs a property of the shop rather than of
+this module. The month is selected once, in `render_monthly_statement`, and
+carried into everything that needs it: the figures below take the purchases
+rather than the account wherever they can, so that assembling a statement walks
+a shopper's history once instead of once per figure. A history is years long and
+a month is not, and a panel that re-derived the month per row would cost the
+most for the shoppers who have bought the most.
+
 The document is assembled once and rendered four ways - the account page's
 markup, the monthly email's plain text, the download's rows, and the one
 sentence a notification has room for. All four are below, and all four are
@@ -610,6 +619,9 @@ def purchases_this_month(account: Account) -> tuple[Purchase, ...]:
     statement module that re-derived the month from a timestamp would be
     answering a question the query has already answered, and answering it in a
     different timezone.
+
+    One walk of the whole history, which is why `render_monthly_statement` does
+    it once and hands the result on rather than letting each figure ask again.
     """
     return tuple(
         purchase for purchase in account.purchases if purchase.in_current_month
@@ -622,8 +634,11 @@ def the_biggest_purchase_this_month(account: Account) -> int:
     The statement leads on this after the headline, because it is the figure a
     shopper checks first: a month that surprised them usually surprised them
     once, and this is the purchase that did it.
+
+    For a caller holding an account and nothing else. The statement itself has
+    already selected the month and uses `_the_biggest_of` on what it selected.
     """
-    return max(purchase.price_cents for purchase in purchases_this_month(account))
+    return _the_biggest_of(purchases_this_month(account))
 
 
 def the_smallest_purchase_this_month(account: Account) -> int:
@@ -634,7 +649,7 @@ def the_smallest_purchase_this_month(account: Account) -> int:
     one big thing or a month of many similar things, before the band breakdown
     says it in detail.
     """
-    return min(purchase.price_cents for purchase in purchases_this_month(account))
+    return _the_smallest_of(purchases_this_month(account))
 
 
 def the_mean_purchase_this_month(account: Account) -> int:
@@ -645,9 +660,29 @@ def the_mean_purchase_this_month(account: Account) -> int:
     produce a mean above the largest purchase on a month of identical prices,
     which is the kind of figure that costs a support conversation.
     """
-    bought = purchases_this_month(account)
+    return _the_mean_of(
+        purchases_this_month(account), account.total_this_month_cents
+    )
 
-    return account.total_this_month_cents // len(bought)
+
+def _the_biggest_of(bought: tuple[Purchase, ...]) -> int:
+    """The largest of the month's purchases, from the month already selected.
+
+    Raises on an empty month, as every figure here does: a month with nothing
+    in it has no largest purchase, and inventing one is how a panel comes to
+    print a figure nobody spent.
+    """
+    return max(purchase.price_cents for purchase in bought)
+
+
+def _the_smallest_of(bought: tuple[Purchase, ...]) -> int:
+    """The smallest of the month's purchases, from the month already selected."""
+    return min(purchase.price_cents for purchase in bought)
+
+
+def _the_mean_of(bought: tuple[Purchase, ...], month_total_cents: int) -> int:
+    """The month's average purchase, from the month already selected."""
+    return month_total_cents // len(bought)
 
 
 def _share_of(part_cents: int, whole_cents: int) -> float:
@@ -673,23 +708,34 @@ def _band_summaries(bought: tuple[Purchase, ...],
     a breakdown assembled from only the non-empty bands cannot tell "no
     purchases between £20 and £50" from "£20 to £50 is not a band this shop
     has", and the first of those is a fact about the shopper's month.
+
+    One pass over the month rather than one pass per band. The bands are
+    ordered and half-open, so the first band that holds a purchase is the only
+    one that can - filtering the month once per band asked the same question
+    seven times and allocated seven lists to hold the answers. A price no band
+    holds falls into none of them, exactly as it did before: the reconciliation
+    check is what notices such a thing, and a fallback here would hide it in
+    the top band.
     """
-    summaries = []
+    counts = [0] * len(THE_PRICE_BANDS)
+    totals = [0] * len(THE_PRICE_BANDS)
 
-    for band in THE_PRICE_BANDS:
-        in_this_band = [purchase for purchase in bought if band.holds(purchase)]
-        total_cents = sum(purchase.price_cents for purchase in in_this_band)
+    for purchase in bought:
+        for index, band in enumerate(THE_PRICE_BANDS):
+            if band.holds(purchase):
+                counts[index] += 1
+                totals[index] += purchase.price_cents
+                break
 
-        summaries.append(
-            BandSummary(
-                band=band,
-                purchase_count=len(in_this_band),
-                total_cents=total_cents,
-                share_of_month=_share_of(total_cents, month_total_cents)
-            )
+    return tuple(
+        BandSummary(
+            band=band,
+            purchase_count=counts[index],
+            total_cents=totals[index],
+            share_of_month=_share_of(totals[index], month_total_cents)
         )
-
-    return tuple(summaries)
+        for index, band in enumerate(THE_PRICE_BANDS)
+    )
 
 
 def _category_summaries(bought: tuple[Purchase, ...],
@@ -703,30 +749,32 @@ def _category_summaries(bought: tuple[Purchase, ...],
     purchase carrying a category the shop does not have does not silently
     invent a row for it. It lands in `UNCLASSIFIED`, which is where the
     catalogue puts it too, and the statement still adds up.
+
+    One pass over the month, accumulating into the shop's own list of
+    categories. Walking the month once per category filed every purchase seven
+    times over to place it once.
     """
     known = set(THE_CATEGORIES)
-    summaries = []
+    counts = dict.fromkeys(THE_CATEGORIES, 0)
+    totals = dict.fromkeys(THE_CATEGORIES, 0)
+    refunded = dict.fromkeys(THE_CATEGORIES, 0)
 
-    for name in THE_CATEGORIES:
-        in_this_category = [
-            purchase for purchase in bought
-            if _category_of(purchase, known) == name
-        ]
-        total_cents = sum(purchase.price_cents for purchase in in_this_category)
+    for purchase in bought:
+        name = _category_of(purchase, known)
+        counts[name] += 1
+        totals[name] += purchase.price_cents
+        refunded[name] += purchase.refunded_cents
 
-        summaries.append(
-            CategorySummary(
-                name=name,
-                purchase_count=len(in_this_category),
-                total_cents=total_cents,
-                refunded_cents=sum(
-                    purchase.refunded_cents for purchase in in_this_category
-                ),
-                share_of_month=_share_of(total_cents, month_total_cents)
-            )
+    return tuple(
+        CategorySummary(
+            name=name,
+            purchase_count=counts[name],
+            total_cents=totals[name],
+            refunded_cents=refunded[name],
+            share_of_month=_share_of(totals[name], month_total_cents)
         )
-
-    return tuple(summaries)
+        for name in THE_CATEGORIES
+    )
 
 
 def _category_of(purchase: Purchase, known: set[str]) -> str:
@@ -845,7 +893,7 @@ def _instalment_of(purchase: Purchase) -> int:
     return purchase.price_cents // (purchase.instalments_remaining + 1)
 
 
-def _the_usual_month(account: Account) -> int:
+def _the_usual_month(account: Account, purchases_this_month_count: int) -> int:
     """What this shopper spends in a month, taken across their whole history.
 
     An approximation, and openly one: the account carries a lifetime total and a
@@ -860,16 +908,21 @@ def _the_usual_month(account: Account) -> int:
     spent twice as much as usual, which they already know. Comparing at equal
     volume isolates the thing they cannot see: whether the things they bought
     were dearer than the things they normally buy.
+
+    The month's count is passed in rather than counted again. It was counted
+    when the month was selected, and re-selecting it here meant a second walk
+    of the entire history to arrive at a number the caller was already holding.
     """
     if not account.purchases:
         return 0
 
     lifetime_mean = account.total_cents // len(account.purchases)
 
-    return lifetime_mean * len(purchases_this_month(account))
+    return lifetime_mean * purchases_this_month_count
 
 
-def _compared_with_usual(account: Account) -> MonthComparison:
+def _compared_with_usual(account: Account,
+                         bought: tuple[Purchase, ...]) -> MonthComparison:
     """This month against what this shopper's months usually cost.
 
     The direction is resolved to a word here, and the share is made positive
@@ -878,7 +931,7 @@ def _compared_with_usual(account: Account) -> MonthComparison:
     eventually print "12% less" for a month that was 12% more, and the only
     person who would notice is the shopper.
     """
-    usual_cents = _the_usual_month(account)
+    usual_cents = _the_usual_month(account, len(bought))
     this_month_cents = account.total_this_month_cents
     difference = this_month_cents - usual_cents
 
@@ -907,6 +960,12 @@ def render_monthly_statement(account: Account,
     which is how two parts of a shop come to disagree about what a shopper
     spent.
 
+    The month is selected once, here, and every figure is worked out from what
+    was selected. This runs inside a page render for every request the rollout
+    reaches, and each re-selection was a walk of the shopper's whole history -
+    so a panel that asked five times cost five times the most for the shoppers
+    who have bought the most, which is a tail nobody sees in an error rate.
+
     Raises rather than returning an empty statement. A month with nothing in it
     has no largest purchase, no smallest, no mean and no shape, and every one of
     those is a row this panel promises. The page above catches it, records the
@@ -921,16 +980,16 @@ def render_monthly_statement(account: Account,
         period=period,
         headline_cents=month_total_cents,
         purchase_count=len(bought),
-        biggest_cents=the_biggest_purchase_this_month(account),
-        smallest_cents=the_smallest_purchase_this_month(account),
-        mean_cents=the_mean_purchase_this_month(account),
+        biggest_cents=_the_biggest_of(bought),
+        smallest_cents=_the_smallest_of(bought),
+        mean_cents=_the_mean_of(bought, month_total_cents),
         bands=_band_summaries(bought, month_total_cents),
         categories=_category_summaries(bought, month_total_cents),
         refunds=_refunds_this_month(bought),
         delivery=_delivery_this_month(bought),
         savings=_savings_this_month(bought),
         instalments=_instalments_this_month(bought),
-        compared_with_usual=_compared_with_usual(account)
+        compared_with_usual=_compared_with_usual(account, bought)
     )
 
 

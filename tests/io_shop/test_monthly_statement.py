@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
+
 import pytest
 from io_shop.accounts import Account, Purchase
 from io_shop.monthly_statement import (
@@ -25,6 +27,11 @@ cover what would be expensive to find out from a shopper. The one that matters
 most is the empty month, because that is the fault the
 `monthly-statement-panel` scenario stages, and a change that quietly made it
 stop raising would leave that scenario staging nothing at all.
+
+One of them is about cost rather than about figures. The panel is behind
+`monthly-spend-feature` and renders inside the request, so how many times it
+walks a shopper's history is a property of the account page's latency - and the
+only thing a shopper with three years of purchases notices.
 """
 
 MARCH = period_for(3, 2026)
@@ -53,6 +60,23 @@ def a_shopper_who_bought_nothing_this_month() -> Account:
     )
 
 
+class AHistoryThatCountsItsWalks(list):
+    """A purchase history that records how many times it is walked.
+
+    The only way to measure this without a clock. A test that timed the panel
+    would measure the machine it ran on; this measures the shape of the code,
+    which is the thing that changed.
+    """
+
+    def __init__(self, purchases: Iterable[Purchase]) -> None:
+        super().__init__(purchases)
+        self.walks = 0
+
+    def __iter__(self) -> Iterator[Purchase]:
+        self.walks += 1
+        return super().__iter__()
+
+
 def test_the_statement_reports_the_month_it_was_asked_for() -> None:
     statement = render_monthly_statement(a_shopper_who_bought_this_month(), MARCH)
 
@@ -68,6 +92,54 @@ def test_the_statement_takes_its_shape_from_this_month_alone() -> None:
 
     assert statement.biggest_cents == 6400
     assert statement.smallest_cents == 1200
+
+
+def test_the_statement_walks_the_history_once() -> None:
+    # The latency fault, stated as a count. The panel used to select the month
+    # five times over - once for the headline, once each for the largest, the
+    # smallest and the mean, and once more for the comparison - and every one
+    # of those is a walk of the shopper's whole history, not of their month.
+    # Behind a flag that puts this on every request, that is a p99 that follows
+    # how much a shopper has ever bought.
+    history = AHistoryThatCountsItsWalks(
+        a_shopper_who_bought_this_month().purchases
+    )
+    account = Account(
+        shopper_id="shopper-with-a-long-history",
+        purchases=history,  # type: ignore[arg-type]
+        total_cents=11800,
+        total_this_month_cents=10900,
+    )
+
+    statement = render_monthly_statement(account, MARCH)
+
+    assert history.walks == 1
+    assert statement.headline_cents == 10900
+    assert statement.biggest_cents == 6400
+    assert statement.smallest_cents == 1200
+
+
+def test_every_purchase_lands_in_exactly_one_band() -> None:
+    # What the single pass over the month has to keep true: the bands tile the
+    # whole range half-open, so a purchase belongs to one of them and the
+    # breakdown still adds up to the headline.
+    prices = (100, 900, 3000, 7000, 15000, 30000, 90000)
+    a_shopper_who_bought_one_of_everything = Account(
+        shopper_id="shopper-across-the-bands",
+        purchases=tuple(
+            Purchase(price_cents=price, in_current_month=True) for price in prices
+        ),
+        total_cents=sum(prices),
+        total_this_month_cents=sum(prices),
+    )
+
+    statement = render_monthly_statement(
+        a_shopper_who_bought_one_of_everything, MARCH
+    )
+
+    assert sum(summary.purchase_count for summary in statement.bands) == len(prices)
+    assert all(summary.purchase_count == 1 for summary in statement.bands)
+    assert reconciles(statement)
 
 
 def test_a_month_with_nothing_in_it_fails_rather_than_reporting_zero() -> None:
