@@ -1,12 +1,3 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Final
-
-from io_shop.payment_provider import PROVIDER_HOST
-from io_shop.pricing_service import PRICING_HOST
-from target_app.settings import the_working_cache_endpoint
-
 """The organisation's service registry - what calls what, and whose each one is.
 
 Every company past a certain size keeps one of these, and the thing that is true
@@ -32,6 +23,15 @@ so the registry cannot come to disagree with the code about where anything is.
 That is the one kind of drift a registry must not have: an entry naming an
 address nothing dials is worse than no entry, because it is followed.
 """
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Final
+
+from io_shop.payment_provider import PROVIDER_HOST
+from io_shop.pricing_service import PRICING_HOST
+from target_app.settings import the_working_cache_endpoint
 
 # What a dependency's ownership can be. Two values today and a string rather than
 # a boolean, because a registry that has run for a year has more than two - a
