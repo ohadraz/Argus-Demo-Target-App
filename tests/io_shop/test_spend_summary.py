@@ -11,7 +11,9 @@ from io_shop.spend_summary import (
 """Io's account-page arithmetic - the lifetime figure and the monthly one.
 
 The monthly figure is newer and ships behind a rollout flag, so the cases below
-cover the shape the page has had for years plus the one the flag adds.
+cover the shape the page has had for years plus the one the flag adds - and the
+cost of the lifetime figure, which is on the path every request without a flag
+takes.
 """
 
 
@@ -25,6 +27,32 @@ def an_account_with_no_purchases_this_month(*prices: int) -> Account:
         total_cents=sum(prices),
         total_this_month_cents=0,
     )
+
+
+class CountingHistory(tuple):
+    """A purchase history that remembers how many times it was read through.
+
+    A tuple everywhere else, so the account holding it is the account the page
+    would hold. The tally is what separates summing the prices once from
+    re-summing them once per purchase, which is the difference a stopwatch
+    would measure less reliably.
+    """
+
+    def __new__(cls, purchases: tuple[Purchase, ...]) -> CountingHistory:
+        made = super().__new__(cls, purchases)
+        made.reads = 0
+
+        return made
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        self.reads += 1
+
+        return tuple.__iter__(self)
+
+    def __getitem__(self, index):  # type: ignore[no-untyped-def]
+        self.reads += 1
+
+        return tuple.__getitem__(self, index)
 
 
 def test_the_lifetime_average_spreads_the_total_over_every_purchase() -> None:
@@ -47,6 +75,32 @@ def test_the_lifetime_average_follows_the_purchases_not_the_carried_total() -> N
     )
 
     assert average_spend_per_item(an_account_whose_total_drifted) == 2000
+
+
+def test_the_lifetime_average_reads_the_history_once() -> None:
+    # The default path: every request the rollouts do not claim renders through
+    # this. Re-summing the prices once per purchase kept only the last sum and
+    # made a page render quadratic in the history - correct figures, and every
+    # one of them slower, which is a regression nothing but the latency reports.
+    how_many = 300
+    history = CountingHistory(
+        tuple(
+            Purchase(price_cents=(index + 1) * 100, in_current_month=False)
+            for index in range(how_many)
+        )
+    )
+    an_account_with_a_long_history = Account(
+        shopper_id="shopper-of-long-standing",
+        purchases=history,
+        total_cents=sum(purchase.price_cents for purchase in history),
+        total_this_month_cents=0,
+    )
+    history.reads = 0
+
+    figure = average_spend_per_item(an_account_with_a_long_history)
+
+    assert figure == sum((index + 1) * 100 for index in range(how_many)) // how_many
+    assert history.reads <= 2
 
 
 def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
