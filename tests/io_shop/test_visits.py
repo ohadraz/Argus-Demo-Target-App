@@ -34,11 +34,15 @@ def a_shop_that_has_just_started() -> None:
 
 
 def a_provider_holding_a_card() -> AskTheProvider:
-    """The provider answering, which is what it does in every case here - these
-    are about what the page remembers, not about who it asks."""
+    """The provider answering, which is what it does in almost every case here -
+    these are about what the page remembers, not about who it asks."""
     return lambda dont_care_shopper: ProviderAnswer(
         status=200, card=StoredCard(brand="visa", last_four="4242")
     )
+
+
+def a_provider_that_is_down() -> AskTheProvider:
+    return lambda dont_care_shopper: ProviderAnswer(status=503)
 
 
 def an_account(shopper_id: str, *prices: int) -> Account:
@@ -92,6 +96,16 @@ def test_serving_a_page_records_the_visit() -> None:
     serve_account_page(an_account("shopper-1", 1000, 3000),
                        use_monthly_summary=False,
                        ask_the_provider=a_provider_holding_a_card())
+
+    assert what_they_saw_last_time("shopper-1") == "2000"
+
+
+def test_a_page_missing_its_card_records_the_figure_it_showed() -> None:
+    # A provider outage leaves a page that rendered, so what the shopper was
+    # shown is the figure - not an error string they never saw.
+    serve_account_page(an_account("shopper-1", 1000, 3000),
+                       use_monthly_summary=False,
+                       ask_the_provider=a_provider_that_is_down())
 
     assert what_they_saw_last_time("shopper-1") == "2000"
 

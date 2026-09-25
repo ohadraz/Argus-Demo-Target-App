@@ -9,13 +9,15 @@ The account page shows the card a shopper will be charged with, and the shop has
 never held that number: it lives with the payment provider, and the page asks
 for it while it renders. That makes the provider part of every account page -
 another company's service on Io's request path, which is the ordinary shape of a
-shop and the reason an outage somewhere else becomes an outage here.
+shop and the reason an outage somewhere else can become an outage here.
 
-Nothing in this module retries, falls back, or renders the page without the
-card. That is deliberate rather than unfinished: when the provider is down there
-is nothing the shop can do about it, and code that softened the failure would
-turn an incident about somebody else's outage into an incident about Io's
-resilience.
+Nothing in this module retries or invents a card. When the provider will not
+answer, that is said plainly - in words naming the host, the path and the status
+- and what the shop does about it is the page's decision, not this module's. The
+account page degrades: it renders without the card panel and reports these words
+beside the render. Card details are not worth failing a page for, and a shop
+that fails every account page because somebody else is down has turned their
+incident into its own.
 
 How the provider is reached is the caller's to supply. The shop states what it
 asks for and what it does with the answer, and whoever is running it says where
@@ -71,6 +73,11 @@ class PaymentProviderFailed(Exception):
     down from one that is refusing this particular shopper, and inventing the
     distinction in an exception type would be the shop claiming knowledge of
     another company's internals.
+
+    Raised so that the caller has to decide what to do about it, and caught by
+    the account page, which renders without the card. The raise is not
+    pointless: it is how the page learns there is no card *and* what to say
+    about it, which a function returning `None` could not tell it.
     """
 
 

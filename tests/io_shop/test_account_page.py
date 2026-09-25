@@ -13,7 +13,8 @@ from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
 Three things worth pinning: a failure is reported rather than raised - a handler
 that let it escape would take the worker down - the report keeps the error's own
 words, which are what a reader diagnoses from, and a payment provider that will
-not answer fails the page in words that name the provider rather than the shop.
+not answer costs the page its card panel in words that name the provider,
+without costing the shopper the page.
 """
 
 
@@ -116,31 +117,47 @@ def test_the_line_a_failure_names_is_the_one_that_raised_it() -> None:
     assert "//" in source[named - 1]
 
 
-def test_a_provider_that_will_not_answer_fails_the_page() -> None:
-    # Nothing is retried and nothing is rendered without the card: when the
-    # provider is down there is nothing the shop can do about it, and code that
-    # softened this would turn somebody else's outage into a question about Io's
-    # resilience.
+def test_a_provider_that_will_not_answer_costs_the_card_and_not_the_page() -> None:
+    # The incident, as a case. The card is one panel sourced from another
+    # company; the figure beside it is Io's own work and is still correct. A
+    # page that failed here would put somebody else's outage into Io's error
+    # rate, which is what took every account page down when the provider
+    # started answering 503.
     page = serve_account_page(an_account_idle_this_month(1000, 3000),
                               use_monthly_summary=False,
                               ask_the_provider=a_provider_that_is_down())
 
-    assert page.figure_cents is None
+    assert page.failure is None
+    assert page.figure_cents == 2000
     assert page.card_last_four is None
-    assert page.failure is not None
 
 
-def test_a_provider_failure_names_the_provider_and_the_status() -> None:
-    # The host and the status, because those are what tell a reader at three in
-    # the morning that the fault is not in this repository.
+def test_a_provider_failure_is_reported_beside_the_page_not_in_it() -> None:
+    # The host, the status and the raising line, because those are what tell a
+    # reader at three in the morning that the fault is not in this repository -
+    # and they belong in `card_failure`, where they are visible in the logs
+    # without being visible in the error rate.
     page = serve_account_page(an_account_idle_this_month(1000, 3000),
                               use_monthly_summary=False,
                               ask_the_provider=a_provider_that_is_down())
 
-    assert page.failure is not None
-    assert page.failure.startswith("PaymentProviderFailed: ")
-    assert payment_provider.PROVIDER_HOST in page.failure
-    assert "503" in page.failure
+    assert page.failure is None
+    assert page.card_failure is not None
+    assert page.card_failure.startswith("PaymentProviderFailed: ")
+    assert payment_provider.PROVIDER_HOST in page.card_failure
+    assert "503" in page.card_failure
+    assert "at src/io_shop/payment_provider.py:" in page.card_failure
+
+
+def test_a_provider_that_answers_reports_no_card_failure() -> None:
+    # The other state. Degrading when the provider is down is only right if the
+    # page is unchanged when it is up.
+    page = serve_account_page(an_account_idle_this_month(1000, 3000),
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card())
+
+    assert page.card_last_four == "4242"
+    assert page.card_failure is None
 
 
 def a_cache_holding(summary_cents: int) -> LookUpSummary:
