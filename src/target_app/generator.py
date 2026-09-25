@@ -206,6 +206,25 @@ _SLOW_ROLLOUT_SHARE = 0.03
 # an ordinary miss costs.
 _RECOMPUTE_PER_ITEM_MS = _RECOMPUTED_PAGE_MS
 
+# What a revision that recomputes the lifetime total once per purchase costs the
+# shop it is deployed to, as a multiple of what the revision before it cost.
+#
+# A multiple over the baseline quantiles rather than a per-request centre, and
+# that is the honest arithmetic for this scenario rather than a shortcut: the
+# shop this deployment lands on has no summary cache configured, so every page
+# already computes its own figure and there is no mixture of a fast path and a
+# slow one for percentiles to fall between. Every request pays the same
+# multiplier, so the median, the 95th and the 99th all move by it together -
+# which is the property that separates this incident from the rollout's.
+#
+# Ten, because that is roughly what walking a history of a dozen purchases once
+# per purchase costs against dividing a total that was already summed: the
+# quadratic term is small at a dozen items and the constant factor is not. It
+# takes the median from 45ms to around half a second and the tail from 380ms to
+# nearly four seconds - unmissable on every panel a reader has, which is the
+# point. Attribution is what is hard here, never detection.
+_DEPLOY_SLOWDOWN = 10.0
+
 # What the cache hands back when it holds a shopper's figure. Which figure it
 # is decides nothing - the page shows it and no metric reads it - and a cached
 # value disagreeing with a recomputed one would be a staleness bug this
@@ -414,6 +433,51 @@ class SlowRollout:
 
 
 @dataclass(frozen=True)
+class SlowDeployment:
+    """When the shop began serving *every* request the expensive way, and when
+    it stopped.
+
+    The same shape as `SlowRollout` and the opposite reach, which is the whole
+    distinction between the two scenarios they stage. A rollout is a cohort: a
+    few requests in a hundred take a longer path and the rest are untouched, so
+    the incident lives where a small share of the traffic lives - the far tail.
+    A deployment is everybody: the revision that is running is the revision
+    every request runs, so the median moves with the tail and nothing hides.
+
+    Kept as a condition of its own rather than derived from the deploy history
+    for the reason the cache outage is: what the history records is that a
+    revision went out, and what this records is over which minutes running it
+    cost anything. A rollback ends the stretch without removing the entry.
+
+    `ended_at` being `None` means the slower revision is still deployed.
+    """
+
+    began_at: datetime
+    ended_at: datetime | None = None
+
+    def share_of(self, minute: datetime, elapsed_seconds: int) -> float:
+        """How much of this minute's first `elapsed_seconds` the slower revision
+        was the one running.
+
+        A share rather than a flag, as every other condition here reports
+        itself: the minute a deployment lands in is served partly by each
+        revision, so the onset ramps across it instead of stepping. The minute a
+        rollback lands in is the same thing in reverse.
+        """
+        if elapsed_seconds <= 0:
+            return 0.0
+
+        window_end = minute + timedelta(seconds=elapsed_seconds)
+        live_from = max(minute, self.began_at)
+        live_until = window_end if self.ended_at is None else min(
+            window_end, self.ended_at
+        )
+        seconds_live = max(0.0, (live_until - live_from).total_seconds())
+
+        return min(1.0, seconds_live / elapsed_seconds)
+
+
+@dataclass(frozen=True)
 class ProcessLifetime:
     """When the shop's process came up, and every time it has come up since.
 
@@ -484,6 +548,7 @@ def generate(timeline: FlagTimeline | None,
              cache_endpoint: CacheEndpoint | None = None,
              cache_outage: CacheOutage | None = None,
              slow_rollout: SlowRollout | None = None,
+             slow_deployment: SlowDeployment | None = None,
              ships_the_statement: bool = False) -> list[GeneratedMinute]:
     """Every minute from `span_minutes` ago up to and including the one in
     progress, once any of it has happened.
@@ -588,6 +653,7 @@ def generate(timeline: FlagTimeline | None,
             cache_endpoint=cache_endpoint,
             cache_outage=cache_outage,
             slow_rollout=slow_rollout,
+            slow_deployment=slow_deployment,
             ships_the_statement=ships_the_statement,
         )
         for offset in range(span_minutes, 0, -1)
@@ -615,6 +681,7 @@ def generate(timeline: FlagTimeline | None,
                 cache_endpoint=cache_endpoint,
                 cache_outage=cache_outage,
                 slow_rollout=slow_rollout,
+                slow_deployment=slow_deployment,
                 ships_the_statement=ships_the_statement,
             )
         )
@@ -644,6 +711,7 @@ def _a_whole_minute(
     cache_endpoint: CacheEndpoint | None = None,
     cache_outage: CacheOutage | None = None,
     slow_rollout: SlowRollout | None = None,
+    slow_deployment: SlowDeployment | None = None,
     ships_the_statement: bool = False,
 ) -> GeneratedMinute:
     """One minute that has finished, generated once and then remembered.
@@ -684,6 +752,7 @@ def _a_whole_minute(
         cache_endpoint=cache_endpoint,
         cache_outage=cache_outage,
         slow_rollout=slow_rollout,
+        slow_deployment=slow_deployment,
         ships_the_statement=ships_the_statement,
     )
 
@@ -702,6 +771,7 @@ def _generate_minute(
     cache_endpoint: CacheEndpoint | None = None,
     cache_outage: CacheOutage | None = None,
     slow_rollout: SlowRollout | None = None,
+    slow_deployment: SlowDeployment | None = None,
     ships_the_statement: bool = False,
 ) -> GeneratedMinute:
     minute_id = minute.strftime(TIMESTAMP_FORMAT)
@@ -730,6 +800,17 @@ def _generate_minute(
     share_of_minute_without_the_cache = (
         cache_outage.share_of(minute, elapsed_seconds)
         if cache_outage is not None
+        else 0.0
+    )
+
+    # What every request cost this minute because of the revision that is
+    # deployed, as a multiple of what it cost before. Exactly 1.0 where no
+    # slower revision is running, which is what leaves every other scenario's
+    # figures where they were - and it draws no entropy, so it cannot shift a
+    # single draw made after it either.
+    slower_for_the_deploy = 1.0 + (_DEPLOY_SLOWDOWN - 1.0) * (
+        slow_deployment.share_of(minute, elapsed_seconds)
+        if slow_deployment is not None
         else 0.0
     )
 
@@ -804,6 +885,7 @@ def _generate_minute(
                 entropy, _BASELINE_P50_MS, _MEDIAN_WOBBLE_AS_FRACTION_OF_BASELINE
             ))
             * under_pressure
+            * slower_for_the_deploy
             + _waiting_on_the_provider(share_of_minute_refused)
         ),
         p95_ms=_the_quantile_at(measured, 0.95) if measured else round(
@@ -811,6 +893,7 @@ def _generate_minute(
                 entropy, _BASELINE_P95_MS, _TAIL_WOBBLE_AS_FRACTION_OF_BASELINE
             ))
             * under_pressure
+            * slower_for_the_deploy
             + _waiting_on_the_provider(share_of_minute_refused)
         ),
         cache_hit_ratio=_how_much_the_cache_carried(outcomes),
@@ -837,6 +920,7 @@ def _generate_minute(
                 entropy, _BASELINE_P99_MS, _TAIL_WOBBLE_AS_FRACTION_OF_BASELINE
             ))
             * under_pressure
+            * slower_for_the_deploy
             + _waiting_on_the_provider(share_of_minute_refused)
         ),
         log_lines=_log_lines_for(

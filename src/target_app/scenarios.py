@@ -12,10 +12,11 @@ real provider, and the telemetry is computed from that flag's state whenever
 anyone asks. Turning the flag off ends the incident, no matter who turns it off
 - which is the only way a mitigation attempt can be honestly graded.
 
-`bad-deployment` is **authored**: a fixed list of minutes, anchored so the whole
-incident sits just behind the seed instant. It has no live condition to react
-to, because rolling a deployment back means pushing a commit, and nothing here
-can yet be asked to do that. It stays as it was until that changes.
+The authored mechanism remains for a scenario that needs a past it can describe
+exactly - a fixed list of minutes, anchored so the whole incident sits just
+behind the seed instant. Nothing staged here uses it today: every scenario has a
+live condition, because a scenario whose telemetry cannot react is one no
+mitigation can be graded against.
 """
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -28,9 +29,16 @@ class ScenarioDeploy:
     Only some scenarios have one - a feature flag flip is not a deploy - and
     that difference is the point: a consumer reading deploy history must be
     able to tell an incident a deploy caused from one it did not.
+
+    `previous_revision` is what was running before it, and it belongs to the
+    scenario rather than to whatever assembles the history: a rollback is
+    addressed to a history entry, so the entry before this one has to be a real
+    commit whose diff against this one is the diagnosis - and which commit that
+    is differs per scenario.
     """
 
     revision: str
+    previous_revision: str
     repo_url: str
     path: str
     target_revision: str = "main"
@@ -177,6 +185,22 @@ class Scenario:
     offered in the console: an audience shown two identical incidents learns
     nothing from the second.
 
+    `deploy_is_slow` stages the sixth generated kind, and the only one whose
+    live condition is which revision is deployed. The revision that went out
+    computes a shopper's lifetime average by walking their purchases once per
+    purchase rather than dividing the total the account carries; the figure is
+    unchanged and costs ten times as much to produce. This shop has no summary
+    cache configured, so every page works its own figure out and every request
+    pays - which is why the median, the 95th and the 99th all climb together.
+
+    That makes it the opposite of `rollout_is_slow` in the one way that matters
+    to a reader: nothing hides. Detection is trivial and attribution is the
+    whole difficulty, because no log line mentions the release and the deploy
+    history is the only evidence naming a cause. What ends it is returning the
+    deployment to the revision before it, which leaves the slower code on the
+    branch - so it is mitigated and not resolved, and re-enabling the platform's
+    own reconciliation brings it straight back.
+
     `offered_in_console` is presentation only. A scenario kept for the capability
     it pins down is not automatically one worth showing an audience; hiding it
     leaves it seedable by id, which is how the e2e suite stages it.
@@ -194,6 +218,7 @@ class Scenario:
     upstream_fails: bool = False
     cache_is_misconfigured: bool = False
     rollout_is_slow: bool = False
+    deploy_is_slow: bool = False
     ships_the_statement: bool = False
     # The deploy a *generated* scenario stages, for the one whose cause is a
     # change rather than a state. An authored scenario carries its deploys on
@@ -220,7 +245,10 @@ class Scenario:
         pointing at a suspect the fixture invented.
         """
         return self.is_generated and not (
-            self.leaks or self.upstream_fails or self.cache_is_misconfigured
+            self.leaks
+            or self.upstream_fails
+            or self.cache_is_misconfigured
+            or self.deploy_is_slow
         )
 
     @property
@@ -245,6 +273,13 @@ CACHE_MISCONFIGURED = "cache-misconfigured"
 # a literal in the scenario - the commit cannot name itself.
 THE_COMMIT_THAT_MOVED_THE_CACHE_PORT = "0d8e826225f0de73958a8a8dd3d867b2ae249e72"
 THE_COMMIT_BEFORE_IT = "544cef36a8eaf45c5b030c3d5c21473d8176cef3"
+# The revision the bad deployment shipped: the lifetime average derived from
+# the purchases once per purchase. A literal for the reason the cache port's
+# commit is one - the commit cannot name itself.
+THE_COMMIT_THAT_SLOWED_THE_AVERAGE = (
+    "5e07d73148d0a704b8fefe5f379bc652bb773655"
+)
+THE_COMMIT_BEFORE_THAT_ONE = "70dbcfde2b549d110a3817d92d60b6dd9786e78b"
 FALLBACK_DISABLED = "fallback-disabled"
 FLAG_TOGGLE_RED_HERRING = "flag-toggle-red-herring"
 COMPETING_FLAG_CHANGES = "competing-flag-changes"
@@ -372,6 +407,7 @@ SCENARIOS: dict[str, Scenario] = {
         cache_is_misconfigured=True,
         deploy=ScenarioDeploy(
             revision=THE_COMMIT_THAT_MOVED_THE_CACHE_PORT,
+            previous_revision=THE_COMMIT_BEFORE_IT,
             repo_url="https://github.com/ohadraz/Argus-Demo-Target-App",
             path="deploy",
             initiated_by="kuki",
@@ -428,74 +464,27 @@ SCENARIOS: dict[str, Scenario] = {
         id=BAD_DEPLOYMENT,
         title="Bad version deployed",
         description=(
-            "A deployment lands and p95 latency climbs from a 220ms baseline to "
-            "timeouts, while the error rate stays mild. The deploy is recorded "
-            "only in the Argo CD history - the log lines never mention it. "
-            "Authored, not live: there is no rollback to perform yet."
+            "A deployment lands and the shop gets slower - every page of it. "
+            "The revision that went out derives a shopper's lifetime average "
+            "from their purchases instead of the total the account already "
+            "carries, and it does that once per purchase, so the figure is the "
+            "one it always was and takes ten times as long to produce. This "
+            "shop runs without a summary cache, so every request computes its "
+            "own figure and every request pays: the median, the 95th and the "
+            "99th percentile all climb together, which is what a deployment "
+            "looks like and what no other scenario here stages. Nothing fails, "
+            "so the error rate never moves. The deploy is recorded only in the "
+            "Argo CD history - no log line mentions a release - so the only "
+            "evidence naming a cause is the history, and what ends the "
+            "incident is returning the deployment to the revision before it."
         ),
-        minutes=(
-            ScenarioMinute(
-                offset_minutes=0,
-                # No mention of the deploy. The Argo CD channel is the only place
-                # it is recorded, so a diagnosis of BAD_DEPLOYMENT can only have
-                # come from there - which is what the e2e case is for.
-                messages=(
-                    "INFO io-shop: request succeeded",
-                    "INFO io-shop: request succeeded",
-                ),
-                error_rate=0.01,
-                p50_ms=40,
-                p95_ms=220,
-                # The tail tracks the p95 all the way up, because a deployment
-                # that made the whole service slower made every request
-                # slower. That is the ordinary shape, and it is worth
-                # authoring rather than leaving out: a scenario whose tail sat
-                # still while its p95 climbed would be a second incident
-                # nobody staged.
-                p99_ms=420,
-                request_volume=1150,
-                deploy=ScenarioDeploy(
-                    revision="9f4c1e7b2a3d5c8e1f0b6a4d2c9e7b5a3f1d8c6e",
-                    repo_url="https://github.com/io-shop/k8s-configs",
-                    path="apps/io-shop/production",
-                ),
-            ),
-            ScenarioMinute(
-                offset_minutes=1,
-                messages=("WARN io-shop: p95 latency climbing",),
-                error_rate=0.02,
-                p50_ms=95,
-                p95_ms=900,
-                p99_ms=1600,
-                request_volume=1120,
-            ),
-            ScenarioMinute(
-                offset_minutes=2,
-                messages=(
-                    "WARN io-shop: p95 latency at 1800ms, up from a 220ms baseline",
-                ),
-                error_rate=0.04,
-                p50_ms=180,
-                p95_ms=1800,
-                p99_ms=3400,
-                request_volume=1090,
-            ),
-            ScenarioMinute(
-                offset_minutes=3,
-                messages=(
-                    "ERROR io-shop: request timeout after 5000ms",
-                    "ERROR io-shop: request timeout after 5000ms",
-                ),
-                error_rate=0.12,
-                p50_ms=320,
-                # Both at the timeout, because the timeout is where a request
-                # stops getting slower and starts being given up on. A tail
-                # authored above it would be a figure no request could have
-                # produced.
-                p95_ms=5000,
-                p99_ms=5000,
-                request_volume=1050,
-            ),
+        deploy_is_slow=True,
+        deploy=ScenarioDeploy(
+            revision=THE_COMMIT_THAT_SLOWED_THE_AVERAGE,
+            previous_revision=THE_COMMIT_BEFORE_THAT_ONE,
+            repo_url="https://github.com/ohadraz/Argus-Demo-Target-App",
+            path="deploy",
+            initiated_by="kuki",
         ),
     ),
 }

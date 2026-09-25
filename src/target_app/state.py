@@ -12,6 +12,7 @@ from target_app.generator import (
     CacheOutage,
     FlagTimeline,
     ProviderOutage,
+    SlowDeployment,
 )
 from target_app.history import forget_the_changes_to
 from target_app.scenarios import (
@@ -158,6 +159,16 @@ class ActiveScenario:
     # is precisely the act of making the second agree with an earlier first.
     cache_outage: CacheOutage | None = None
     cache_endpoint: CacheEndpoint | None = None
+    # The stretch the slower revision has been the one deployed, for the one
+    # scenario whose condition is which revision is running. `None` everywhere
+    # else, which leaves every other scenario's latency exactly where it was -
+    # the multiplier this becomes is 1.0 in its absence.
+    #
+    # Stored rather than derived from the deploy history, because the history
+    # records that a revision went out and this records over which minutes
+    # running it cost anything. A rollback ends the stretch and leaves the
+    # entry, which is what the history is for.
+    deploy_slowdown: SlowDeployment | None = None
     # Every time somebody has brought the process back since. A list rather
     # than a latest value, because a restart has to stay in the window it
     # happened in: the minutes before it kept the heap they had, and a single
@@ -323,6 +334,29 @@ class ScenarioState:
             )
             return
 
+        if scenario.deploy_is_slow:
+            # No flag, no cache and nothing unreachable. What is staged is the
+            # revision that is deployed: the one this scenario names computes the
+            # figure every page shows the long way round, so every request pays
+            # and no aggregate hides it. No cache is configured, which is what
+            # makes "every request" true - a cached page would not compute the
+            # figure at all.
+            #
+            # Backdated like the others, so the incident is diagnosable the
+            # instant this returns.
+            self._remember_where_the_flags_are_now()
+            self._active = ActiveScenario(
+                scenario=scenario,
+                seeded_at=now,
+                process_started_at=now - SETTLED_UPTIME,
+                deploy_slowdown=SlowDeployment(
+                    began_at=now - timedelta(
+                        minutes=get_scenario_settings().onset_backdate_minutes
+                    )
+                ),
+            )
+            return
+
         if scenario.leaks:
             # No flag is touched, because no flag is involved. The condition
             # this stages is the process's own accumulation, which has been
@@ -416,34 +450,48 @@ class ScenarioState:
         """
         self._syncs_itself = enabled
 
-    def roll_the_configuration_back(self) -> datetime:
-        """Puts the shop back on the cache address the previous revision named,
-        and says when.
+    def roll_the_deployment_back(self) -> datetime:
+        """Puts the shop on what the previous revision was running, and says
+        when.
 
-        What a platform rollback does, and all it does: the running
-        configuration is made to agree with an earlier revision. Nothing in the
-        repository changes - the values file still names the port that broke
-        this - which is why the incident is mitigated rather than resolved, and
-        why re-enabling automated sync would bring it straight back.
+        What a platform rollback does, and all it does: what is running is made
+        to agree with an earlier revision. Whichever of the two things a revision
+        carries was the one that broke this, the rollback ends it - a
+        configuration value the shop dials, or code every request executes - and
+        a caller says only which application to return, exactly as the platform's
+        own API does.
 
-        Ends the outage rather than clearing it, for the reason a restart is
+        Nothing in the repository changes. The values file still names the port
+        and the branch still holds the slower code, which is why either incident
+        is mitigated rather than resolved, and why re-enabling automated sync
+        would bring it straight back.
+
+        Ends a stretch rather than clearing it, for the reason a restart is
         recorded rather than erasing the climb: the minutes the shop spent
-        unreachable are what happened, and a window that lost them the moment
-        somebody fixed it would take the incident out of the record exactly
-        when a mitigation wants to be judged against it.
+        unreachable or slow are what happened, and a window that lost them the
+        moment somebody fixed it would take the incident out of the record
+        exactly when a mitigation wants to be judged against it.
 
-        Free on a shop that is not misconfigured, which is what makes it safe
-        for anybody to call: there is no outage to end, and the answer is
-        simply when they asked.
+        Free on a shop with neither staged, which is what makes it safe for
+        anybody to call: there is nothing to end, and the answer is simply when
+        they asked.
         """
         at = utc_now()
         active = self._active
 
-        if active is not None and active.cache_outage is not None:
+        if active is None:
+            return at
+
+        if active.cache_outage is not None:
             self._active = replace(
                 active,
                 cache_outage=replace(active.cache_outage, ended_at=at),
                 cache_endpoint=the_working_cache_endpoint(),
+            )
+        elif active.deploy_slowdown is not None:
+            self._active = replace(
+                active,
+                deploy_slowdown=replace(active.deploy_slowdown, ended_at=at),
             )
 
         return at
@@ -695,6 +743,10 @@ class ScenarioState:
         phase is the rollback: the moment the shop is put back on the address
         the cache actually listens on. Worth watching afterwards for the same
         reason a revert is - to see the median come back down and stay there.
+
+        A slow deployment is the same three phases ended by the same act, and
+        for the same reason it is worth watching after: what a rollback bought
+        is visible only in the minutes that follow it.
         """
         active = self._active
 
@@ -713,6 +765,12 @@ class ScenarioState:
             ended_at = (
                 active.cache_outage.ended_at
                 if active.cache_outage is not None
+                else None
+            )
+        elif active.scenario.deploy_is_slow:
+            ended_at = (
+                active.deploy_slowdown.ended_at
+                if active.deploy_slowdown is not None
                 else None
             )
         else:
@@ -764,6 +822,17 @@ class ScenarioState:
                 return None, utc_now()
 
             return None, min(utc_now(), _settled_at(active.cache_outage.ended_at))
+
+        if active is not None and active.scenario.deploy_is_slow:
+            # No flag here either, and what ends it is the same rollback the
+            # misconfiguration is ended by - settled the same way, and for a
+            # better reason than either: every quantile moved, so every quantile
+            # has to be seen coming back down before a mitigation can be said to
+            # have worked.
+            if active.deploy_slowdown is None or active.deploy_slowdown.ended_at is None:
+                return None, utc_now()
+
+            return None, min(utc_now(), _settled_at(active.deploy_slowdown.ended_at))
 
         if active is not None and active.scenario.leaks:
             if not active.restarts:

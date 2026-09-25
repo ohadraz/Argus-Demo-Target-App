@@ -32,7 +32,6 @@ from target_app.scenarios import (
     FEATURE_FLAG,
     FEATURE_FLAG_TOGGLE,
     SCENARIOS,
-    THE_COMMIT_BEFORE_IT,
     TIMESTAMP_FORMAT,
     Scenario,
     bucket_id,
@@ -617,7 +616,7 @@ def argocd_rollback(application: str, body: ArgoCdRollback) -> ArgoCdApplication
             detail=f"no revision history entry with id {body.id}",
         )
 
-    state.roll_the_configuration_back()
+    state.roll_the_deployment_back()
 
     return argocd_application(application)
 
@@ -880,7 +879,7 @@ def _the_revision_history() -> list[ArgoCdRevisionHistory]:
         return [
             ArgoCdRevisionHistory(
                 id=1,
-                revision=THE_COMMIT_BEFORE_IT,
+                revision=active.scenario.deploy.previous_revision,
                 deployedAt=to_bucket_id(landed - _A_PREVIOUS_DEPLOY_AGO),
                 deployStartedAt=to_bucket_id(
                     landed - _A_PREVIOUS_DEPLOY_AGO - timedelta(minutes=1)
@@ -971,6 +970,7 @@ def _generated_minutes() -> list[GeneratedMinute]:
         cache_endpoint=active.cache_endpoint if active else None,
         cache_outage=active.cache_outage if active else None,
         slow_rollout=_the_rollout_in(scenario, timeline),
+        slow_deployment=active.deploy_slowdown if active else None,
         ships_the_statement=scenario.ships_the_statement,
     )
 

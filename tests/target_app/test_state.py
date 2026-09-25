@@ -798,14 +798,14 @@ def test_a_misconfigured_cache_is_running_until_it_is_rolled_back() -> None:
     assert state.phase() == RUNNING
 
 
-def test_rolling_the_configuration_back_moves_it_into_recovering() -> None:
+def test_rolling_the_deployment_back_moves_it_into_recovering() -> None:
     # Without this the scenario reports `running` for ever: it has no flag to
     # go back and no restart to settle from, so nothing else in the phase
     # derivation can see that it ended.
     state = a_scenario_state(a_flag_client_reporting(False))
     a_staged_cache_misconfiguration(state)
 
-    state.roll_the_configuration_back()
+    state.roll_the_deployment_back()
 
     assert state.phase() == RECOVERING
 
@@ -815,7 +815,7 @@ def test_a_rollback_puts_the_shop_back_on_the_address_that_answers() -> None:
     a_staged_cache_misconfiguration(state)
     broken = state.active.cache_endpoint
 
-    state.roll_the_configuration_back()
+    state.roll_the_deployment_back()
 
     assert state.active.cache_endpoint != broken
     assert state.active.cache_outage.ended_at is not None

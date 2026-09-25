@@ -13,6 +13,7 @@ from target_app.generator import (
     FlagTimeline,
     GeneratedMinute,
     ProviderOutage,
+    SlowDeployment,
     SlowRollout,
     generate,
 )
@@ -1123,3 +1124,94 @@ def test_the_minute_in_progress_still_moves_between_reads() -> None:
     )
 
     assert ten_seconds_later[-1].error_rate < fifty_seconds_later[-1].error_rate
+
+
+def a_window_with_the_slower_revision_deployed(
+    deployed_minutes_ago: int, rolled_back_minutes_ago: int | None = None
+) -> list[GeneratedMinute]:
+    """A shop with no summary cache configured, running the revision that
+    computes its figure the long way round since then.
+
+    No cache on purpose, and it is what makes every request pay: a cached page
+    never computes the figure, so a shop with a cache would stage an incident a
+    tenth of its traffic sees. Without one the minute reports the baseline
+    quantile model, which is where the deployment's multiplier lands.
+    """
+    return generate(
+        None,
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="dont-care-flag",
+        slow_deployment=SlowDeployment(
+            began_at=SOME_NOW - timedelta(minutes=deployed_minutes_ago),
+            ended_at=(
+                None if rolled_back_minutes_ago is None
+                else SOME_NOW - timedelta(minutes=rolled_back_minutes_ago)
+            ),
+        ),
+    )
+
+
+def test_the_deployment_moves_every_quantile_together() -> None:
+    # The property this scenario exists for, and the mirror of the rollout's.
+    # Every request runs the revision that is deployed, so there is no cohort
+    # for the incident to hide in and nothing for an aggregate to average away.
+    minutes = a_window_with_the_slower_revision_deployed(deployed_minutes_ago=10)
+
+    calm = minute_at(18, minutes)
+    degraded = minute_at(3, minutes)
+
+    assert degraded.p50_ms > calm.p50_ms * 5
+    assert degraded.p95_ms > calm.p95_ms * 5
+    assert degraded.p99_ms > calm.p99_ms * 5
+
+
+def test_the_deployment_breaks_nothing() -> None:
+    # The figure is the one it always was and the pages are correct, so the only
+    # thing wrong is how long they took.
+    minutes = a_window_with_the_slower_revision_deployed(deployed_minutes_ago=10)
+
+    assert minute_at(3, minutes).error_rate < CLEARLY_HEALTHY
+
+
+def test_the_deployment_leaves_the_heap_where_it_was() -> None:
+    # Nothing accumulates, so a restart reclaims nothing and ends nothing.
+    minutes = a_window_with_the_slower_revision_deployed(deployed_minutes_ago=10)
+
+    assert minute_at(3, minutes).memory_used_bytes < BASELINE_MEMORY_BYTES * 1.5
+
+
+def test_a_rollback_ends_the_incident_and_keeps_the_minutes_it_happened_in(
+) -> None:
+    # Both halves matter. The minutes after the rollback are how a mitigation is
+    # judged, and the minutes before it are what it is judged against - a window
+    # that lost them would take the incident out of the record at the moment
+    # somebody acted on it.
+    minutes = a_window_with_the_slower_revision_deployed(
+        deployed_minutes_ago=15, rolled_back_minutes_ago=5
+    )
+
+    assert minute_at(8, minutes).p50_ms > minute_at(18, minutes).p50_ms * 5
+    assert minute_at(2, minutes).p50_ms < minute_at(8, minutes).p50_ms
+
+
+def test_a_window_with_no_deployment_staged_is_untouched_by_it() -> None:
+    # The multiplier is exactly 1.0 in its absence and draws no entropy, which
+    # is what leaves every other scenario's figures where they were.
+    with_nothing_staged = generate(
+        None, SOME_NOW, SOME_SPAN_MINUTES, flag="dont-care-flag"
+    )
+    with_a_rollback_long_finished = generate(
+        None,
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="dont-care-flag",
+        slow_deployment=SlowDeployment(
+            began_at=SOME_NOW - timedelta(minutes=SOME_SPAN_MINUTES * 3),
+            ended_at=SOME_NOW - timedelta(minutes=SOME_SPAN_MINUTES * 2),
+        ),
+    )
+
+    assert [minute.p50_ms for minute in with_a_rollback_long_finished] == [
+        minute.p50_ms for minute in with_nothing_staged
+    ]
