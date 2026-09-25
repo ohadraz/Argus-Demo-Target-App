@@ -33,6 +33,22 @@ def test_the_lifetime_average_spreads_the_total_over_every_purchase() -> None:
     assert average_spend_per_item(account) == 2000
 
 
+def test_the_lifetime_average_follows_the_purchases_not_the_carried_total() -> None:
+    # The figure is derived from the list the shopper is looking at, so a total
+    # that has drifted from its own purchases does not reach the page.
+    an_account_whose_total_drifted = Account(
+        shopper_id="shopper-with-a-stale-total",
+        purchases=(
+            Purchase(price_cents=1000, in_current_month=False),
+            Purchase(price_cents=3000, in_current_month=False),
+        ),
+        total_cents=99_999,
+        total_this_month_cents=0,
+    )
+
+    assert average_spend_per_item(an_account_whose_total_drifted) == 2000
+
+
 def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
     # The ordinary case for the monthly figure: a shopper who has bought
     # something this month, averaged over what they bought this month.
