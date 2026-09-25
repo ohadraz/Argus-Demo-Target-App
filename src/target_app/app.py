@@ -152,6 +152,16 @@ class SeedRequest(BaseModel):
 
 class ScenarioStatus(BaseModel):
     active_scenario: str | None
+    # The instant the scenario was put in place, which is the instant its whole
+    # window hangs off: the minutes are numbered back from it and the deploy
+    # history is dated against it. Reported because a consumer replaying a
+    # recorded walk has to line that walk's frozen timestamps up with the world
+    # in front of it, and the only honest anchor is the one this service used.
+    #
+    # `None` where nothing is staged, which is the same answer as an absent
+    # `active_scenario` and for the same reason: a shop with no scenario has no
+    # seeding to date anything from.
+    seeded_at: datetime | None = None
 
 
 class ShopRestarted(BaseModel):
@@ -508,7 +518,7 @@ def seed_scenario(body: SeedRequest) -> ScenarioStatus:
     except FlagProviderUnavailable as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
 
-    return ScenarioStatus(active_scenario=state.active_scenario_id)
+    return _the_scenario_now()
 
 
 @app.post("/scenario/reset", response_model=ScenarioStatus)
@@ -518,7 +528,7 @@ def reset_scenario() -> ScenarioStatus:
     except (FlagProviderUnavailable, FlagHistoryUnavailable) as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
 
-    return ScenarioStatus(active_scenario=state.active_scenario_id)
+    return _the_scenario_now()
 
 
 @app.post("/scenario/restart", response_model=ShopRestarted)
@@ -645,7 +655,24 @@ def raise_alert() -> AlertRaised:
 
 @app.get("/scenario/status", response_model=ScenarioStatus)
 def scenario_status() -> ScenarioStatus:
-    return ScenarioStatus(active_scenario=state.active_scenario_id)
+    return _the_scenario_now()
+
+
+def _the_scenario_now() -> ScenarioStatus:
+    """What is staged, and the instant it was staged at.
+
+    One answer for all three of the endpoints that report the scenario, because
+    they report the same fact: seeding it, clearing it and asking about it all
+    describe the state the shop is in afterwards. Three copies of the reading
+    is three places for one of them to go on naming the scenario without the
+    instant it hangs off.
+    """
+    active = state.active
+
+    return ScenarioStatus(
+        active_scenario=state.active_scenario_id,
+        seeded_at=active.seeded_at if active is not None else None
+    )
 
 
 @app.get("/logs", response_model=list[str])

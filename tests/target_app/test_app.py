@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterable, Iterator
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock
 
 import pytest
@@ -123,6 +123,30 @@ def test_the_leak_is_seedable_by_id(client: TestClient) -> None:
     a_staged_leak(client)
 
     assert client.get("/scenario/status").json()["active_scenario"] == RESOURCE_LEAK
+
+
+def test_the_status_says_when_the_scenario_was_seeded(client: TestClient) -> None:
+    # The instant the whole window hangs off: the minutes are numbered back from
+    # it and the deploy history is dated against it. A consumer replaying a
+    # recorded walk lines that walk's frozen timestamps up against this, so an
+    # absent one leaves it guessing at the anchor this service actually used.
+    a_staged_leak(client)
+
+    seeded_at = client.get("/scenario/status").json()["seeded_at"]
+
+    assert seeded_at is not None
+    assert (
+        datetime.now(UTC) - datetime.fromisoformat(seeded_at)
+    ).total_seconds() < A_MINUTE_BECOMES_READABLE_SECONDS
+
+
+def test_a_shop_with_nothing_staged_has_no_seeding_to_date(client: TestClient) -> None:
+    # The same answer an absent scenario gives, and for the same reason: there
+    # is no seeding to date anything from, and a moment reported here would be
+    # one nothing in the window was built against.
+    client.post("/scenario/reset")
+
+    assert client.get("/scenario/status").json()["seeded_at"] is None
 
 
 def test_the_leak_is_offered_in_the_console(client: TestClient) -> None:
