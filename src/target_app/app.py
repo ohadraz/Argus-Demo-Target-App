@@ -27,6 +27,7 @@ from target_app.oncall import a_user, an_incident
 from target_app.people import pay_grades_and_bands
 from target_app.payments import charges_between
 from target_app.rates import UnknownBase, rates_quoted_against
+from target_app.registry import dependencies_of
 from target_app.scenarios import (
     FALLBACK_FLAG,
     FEATURE_FLAG,
@@ -68,6 +69,18 @@ _A_PREVIOUS_DEPLOY_AGO = timedelta(hours=4)
 def to_bucket_id(moment: datetime) -> str:
     """One instant as the minute id every other channel spells it with."""
     return moment.replace(second=0, microsecond=0).strftime(TIMESTAMP_FORMAT)
+
+# What the platform calls the pricing service. The one application name this
+# file reads rather than echoing back, because restarting the wrong process is
+# the mistake this scenario is built to catch - see
+# `argocd_run_resource_action`.
+PRICING_APPLICATION = "io-pricing"
+
+# What the rest of a pod's name looks like. A platform's pods carry a suffix from
+# the replica set that made them, and a caller reading one only ever reads that
+# it changed - so any fixed spelling does, and a random one would make a pod
+# appear to have been replaced on every poll.
+_A_POD_SUFFIX = "7d9c4f8b6-x2k9p"
 
 flags = FlagClient()
 # The second flag guards the safe path, so the shop is well while it is on.
@@ -374,6 +387,53 @@ class ArgoCdApplication(BaseModel):
     status: ArgoCdApplicationStatus
 
 
+class RegisteredDependency(BaseModel):
+    """One dependency as the registry serves it.
+
+    A model of its own rather than the dataclass returned directly, for the
+    reason every other response here has one: what crosses the wire is a
+    published shape, and letting an internal value class be that shape makes
+    every rename of a field a change to somebody else's parser.
+    """
+
+    name: str
+    purpose: str
+    host: str
+    owner: str
+    ownership: str
+
+
+class RegisteredServiceResponse(BaseModel):
+    service: str
+    dependencies: list[RegisteredDependency]
+
+
+class ArgoCdResourceNode(BaseModel):
+    """One live object the platform sees under an application.
+
+    Argo CD's resource tree is how anybody finds out what is actually running:
+    the pod's `createdAt` is when that process came up, and it is the platform's
+    own answer to "did the restart land". A monitoring stack's process start time
+    says the same thing from the other side, and both exist here for the reason
+    both exist in real life - a platform is asked about pods and a monitor is
+    asked about series.
+
+    Only the fields a caller confirming a restart reads. A real node carries its
+    health, its parents and its resource version too, and a stand-in that
+    invented values for those would be putting figures into the world for nobody
+    to read.
+    """
+
+    kind: str
+    name: str
+    namespace: str
+    createdAt: str
+
+
+class ArgoCdResourceTree(BaseModel):
+    nodes: list[ArgoCdResourceNode]
+
+
 class ArgoCdRollback(BaseModel):
     """The body Argo CD's rollback endpoint takes.
 
@@ -562,6 +622,17 @@ def argocd_run_resource_action(application: str,
     accepted. A platform that answered 200 to an action it did not run would
     have a caller believe production had changed when it had not.
 
+    Which application was addressed is read here, and it is the one place in this
+    file where that matters. Everything else answers from the staged scenario
+    whatever name it is asked about, because there is one shop and one window;
+    a restart is different because two processes can be restarted and only one of
+    them is the right one. A stand-in that restarted the shop whoever was named
+    would grade every mitigation as correct.
+
+    An application nobody recognises restarts the shop, which is the same
+    permissiveness the rest of this file has: the fixture knows two applications,
+    and refusing a third would be inventing an estate for a caller to get wrong.
+
     Argo CD answers an empty body on success, and so does this.
     """
     if body.action != RESTART_ACTION:
@@ -570,9 +641,53 @@ def argocd_run_resource_action(application: str,
             detail=f"unknown resource action: {body.action}",
         )
 
-    state.restart_the_shop()
+    if application == PRICING_APPLICATION:
+        state.restart_the_pricing_service()
+    else:
+        state.restart_the_shop()
 
     return {}
+
+
+@app.get("/argocd/{application}/resource-tree", response_model=ArgoCdResourceTree)
+def argocd_resource_tree(application: str) -> ArgoCdResourceTree:
+    """Stands in for Argo CD's `GET
+    /api/v1/applications/{name}/resource-tree`.
+
+    One pod per application, and its `createdAt` is when that process came up.
+    This is what confirms a restart landed, and it is per application on purpose:
+    restarting the pricing service moves its pod's creation time and leaves the
+    shop's where it was, which is the only evidence distinguishing "the
+    dependency was restarted" from "something was restarted".
+
+    Empty with nothing staged. A platform with no application deployed has no
+    pods to report, and a fixture answering with a creation time it invented
+    would let a restart be confirmed against a world that does not exist.
+    """
+    active = state.active
+
+    if active is None:
+        return ArgoCdResourceTree(nodes=[])
+
+    came_up = (
+        active.pricing_serving_since
+        if application == PRICING_APPLICATION
+        else active.serving_since
+    )
+
+    if came_up is None:
+        return ArgoCdResourceTree(nodes=[])
+
+    return ArgoCdResourceTree(
+        nodes=[
+            ArgoCdResourceNode(
+                kind="Pod",
+                name=f"{application}-{_A_POD_SUFFIX}",
+                namespace="production",
+                createdAt=came_up.strftime(TIMESTAMP_FORMAT)
+            )
+        ]
+    )
 
 
 @app.put("/argocd/{application}/spec")
@@ -841,6 +956,37 @@ def pagerduty_user(user_id: str) -> dict[str, Any]:
     return {"user": user}
 
 
+@app.get("/registry/services/{service}", response_model=RegisteredServiceResponse)
+def registered_service(service: str) -> RegisteredServiceResponse:
+    """What the organisation's service registry records about one service.
+
+    Unlike `/logs`, `/metrics` and the Argo CD stand-in, this does not answer
+    from the staged scenario: the registry says what calls what, which is a fact
+    about how the shop is built rather than about what is wrong with it today. It
+    answers the same thing with nothing seeded, which is exactly right - the
+    coupling was there all along, and that it went unnoticed is the incident.
+
+    A service the registry does not hold answers with no dependencies and its own
+    name echoed back, so a reader can tell "nothing recorded" from "nothing
+    called".
+    """
+    found = dependencies_of(service)
+
+    return RegisteredServiceResponse(
+        service=found.service,
+        dependencies=[
+            RegisteredDependency(
+                name=dependency.name,
+                purpose=dependency.purpose,
+                host=dependency.host,
+                owner=dependency.owner,
+                ownership=dependency.ownership
+            )
+            for dependency in found.dependencies
+        ]
+    )
+
+
 @app.get("/argocd/{application}", response_model=ArgoCdApplication)
 def argocd_application(application: str) -> ArgoCdApplication:
     """Stands in for Argo CD's `GET /api/v1/applications/{name}`.
@@ -998,6 +1144,7 @@ def _generated_minutes() -> list[GeneratedMinute]:
         cache_outage=active.cache_outage if active else None,
         slow_rollout=_the_rollout_in(scenario, timeline),
         slow_deployment=active.deploy_slowdown if active else None,
+        pricing_slowdown=active.pricing_slowdown if active else None,
         ships_the_statement=scenario.ships_the_statement,
     )
 

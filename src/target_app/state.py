@@ -11,6 +11,7 @@ from target_app.generator import (
     SETTLED_UPTIME,
     CacheOutage,
     FlagTimeline,
+    PricingSlowdown,
     ProviderOutage,
     SlowDeployment,
 )
@@ -169,12 +170,61 @@ class ActiveScenario:
     # running it cost anything. A rollback ends the stretch and leaves the
     # entry, which is what the history is for.
     deploy_slowdown: SlowDeployment | None = None
+    # The stretch the pricing service has spent answering slowly, for the one
+    # scenario whose condition belongs to a neighbour of Io's own. `None`
+    # everywhere else, which is what keeps that service prompt - and silent - in
+    # every other scenario.
+    pricing_slowdown: PricingSlowdown | None = None
+    # When the pricing service's own process came up. `None` until somebody
+    # restarts it, and then the moment they did: the two services come up
+    # together and diverge only when one of them is restarted, which is exactly
+    # what `pricing_serving_since` says.
+    #
+    # A single instant rather than a list, unlike `restarts` below. Nothing
+    # accumulates in that process as far as this fixture is concerned, so no
+    # window has to remember where its restarts fell - all anybody asks of it is
+    # whether the process serving now is a new one.
+    pricing_started_at: datetime | None = None
     # Every time somebody has brought the process back since. A list rather
     # than a latest value, because a restart has to stay in the window it
     # happened in: the minutes before it kept the heap they had, and a single
     # moving instant would flatten the climb retrospectively and take the
     # incident out of the record the moment it was mitigated.
     restarts: tuple[datetime, ...] = ()
+
+    @property
+    def serving_since(self) -> datetime | None:
+        """When the process now serving the shop came up.
+
+        The latest restart if anybody has performed one, and otherwise when the
+        scenario staged the process. `restarts` is kept as a list because the
+        telemetry needs to know which minute each one fell in; this is the one
+        question that only wants the last of them, which is whether the process
+        answering right now is a new one.
+        """
+        if self.restarts:
+            return self.restarts[-1]
+
+        return self.process_started_at
+
+    @property
+    def pricing_serving_since(self) -> datetime | None:
+        """When the process now answering as the pricing service came up.
+
+        The instant the scenario staged until somebody restarts the pricing
+        service, because the two applications are deployed together and have been
+        up as long as each other. Derived rather than stored in every branch of
+        `seed`: one fact said once, and a copy written into six scenarios is a
+        copy that comes to disagree with the one that matters.
+
+        `process_started_at` rather than `serving_since` above, and that is the
+        whole point of there being two of these: restarting the shop moves the
+        shop's answer and must leave this one exactly where it was.
+        """
+        if self.pricing_started_at is not None:
+            return self.pricing_started_at
+
+        return self.process_started_at
 
 
 class ScenarioState:
@@ -357,6 +407,34 @@ class ScenarioState:
             )
             return
 
+        if scenario.dependency_is_slow:
+            # No flag, no cache, no deploy, and nothing wrong with this process
+            # at all. What is staged is a neighbour: the pricing service every
+            # account page asks what the shopper's basket comes to starts taking
+            # an order of magnitude longer to answer. It answers every call, so
+            # nothing fails and the error rate never moves - the shop simply
+            # waits, on every request, because every page shows a basket total.
+            #
+            # No cache is configured, for the reason the deployment scenario
+            # configures none: the wait lands on every request whichever path the
+            # figure took, and a hit ratio reported here would be a signal this
+            # scenario never staged.
+            #
+            # Backdated like the others, so the incident is diagnosable the
+            # instant this returns.
+            self._remember_where_the_flags_are_now()
+            self._active = ActiveScenario(
+                scenario=scenario,
+                seeded_at=now,
+                process_started_at=now - SETTLED_UPTIME,
+                pricing_slowdown=PricingSlowdown(
+                    began_at=now - timedelta(
+                        minutes=get_scenario_settings().onset_backdate_minutes
+                    )
+                ),
+            )
+            return
+
         if scenario.leaks:
             # No flag is touched, because no flag is involved. The condition
             # this stages is the process's own accumulation, which has been
@@ -514,6 +592,11 @@ class ScenarioState:
         The climb then begins again, because a restart takes away what
         accumulated and not what accumulates it. That is the whole of why this
         mitigates a leak without resolving it.
+
+        It ends no other service's condition, and that omission is load-bearing.
+        A slow pricing service goes on being slow through as many restarts of the
+        shop as anybody cares to perform, which is what makes restarting the shop
+        a refutable mistake rather than an accidental fix.
         """
         at = utc_now()
         forget_every_visit()
@@ -521,6 +604,49 @@ class ScenarioState:
 
         if active is not None:
             self._active = replace(active, restarts=(*active.restarts, at))
+
+        return at
+
+    def restart_the_pricing_service(self) -> datetime:
+        """Brings the pricing service's process back, and says when.
+
+        Two things happen, and both of them are the restart: whatever had that
+        service wedged is gone, so it answers promptly again, and its own start
+        time moves so that the restart is confirmable from outside. A restart
+        that fixed the latency without moving the start time would be
+        indistinguishable from one that never happened.
+
+        Only that service's start time moves. The shop's is untouched, which is
+        what lets a reader - and a mitigation judging its own work - tell which
+        of the two processes was actually restarted.
+
+        The shop's own heap is untouched too. Nothing here reclaims anything of
+        Io's, because nothing of Io's was wrong.
+
+        Ends the stretch rather than clearing it, for the reason a rollback does:
+        the minutes the shop spent waiting are what happened, and a window that
+        lost them the moment somebody fixed it would take the incident out of the
+        record exactly when a mitigation wants to be judged against it.
+
+        Free on a shop with nothing staged, which is what makes it safe for
+        anybody to call: there is nothing to end, and the answer is simply when
+        they asked.
+        """
+        at = utc_now()
+        active = self._active
+
+        if active is None:
+            return at
+
+        self._active = replace(
+            active,
+            pricing_started_at=at,
+            pricing_slowdown=(
+                replace(active.pricing_slowdown, ended_at=at)
+                if active.pricing_slowdown is not None
+                else None
+            )
+        )
 
         return at
 
@@ -747,6 +873,11 @@ class ScenarioState:
         A slow deployment is the same three phases ended by the same act, and
         for the same reason it is worth watching after: what a rollback bought
         is visible only in the minutes that follow it.
+
+        A slow dependency reaches all three as well, and what ends its running
+        phase is a restart of the *other* service. Restarting this one leaves it
+        running, which is the fixture declining to grade a wrong answer as a
+        right one.
         """
         active = self._active
 
@@ -771,6 +902,12 @@ class ScenarioState:
             ended_at = (
                 active.deploy_slowdown.ended_at
                 if active.deploy_slowdown is not None
+                else None
+            )
+        elif active.scenario.dependency_is_slow:
+            ended_at = (
+                active.pricing_slowdown.ended_at
+                if active.pricing_slowdown is not None
                 else None
             )
         else:
@@ -833,6 +970,20 @@ class ScenarioState:
                 return None, utc_now()
 
             return None, min(utc_now(), _settled_at(active.deploy_slowdown.ended_at))
+
+        if active is not None and active.scenario.dependency_is_slow:
+            # No flag, and what ends it is a restart - but not the restart the
+            # leak is ended by, and not this application's. The stretch closes
+            # when the pricing service comes back, which is why the condition is
+            # read here rather than `restarts`: a shop restarted a dozen times
+            # leaves this exactly where it was.
+            if (
+                active.pricing_slowdown is None
+                or active.pricing_slowdown.ended_at is None
+            ):
+                return None, utc_now()
+
+            return None, min(utc_now(), _settled_at(active.pricing_slowdown.ended_at))
 
         if active is not None and active.scenario.leaks:
             if not active.restarts:

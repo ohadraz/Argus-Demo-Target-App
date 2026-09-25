@@ -174,6 +174,36 @@ class Scenario:
     is resolved as well as mitigated, because nothing is left behind for a new
     process or a re-sync to find.
 
+    `dependency_is_slow` stages the seventh generated kind, and the only one
+    whose live condition belongs to a service this company runs and this process
+    is not. The pricing service every account page asks what a basket comes to
+    starts taking an order of magnitude longer to answer. It answers every call,
+    so nothing fails; the shop waits on every request, because every page shows
+    a basket total, and the median and both tails climb together.
+
+    Its telemetry is nearly `deploy_is_slow`'s, and the one arithmetic
+    difference between them is worth reading rather than smoothing away. A
+    slower revision *multiplies* what every request cost, so the spread grows
+    with the centre - 45ms to 450ms and 380ms to 3800ms. A wait *adds* to it, so
+    the spread collapses: 45ms to about 1550ms and 380ms to about 1720ms, the
+    median and the tail within a couple of hundred milliseconds of each other.
+    That is what a queue behind one slow call actually looks like, and a reader
+    who notices it has found the incident from the metrics alone.
+
+    What separates them for certain is the deploy history: one has an entry at
+    the onset and this has none. What names the cause is a WARN line the shop
+    writes
+    about its own outbound call, and what decides the response is the service
+    registry, which says the host in that line belongs to this company while the
+    payment provider's, which looks exactly as foreign, does not.
+
+    It is the mirror of `upstream_fails`, and the pair is the point. Both are a
+    neighbour's fault arriving here; one is answered by escalating because
+    nothing Argus may do reaches another company, and this one by restarting a
+    service Argus was not paged about. Restarting the shop changes nothing,
+    which is what makes the wrong answer refutable rather than accidentally
+    right.
+
     `ships_the_statement` stages the same incident as `feature-flag-toggle` in
     every respect a reader of the telemetry could name - the same flag, the same
     cohort, the same shoppers failing for the same reason, the same error rate -
@@ -219,6 +249,7 @@ class Scenario:
     cache_is_misconfigured: bool = False
     rollout_is_slow: bool = False
     deploy_is_slow: bool = False
+    dependency_is_slow: bool = False
     ships_the_statement: bool = False
     # The deploy a *generated* scenario stages, for the one whose cause is a
     # change rather than a state. An authored scenario carries its deploys on
@@ -237,18 +268,21 @@ class Scenario:
     def stages_a_flag(self) -> bool:
         """Whether this scenario's incident is a flag's doing.
 
-        Three generated scenarios are not: a leak is the process's own
-        accumulation, an upstream failure is another company's service, and a
-        misconfigured cache is a value in a file. A page offering a flag to
-        watch for any of them would be offering a control that changes
-        nothing, and naming a flag as the thing that breaks the shop would be
-        pointing at a suspect the fixture invented.
+        Most generated scenarios are not: a leak is the process's own
+        accumulation, an upstream failure is another company's service, a
+        misconfigured cache is a value in a file, a bad deployment is the
+        revision that is running, and a slow dependency is another team's
+        process. A page offering a flag to watch for any of them would be
+        offering a control that changes nothing, and naming a flag as the thing
+        that breaks the shop would be pointing at a suspect the fixture
+        invented.
         """
         return self.is_generated and not (
             self.leaks
             or self.upstream_fails
             or self.cache_is_misconfigured
             or self.deploy_is_slow
+            or self.dependency_is_slow
         )
 
     @property
@@ -285,6 +319,7 @@ FLAG_TOGGLE_RED_HERRING = "flag-toggle-red-herring"
 COMPETING_FLAG_CHANGES = "competing-flag-changes"
 SLOW_CANARY_ROLLOUT = "slow-canary-rollout"
 MONTHLY_STATEMENT_PANEL = "monthly-statement-panel"
+PRICING_SERVICE_DEGRADED = "pricing-service-degraded"
 
 SCENARIOS: dict[str, Scenario] = {
     FEATURE_FLAG_TOGGLE: Scenario(
@@ -486,6 +521,29 @@ SCENARIOS: dict[str, Scenario] = {
             path="deploy",
             initiated_by="kuki",
         ),
+    ),
+    PRICING_SERVICE_DEGRADED: Scenario(
+        id=PRICING_SERVICE_DEGRADED,
+        title="A service the shop forgot it calls",
+        description=(
+            "Io's account page shows the shopper what their basket comes to "
+            "with their discounts applied, and Io does not work that figure "
+            "out - 'io-pricing' does, a service the same company runs, and the "
+            "page asks it while it renders. That service starts taking an "
+            "order of magnitude longer to answer. It answers every call, so "
+            "nothing fails and the error rate never moves; the shop simply "
+            "waits, on every request, and the median, the 95th and the 99th "
+            "all climb together. Memory is flat, no flag was touched and "
+            "nothing was deployed - so the shape says 'a deployment' and the "
+            "deploy history is empty. The only evidence naming a cause is the "
+            "shop's own log: a WARN line saying which host the time went to. "
+            "What that host is worth knowing about is in the service registry, "
+            "which nobody reads until an incident: 'io-pricing' belongs to this "
+            "company, and the payment provider beside it does not. Restarting "
+            "the shop changes nothing, because nothing is wrong with the shop. "
+            "What ends it is restarting a service Argus was not paged about."
+        ),
+        dependency_is_slow=True,
     ),
 }
 

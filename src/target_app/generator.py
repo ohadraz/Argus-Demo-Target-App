@@ -9,6 +9,7 @@ from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
 from io_shop.monthly_statement import StatementPeriod, period_for
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
+from io_shop.pricing_service import AskThePricingService, PricingAnswer
 from io_shop.rollout import CANARY_SHARE
 from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
 from target_app.settings import get_unleash_settings
@@ -146,6 +147,27 @@ _A_CARD = StoredCard(brand="visa", last_four="4242")
 # waiting on somebody else is visible in the latency long before anybody reads
 # a log - which is what makes errors *and* latency this scenario's signature.
 _PROVIDER_TIMEOUT_MS = 2000
+
+# What the basket comes to. One figure for every shopper, for the reason one
+# card serves every shopper: the page shows it and no metric reads it.
+_A_BASKET_TOTAL_CENTS = 8400
+
+# How long a call to the pricing service takes when that service is well. Well
+# under the threshold the shop remarks on, so an ordinary minute carries no line
+# about pricing at all - a fixture that mentioned a dependency every minute
+# would make the minute it mattered unfindable.
+_PRICING_CALL_MS = 20
+
+# And how long it takes when that service is not. The pricing service answers
+# every call throughout - nothing here fails - so this is a wait rather than a
+# timeout, and the shop pays it on every request because every account page
+# shows a basket total.
+#
+# Large enough that the median moves by an order of magnitude and small enough
+# that no request looks like it gave up: a page taking one and a half seconds is
+# a slow page, and a page taking thirty is a broken one. The scenario's whole
+# claim is that nothing is broken.
+_PRICING_SLOW_CALL_MS = 1500
 
 # What one account page costs, by which path it took. The cached path still
 # calls the payment provider and still renders; what it skips is walking the
@@ -478,6 +500,55 @@ class SlowDeployment:
 
 
 @dataclass(frozen=True)
+class PricingSlowdown:
+    """When the pricing service began taking too long to answer, and when it
+    stopped.
+
+    The same shape as the payment provider's outage and a different kind of
+    neighbour: that one is another company's service, and this is another team's
+    in the same company. Nothing about the shape says which - the difference is
+    who can be asked to fix it, and it is published in the service catalogue
+    rather than modelled here.
+
+    Two things separate it from the outage besides ownership. The service answers
+    every call, so no request fails and the error rate never moves. And the shop
+    has no timeout to give up at, because there is nothing to give up on: it
+    waits, gets a correct price, and serves a correct page slowly.
+
+    Kept as a condition of its own for the reason every other condition here is
+    one: what it records is over which minutes calling the pricing service cost
+    anything. A restart of that service ends the stretch.
+
+    `ended_at` being `None` means it is still slow.
+    """
+
+    began_at: datetime
+    ended_at: datetime | None = None
+
+    def share_of(self, minute: datetime, elapsed_seconds: int) -> float:
+        """How much of this minute's first `elapsed_seconds` the pricing service
+        spent answering slowly.
+
+        A share for the reason the provider's outage has one: the minute a
+        degradation begins in is partly served at the old speed and partly at
+        the new, and reporting it as either whole would put a step where the
+        telemetry has a slope. The minute a restart lands in is the same thing
+        in reverse.
+        """
+        if elapsed_seconds <= 0:
+            return 0.0
+
+        window_end = minute + timedelta(seconds=elapsed_seconds)
+        slow_from = max(minute, self.began_at)
+        slow_until = window_end if self.ended_at is None else min(
+            window_end, self.ended_at
+        )
+        seconds_slow = max(0.0, (slow_until - slow_from).total_seconds())
+
+        return min(1.0, seconds_slow / elapsed_seconds)
+
+
+@dataclass(frozen=True)
 class ProcessLifetime:
     """When the shop's process came up, and every time it has come up since.
 
@@ -549,6 +620,7 @@ def generate(timeline: FlagTimeline | None,
              cache_outage: CacheOutage | None = None,
              slow_rollout: SlowRollout | None = None,
              slow_deployment: SlowDeployment | None = None,
+             pricing_slowdown: PricingSlowdown | None = None,
              ships_the_statement: bool = False) -> list[GeneratedMinute]:
     """Every minute from `span_minutes` ago up to and including the one in
     progress, once any of it has happened.
@@ -614,6 +686,13 @@ def generate(timeline: FlagTimeline | None,
     model has no sample for a percentile to be taken over - which is the whole
     of what this condition is visible in.
 
+    `pricing_slowdown` is the stretch the pricing service spent answering
+    slowly. Left unsaid, it answers promptly and nothing in the window mentions
+    it - which is what every scenario that is not about a neighbour of Io's own
+    looks like. It needs no cache endpoint beside it: every account page shows a
+    basket total, so the wait lands on every request and the baseline quantile
+    model carries it.
+
     `ships_the_statement` says which feature the flag is shipping this time.
     The shop has one feature flag and several scenarios behind it: most ship
     the monthly summary, one ships the typical purchase, and this one ships the
@@ -654,6 +733,7 @@ def generate(timeline: FlagTimeline | None,
             cache_outage=cache_outage,
             slow_rollout=slow_rollout,
             slow_deployment=slow_deployment,
+            pricing_slowdown=pricing_slowdown,
             ships_the_statement=ships_the_statement,
         )
         for offset in range(span_minutes, 0, -1)
@@ -682,6 +762,7 @@ def generate(timeline: FlagTimeline | None,
                 cache_outage=cache_outage,
                 slow_rollout=slow_rollout,
                 slow_deployment=slow_deployment,
+                pricing_slowdown=pricing_slowdown,
                 ships_the_statement=ships_the_statement,
             )
         )
@@ -712,6 +793,7 @@ def _a_whole_minute(
     cache_outage: CacheOutage | None = None,
     slow_rollout: SlowRollout | None = None,
     slow_deployment: SlowDeployment | None = None,
+    pricing_slowdown: PricingSlowdown | None = None,
     ships_the_statement: bool = False,
 ) -> GeneratedMinute:
     """One minute that has finished, generated once and then remembered.
@@ -753,6 +835,7 @@ def _a_whole_minute(
         cache_outage=cache_outage,
         slow_rollout=slow_rollout,
         slow_deployment=slow_deployment,
+        pricing_slowdown=pricing_slowdown,
         ships_the_statement=ships_the_statement,
     )
 
@@ -772,6 +855,7 @@ def _generate_minute(
     cache_outage: CacheOutage | None = None,
     slow_rollout: SlowRollout | None = None,
     slow_deployment: SlowDeployment | None = None,
+    pricing_slowdown: PricingSlowdown | None = None,
     ships_the_statement: bool = False,
 ) -> GeneratedMinute:
     minute_id = minute.strftime(TIMESTAMP_FORMAT)
@@ -814,6 +898,20 @@ def _generate_minute(
         else 0.0
     )
 
+    # How much of this minute the pricing service spent answering slowly.
+    share_of_minute_waiting_on_pricing = (
+        pricing_slowdown.share_of(minute, elapsed_seconds)
+        if pricing_slowdown is not None
+        else 0.0
+    )
+
+    # And how many of the minute's requests that share amounts to. An exact
+    # count rather than a draw per request, for the reason the rollout's cohort
+    # is one: the number is what the minute's own log line reports, and a figure
+    # that wandered by a request or two either way would have the fixture
+    # disagreeing with itself about how many pages waited.
+    calls_that_waited = round(_SAMPLE_SIZE * share_of_minute_waiting_on_pricing)
+
     # An exact count of the sample rather than a draw per request - see
     # `_SLOW_ROLLOUT_SHARE`. Scaled by how much of the minute the rollout was
     # live for, so the minute it lands in is partly served each way and the
@@ -843,6 +941,7 @@ def _generate_minute(
             # same both times - the same reason every other figure here is
             # seeded from the minute's own id.
             statement_period=period_for(minute.month, minute.year),
+            the_pricing_call_was_slow=index < calls_that_waited,
         )
         for index in range(_SAMPLE_SIZE)
     ]
@@ -887,6 +986,7 @@ def _generate_minute(
             * under_pressure
             * slower_for_the_deploy
             + _waiting_on_the_provider(share_of_minute_refused)
+            + _waiting_on_the_pricing_service(share_of_minute_waiting_on_pricing)
         ),
         p95_ms=_the_quantile_at(measured, 0.95) if measured else round(
             (_BASELINE_P95_MS + _wobble_around(
@@ -895,6 +995,7 @@ def _generate_minute(
             * under_pressure
             * slower_for_the_deploy
             + _waiting_on_the_provider(share_of_minute_refused)
+            + _waiting_on_the_pricing_service(share_of_minute_waiting_on_pricing)
         ),
         cache_hit_ratio=_how_much_the_cache_carried(outcomes),
         request_volume=_REPORTED_VOLUME_PER_MINUTE,
@@ -922,6 +1023,7 @@ def _generate_minute(
             * under_pressure
             * slower_for_the_deploy
             + _waiting_on_the_provider(share_of_minute_refused)
+            + _waiting_on_the_pricing_service(share_of_minute_waiting_on_pricing)
         ),
         log_lines=_log_lines_for(
             minute_id,
@@ -935,6 +1037,7 @@ def _generate_minute(
             ),
             heap=_heap_lines_for(minute_id, minute, heap_bytes, pressure, lifetime),
             cache=_cache_lines_for(minute_id, outcomes),
+            pricing=_pricing_lines_for(minute_id, outcomes),
         ),
     )
 
@@ -991,6 +1094,39 @@ def _cache_lines_for(minute_id: str, outcomes: list[_ServedPage]) -> tuple[str, 
     return (
         f"{minute_id} ERROR io-shop: summary cache lookup failed - "
         f"{unreachable[0]} ({len(unreachable)} of {len(outcomes)} requests)",
+    )
+
+
+def _pricing_lines_for(minute_id: str, outcomes: list[_ServedPage]) -> tuple[str, ...]:
+    """What the shop said about the pricing service this minute.
+
+    Quiet while it answers in the time it always does, for the reason the cache
+    lines are quiet while the cache works: a line every minute about a dependency
+    behaving normally is a line nobody reads on the minute it stops.
+
+    WARN rather than ERROR, and that is the whole character of this incident. No
+    request failed, every page was correct, and every shopper was shown the right
+    price - so a reader looking for errors finds none, and the only account of
+    where the time went sits at a level most searches filter out.
+
+    One line rather than one per slow call, as the cache's is: every call waited
+    on the same service at the same address, and a minute of identical lines is a
+    minute whose informative words nobody reaches. The count is what says how
+    much of the minute was affected.
+    """
+    delayed = [
+        served.pricing_delay for served in outcomes
+        if served.pricing_delay is not None
+    ]
+
+    if not delayed:
+        return ()
+
+    return (
+        (
+            f"{minute_id} WARN io-shop: slow upstream call - "
+            f"{delayed[0]} ({len(delayed)} of {len(outcomes)} requests)"
+        ),
     )
 
 
@@ -1073,6 +1209,23 @@ def _waiting_on_the_provider(share_of_minute_refused: float) -> float:
     outage starts in reads as part of one and not as the whole of it.
     """
     return _PROVIDER_TIMEOUT_MS * share_of_minute_refused
+
+
+def _waiting_on_the_pricing_service(share_of_minute_slow: float) -> float:
+    """How much of this minute's latency was spent waiting on the pricing
+    service.
+
+    Added rather than multiplying, for the reason waiting on the payment
+    provider is added: the request does its own work at the speed it always did
+    and then waits. The wait is the pricing service's, and scaling it by how fast
+    Io happens to be would be the wrong way round.
+
+    The whole of it is added to every quantile, because every account page shows
+    a basket total - there is no cohort here and no fast path left over. That is
+    the difference between this and the rollout, and it is why this incident is
+    visible in the median.
+    """
+    return _PRICING_SLOW_CALL_MS * share_of_minute_slow
 
 
 def _with_the_allocations_that_failed(failures: list[str], pressure: float) -> list[str]:
@@ -1185,6 +1338,8 @@ class _ServedPage:
 
     `cache_failure` is carried for the same reason the flag value is: the shop
     said it, and a minute's log lines are assembled from what the shop said.
+    `pricing_delay` is carried for that reason too, and it is the one thing in a
+    minute of this scenario's telemetry that names where the time went.
     """
 
     flag_is_on: bool
@@ -1192,6 +1347,7 @@ class _ServedPage:
     latency_ms: int | None = None
     from_cache: bool = False
     cache_failure: str | None = None
+    pricing_delay: str | None = None
 
 
 def _serve_one_account_page(
@@ -1205,6 +1361,7 @@ def _serve_one_account_page(
     the_flag_ships_the_slow_feature: bool = False,
     the_flag_ships_the_statement: bool = False,
     statement_period: StatementPeriod | None = None,
+    the_pricing_call_was_slow: bool = False,
 ) -> _ServedPage:
     """Puts one request through the shop and records how it went.
 
@@ -1287,6 +1444,9 @@ def _serve_one_account_page(
         an_account_of_theirs,
         use_monthly_summary=use_monthly_summary,
         ask_the_provider=_the_provider_answering(refusing=provider_refused),
+        ask_the_pricing_service=_the_pricing_service_answering(
+            slowly=the_pricing_call_was_slow
+        ),
         look_up_summary=_the_cache_answering(
             cache_entropy,
             share_of_minute_without_the_cache,
@@ -1322,11 +1482,11 @@ def _serve_one_account_page(
         # nothing to do with one.
         return _ServedPage(
             flag_is_on, "ClientDisconnected: the shopper closed the connection",
-            cost, page.served_from_cache, page.cache_failure
+            cost, page.served_from_cache, page.cache_failure, page.pricing_delay
         )
 
     return _ServedPage(flag_is_on, None, cost, page.served_from_cache,
-                       page.cache_failure)
+                       page.cache_failure, page.pricing_delay)
 
 
 def _the_cache_answering(cache_entropy: random.Random | None,
@@ -1451,6 +1611,28 @@ def _the_provider_answering(refusing: bool) -> AskTheProvider:
     return ask
 
 
+def _the_pricing_service_answering(slowly: bool) -> AskThePricingService:
+    """The pricing service, as this request finds it.
+
+    A function rather than a client for the reason the provider's is one, and
+    with one difference that matters: the answer is always a price. A degraded
+    pricing service is slow and correct, so there is no status to vary and
+    nothing for the shop to fail on - what varies is the one number the shop
+    turns into a log line.
+
+    No draw is taken either way, which is what keeps every figure this generator
+    already produced exactly where it was: one generator is seeded per minute,
+    and a draw inserted into the sequence shifts every draw after it.
+    """
+    def ask(shopper_id: str) -> PricingAnswer:
+        return PricingAnswer(
+            total_cents=_A_BASKET_TOTAL_CENTS,
+            took_ms=_PRICING_SLOW_CALL_MS if slowly else _PRICING_CALL_MS
+        )
+
+    return ask
+
+
 def _an_account(entropy: random.Random) -> Account:
     """One shopper's history, as the account page loads it.
 
@@ -1492,6 +1674,7 @@ def _log_lines_for(
     decoy: str | None = None,
     heap: tuple[str, ...] = (),
     cache: tuple[str, ...] = (),
+    pricing: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     evaluations = (
         *(
@@ -1502,6 +1685,7 @@ def _log_lines_for(
         *((decoy,) if decoy is not None else ()),
         *heap,
         *cache,
+        *pricing,
     )
 
     if not failures:

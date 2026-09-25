@@ -4,6 +4,7 @@ import re
 from datetime import UTC, datetime, timedelta
 
 from io_shop.payment_provider import PROVIDER_HOST
+from io_shop.pricing_service import PRICING_HOST
 from io_shop.summary_cache import CacheEndpoint
 from target_app.generator import (
     BASELINE_MEMORY_BYTES,
@@ -12,6 +13,7 @@ from target_app.generator import (
     CacheOutage,
     FlagTimeline,
     GeneratedMinute,
+    PricingSlowdown,
     ProviderOutage,
     SlowDeployment,
     SlowRollout,
@@ -1215,3 +1217,113 @@ def test_a_window_with_no_deployment_staged_is_untouched_by_it() -> None:
     assert [minute.p50_ms for minute in with_a_rollback_long_finished] == [
         minute.p50_ms for minute in with_nothing_staged
     ]
+
+
+def a_window_with_the_pricing_service_slow(
+    began_minutes_ago: int, restarted_minutes_ago: int | None = None
+) -> list[GeneratedMinute]:
+    """A shop whose pricing service has been answering slowly since then.
+
+    No cache configured, for the reason the slow deployment's window configures
+    none: the wait lands on every request whichever path the figure took, and a
+    cache here would report a hit ratio this scenario never staged.
+    """
+    return generate(
+        None,
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="dont-care-flag",
+        pricing_slowdown=PricingSlowdown(
+            began_at=SOME_NOW - timedelta(minutes=began_minutes_ago),
+            ended_at=(
+                None if restarted_minutes_ago is None
+                else SOME_NOW - timedelta(minutes=restarted_minutes_ago)
+            ),
+        ),
+    )
+
+
+def test_a_slow_dependency_moves_every_quantile() -> None:
+    minutes = a_window_with_the_pricing_service_slow(began_minutes_ago=10)
+
+    calm = minute_at(18, minutes)
+    waiting = minute_at(3, minutes)
+
+    assert waiting.p50_ms > calm.p50_ms * 5
+    assert waiting.p95_ms > calm.p95_ms * 5
+    assert waiting.p99_ms > calm.p99_ms
+
+
+def test_waiting_compresses_the_spread_where_a_slow_revision_widens_it() -> None:
+    # The one arithmetic difference between this incident and the deployment's,
+    # and the only thing in the metrics that tells them apart. A slower revision
+    # multiplies what every request cost, so the distance between the median and
+    # the tail grows with it; a wait is added to every request alike, so that
+    # distance is exactly what it was and the two quantiles close up.
+    waiting = minute_at(3, a_window_with_the_pricing_service_slow(10))
+    deployed = minute_at(
+        3, a_window_with_the_slower_revision_deployed(deployed_minutes_ago=10)
+    )
+
+    assert waiting.p99_ms - waiting.p50_ms < deployed.p99_ms - deployed.p50_ms
+
+
+def test_a_slow_dependency_breaks_nothing() -> None:
+    minutes = a_window_with_the_pricing_service_slow(began_minutes_ago=10)
+
+    assert minute_at(3, minutes).error_rate < CLEARLY_HEALTHY
+
+
+def test_a_slow_dependency_leaves_memory_alone() -> None:
+    # Nothing is accumulating here, and a fixture that moved memory as well
+    # would leave a reader unable to say which signal the incident is in.
+    minutes = a_window_with_the_pricing_service_slow(began_minutes_ago=10)
+
+    assert minute_at(3, minutes).memory_used_bytes < BASELINE_MEMORY_BYTES * 2
+
+
+def test_the_shop_says_which_host_the_time_went_to() -> None:
+    # The only evidence naming a cause. There is no deploy, no flag and no
+    # telemetry of the dependency's own - a caller has its own logs and nothing
+    # else, which is what "hidden" means here.
+    minutes = a_window_with_the_pricing_service_slow(began_minutes_ago=10)
+
+    named = [line for line in minute_at(3, minutes).log_lines
+             if PRICING_HOST in line]
+
+    assert named
+    assert "1500ms" in named[0]
+
+
+def test_the_slow_call_is_a_warning_rather_than_an_error() -> None:
+    # No request failed and every page was correct. A line at ERROR would be the
+    # fixture telling a reader this is an outage, which is the one thing it is
+    # not.
+    minutes = a_window_with_the_pricing_service_slow(began_minutes_ago=10)
+
+    named = [line for line in minute_at(3, minutes).log_lines
+             if PRICING_HOST in line]
+
+    assert "WARN" in named[0]
+
+
+def test_a_shop_with_a_prompt_pricing_service_says_nothing_about_it() -> None:
+    # A line every minute about a dependency behaving normally is a line nobody
+    # reads on the minute it stops.
+    minutes = generate(None, SOME_NOW, SOME_SPAN_MINUTES, flag="dont-care-flag")
+
+    assert not [line for line in minute_at(3, minutes).log_lines
+                if PRICING_HOST in line]
+
+
+def test_restarting_the_pricing_service_brings_the_quantiles_back() -> None:
+    minutes = a_window_with_the_pricing_service_slow(
+        began_minutes_ago=15, restarted_minutes_ago=8
+    )
+
+    calm = minute_at(18, minutes)
+    waiting = minute_at(12, minutes)
+    after = minute_at(3, minutes)
+
+    assert waiting.p50_ms > calm.p50_ms * 5
+    assert after.p50_ms < waiting.p50_ms / 5

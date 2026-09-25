@@ -6,6 +6,7 @@ from io_shop import payment_provider, spend_summary
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
+from io_shop.pricing_service import AskThePricingService, PricingAnswer
 from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
 
 """The shop's request boundary: what a caller sees when the page fails.
@@ -25,6 +26,26 @@ def a_provider_holding_a_card() -> AskTheProvider:
 
 def a_provider_that_is_down() -> AskTheProvider:
     return lambda dont_care_shopper: ProviderAnswer(status=503)
+
+
+def a_prompt_pricing_service() -> AskThePricingService:
+    """A pricing service behaving itself, which is what every test here wants
+    from it except the two that are about it.
+
+    Well under the threshold the shop remarks on, so a page served through this
+    reports no delay at all.
+    """
+    return lambda dont_care_shopper: PricingAnswer(total_cents=8400, took_ms=12)
+
+
+def a_slow_pricing_service(took_ms: int = 1500) -> AskThePricingService:
+    return lambda dont_care_shopper: PricingAnswer(
+        total_cents=8400, took_ms=took_ms
+    )
+
+
+def a_pricing_service_with_no_price() -> AskThePricingService:
+    return lambda dont_care_shopper: PricingAnswer(total_cents=None, took_ms=8)
 
 
 def an_account_idle_this_month(*prices: int) -> Account:
@@ -53,7 +74,8 @@ def test_a_page_that_renders_carries_the_figure_and_no_failure() -> None:
 
     page = serve_account_page(account,
                               use_monthly_summary=False,
-                              ask_the_provider=a_provider_holding_a_card())
+                              ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_prompt_pricing_service())
 
     assert page.figure_cents == 2000
     assert page.card_last_four == "4242"
@@ -64,7 +86,8 @@ def test_a_page_that_breaks_is_reported_rather_than_raised() -> None:
     page = serve_account_page(
         an_account_that_never_bought_anything(),
         use_monthly_summary=False,
-        ask_the_provider=a_provider_holding_a_card()
+        ask_the_provider=a_provider_holding_a_card(),
+        ask_the_pricing_service=a_prompt_pricing_service()
     )
 
     assert page.figure_cents is None
@@ -77,7 +100,8 @@ def test_a_failure_keeps_the_errors_own_words() -> None:
     page = serve_account_page(
         an_account_that_never_bought_anything(),
         use_monthly_summary=False,
-        ask_the_provider=a_provider_holding_a_card()
+        ask_the_provider=a_provider_holding_a_card(),
+        ask_the_pricing_service=a_prompt_pricing_service()
     )
 
     assert page.failure is not None
@@ -91,7 +115,8 @@ def test_a_failure_names_the_line_it_was_raised_on() -> None:
     page = serve_account_page(
         an_account_that_never_bought_anything(),
         use_monthly_summary=False,
-        ask_the_provider=a_provider_holding_a_card()
+        ask_the_provider=a_provider_holding_a_card(),
+        ask_the_pricing_service=a_prompt_pricing_service()
     )
 
     assert page.failure is not None
@@ -107,7 +132,8 @@ def test_the_line_a_failure_names_is_the_one_that_raised_it() -> None:
     page = serve_account_page(
         an_account_that_never_bought_anything(),
         use_monthly_summary=False,
-        ask_the_provider=a_provider_holding_a_card()
+        ask_the_provider=a_provider_holding_a_card(),
+        ask_the_pricing_service=a_prompt_pricing_service()
     )
 
     assert page.failure is not None
@@ -123,7 +149,8 @@ def test_a_provider_that_will_not_answer_fails_the_page() -> None:
     # resilience.
     page = serve_account_page(an_account_idle_this_month(1000, 3000),
                               use_monthly_summary=False,
-                              ask_the_provider=a_provider_that_is_down())
+                              ask_the_provider=a_provider_that_is_down(),
+                              ask_the_pricing_service=a_prompt_pricing_service())
 
     assert page.figure_cents is None
     assert page.card_last_four is None
@@ -135,7 +162,8 @@ def test_a_provider_failure_names_the_provider_and_the_status() -> None:
     # the morning that the fault is not in this repository.
     page = serve_account_page(an_account_idle_this_month(1000, 3000),
                               use_monthly_summary=False,
-                              ask_the_provider=a_provider_that_is_down())
+                              ask_the_provider=a_provider_that_is_down(),
+                              ask_the_pricing_service=a_prompt_pricing_service())
 
     assert page.failure is not None
     assert page.failure.startswith("PaymentProviderFailed: ")
@@ -164,6 +192,7 @@ def test_a_page_whose_figure_was_cached_says_so() -> None:
     page = serve_account_page(an_account_idle_this_month(1000, 3000),
                               use_monthly_summary=False,
                               ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_prompt_pricing_service(),
                               look_up_summary=a_cache_holding(999),
                               cache_endpoint=SOME_CACHE_ENDPOINT)
 
@@ -177,12 +206,14 @@ def test_a_miss_is_computed_and_the_page_is_still_correct() -> None:
     computed = serve_account_page(account,
                                   use_monthly_summary=False,
                                   ask_the_provider=a_provider_holding_a_card(),
+                                  ask_the_pricing_service=a_prompt_pricing_service(),
                                   look_up_summary=a_cache_holding_nothing(),
                                   cache_endpoint=SOME_CACHE_ENDPOINT)
     without_a_cache_at_all = serve_account_page(
         account,
         use_monthly_summary=False,
-        ask_the_provider=a_provider_holding_a_card()
+        ask_the_provider=a_provider_holding_a_card(),
+        ask_the_pricing_service=a_prompt_pricing_service()
     )
 
     assert computed.figure_cents == without_a_cache_at_all.figure_cents
@@ -198,6 +229,7 @@ def test_a_cache_nobody_can_reach_does_not_fail_the_page() -> None:
     page = serve_account_page(account,
                               use_monthly_summary=False,
                               ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_prompt_pricing_service(),
                               look_up_summary=a_cache_that_cannot_be_reached(),
                               cache_endpoint=SOME_CACHE_ENDPOINT)
 
@@ -213,9 +245,46 @@ def test_an_unreachable_cache_is_reported_beside_the_failure_not_in_it() -> None
     page = serve_account_page(an_account_idle_this_month(1000, 3000),
                               use_monthly_summary=False,
                               ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_prompt_pricing_service(),
                               look_up_summary=a_cache_that_cannot_be_reached(),
                               cache_endpoint=SOME_CACHE_ENDPOINT)
 
     assert page.failure is None
     assert page.cache_failure is not None
     assert "6379" in page.cache_failure
+
+
+def test_a_page_carries_what_the_basket_comes_to() -> None:
+    page = serve_account_page(an_account_idle_this_month(1000, 3000),
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_prompt_pricing_service())
+
+    assert page.basket_total_cents == 8400
+    assert page.pricing_delay is None
+
+
+def test_a_slow_pricing_service_delays_the_page_without_failing_it() -> None:
+    # The whole scenario rests on this, exactly as the cache's rests on the
+    # fallback: the page is correct, the shopper is charged the right amount,
+    # and the only trace is a line nobody is paged for.
+    page = serve_account_page(an_account_idle_this_month(1000, 3000),
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_slow_pricing_service())
+
+    assert page.failure is None
+    assert page.figure_cents == 2000
+    assert page.basket_total_cents == 8400
+    assert page.pricing_delay is not None
+    assert payment_provider.PROVIDER_HOST not in page.pricing_delay
+
+
+def test_a_pricing_service_with_no_price_fails_the_page() -> None:
+    page = serve_account_page(an_account_idle_this_month(1000, 3000),
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_pricing_service_with_no_price())
+
+    assert page.failure is not None
+    assert "pricing.io-internal.svc" in page.failure

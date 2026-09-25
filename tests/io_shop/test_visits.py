@@ -5,6 +5,7 @@ import pytest
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
+from io_shop.pricing_service import AskThePricingService, PricingAnswer
 from io_shop.visits import (
     forget_every_visit,
     how_many_shoppers_are_remembered,
@@ -39,6 +40,12 @@ def a_provider_holding_a_card() -> AskTheProvider:
     return lambda dont_care_shopper: ProviderAnswer(
         status=200, card=StoredCard(brand="visa", last_four="4242")
     )
+
+
+def a_prompt_pricing_service() -> AskThePricingService:
+    """The pricing service answering promptly, for the same reason the provider
+    above answers at all: these cases are about what the page remembers."""
+    return lambda dont_care_shopper: PricingAnswer(total_cents=8400, took_ms=12)
 
 
 def an_account(shopper_id: str, *prices: int) -> Account:
@@ -91,7 +98,8 @@ def test_a_shopper_coming_back_adds_nothing() -> None:
 def test_serving_a_page_records_the_visit() -> None:
     serve_account_page(an_account("shopper-1", 1000, 3000),
                        use_monthly_summary=False,
-                       ask_the_provider=a_provider_holding_a_card())
+                       ask_the_provider=a_provider_holding_a_card(),
+                       ask_the_pricing_service=a_prompt_pricing_service())
 
     assert what_they_saw_last_time("shopper-1") == "2000"
 
@@ -102,7 +110,8 @@ def test_a_page_that_failed_is_a_visit_too() -> None:
     # not how retained state behaves.
     serve_account_page(an_account("shopper-1"),
                        use_monthly_summary=False,
-                       ask_the_provider=a_provider_holding_a_card())
+                       ask_the_provider=a_provider_holding_a_card(),
+                       ask_the_pricing_service=a_prompt_pricing_service())
 
     remembered = what_they_saw_last_time("shopper-1")
 
@@ -115,7 +124,8 @@ def test_serving_pages_to_many_shoppers_holds_one_entry_each() -> None:
         serve_account_page(
             an_account(f"shopper-{shopper}", 1000, 3000),
             use_monthly_summary=False,
-            ask_the_provider=a_provider_holding_a_card()
+            ask_the_provider=a_provider_holding_a_card(),
+            ask_the_pricing_service=a_prompt_pricing_service()
         )
 
     assert how_many_shoppers_are_remembered() == 20

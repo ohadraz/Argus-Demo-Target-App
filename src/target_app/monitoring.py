@@ -27,6 +27,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from target_app.scenarios import (
     BAD_DEPLOYMENT,
     CACHE_MISCONFIGURED,
+    PRICING_SERVICE_DEGRADED,
     RESOURCE_LEAK,
     SLOW_CANARY_ROLLOUT,
     TIMESTAMP_FORMAT,
@@ -80,6 +81,14 @@ _WHAT_FIRED: dict[str, tuple[str, str]] = {
     RESOURCE_LEAK: (
         _HIGH_MEMORY_USAGE,
         "Memory usage climbing against the container limit for 15m",
+    ),
+    # The same rule the bad deployment trips, and deliberately the same words:
+    # every request got slower in both, so the p95 rule is the one that fires
+    # and there is nothing in a firing alert that could distinguish them. The
+    # alert names the shop, because the shop is what is being paged about - and
+    # the shop is not what is wrong, which is the whole incident.
+    PRICING_SERVICE_DEGRADED: (
+        _HIGH_LATENCY, "p95 latency above threshold for 5m"
     ),
 }
 _BY_DEFAULT = (_HIGH_ERROR_RATE, "Error rate above threshold for 5m")

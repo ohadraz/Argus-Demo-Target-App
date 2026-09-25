@@ -20,6 +20,7 @@ from target_app.scenarios import (
     FALLBACK_DISABLED,
     FEATURE_FLAG_TOGGLE,
     FLAG_TOGGLE_RED_HERRING,
+    PRICING_SERVICE_DEGRADED,
     RESOURCE_LEAK,
     SCENARIOS,
     SLOW_CANARY_ROLLOUT,
@@ -937,3 +938,70 @@ def test_resetting_a_slow_rollout_puts_its_own_flag_back() -> None:
     state.reset()
 
     assert not where_it_was_left(flags)
+
+
+def a_staged_slow_dependency() -> ScenarioState:
+    """A state object with the pricing service answering slowly.
+
+    No flag, no cache and no deploy - the condition belongs to a process this
+    one does not run, which is why nothing here is configured but the scenario.
+    """
+    state = a_scenario_state(a_flag_client_reporting(False))
+    state.seed(SCENARIOS[PRICING_SERVICE_DEGRADED])
+
+    return state
+
+
+def test_a_slow_dependency_is_running_until_that_service_is_restarted() -> None:
+    state = a_staged_slow_dependency()
+
+    assert state.phase() == RUNNING
+
+
+def test_restarting_the_shop_does_not_end_a_slow_dependency() -> None:
+    # The whole reason the address on the action matters. Every strategy that
+    # existed before this scenario would have restarted the shop, and a fixture
+    # that recovered when it did would grade the wrong answer as the right one.
+    state = a_staged_slow_dependency()
+
+    state.restart_the_shop()
+
+    assert state.phase() == RUNNING
+
+
+def test_restarting_the_pricing_service_ends_it() -> None:
+    state = a_staged_slow_dependency()
+
+    state.restart_the_pricing_service()
+
+    assert state.phase() == RECOVERING
+
+
+def test_restarting_the_shop_leaves_the_pricing_services_clock_alone() -> None:
+    state = a_staged_slow_dependency()
+    was = state.active.pricing_serving_since if state.active else None
+
+    state.restart_the_shop()
+
+    assert state.active is not None
+    assert state.active.pricing_serving_since == was
+    assert state.active.serving_since != was
+
+
+def test_restarting_the_pricing_service_leaves_the_shops_clock_alone() -> None:
+    state = a_staged_slow_dependency()
+    was = state.active.serving_since if state.active else None
+
+    state.restart_the_pricing_service()
+
+    assert state.active is not None
+    assert state.active.serving_since == was
+    assert state.active.pricing_serving_since != was
+
+
+def test_restarting_the_pricing_service_with_nothing_staged_is_free() -> None:
+    # Safe for anybody to call, exactly as the shop's own restart is: there is
+    # nothing to end, and the answer is simply when they asked.
+    state = a_scenario_state(a_flag_client_reporting(False))
+
+    assert state.restart_the_pricing_service() is not None

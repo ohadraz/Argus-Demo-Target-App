@@ -21,6 +21,7 @@ from target_app.generator import BASELINE_MEMORY_BYTES, SETTLED_UPTIME
 from target_app.scenarios import (
     CACHE_MISCONFIGURED,
     MONTHLY_STATEMENT_PANEL,
+    PRICING_SERVICE_DEGRADED,
     RESOURCE_LEAK,
     SLOW_CANARY_ROLLOUT,
     UPSTREAM_DEPENDENCY_FAILURE,
@@ -591,6 +592,134 @@ def test_the_statement_scenario_is_not_offered_to_an_audience(
     catalogue = client.get("/scenario/catalog").json()["scenarios"]
 
     assert MONTHLY_STATEMENT_PANEL not in [scenario["id"] for scenario in catalogue]
+
+
+def a_staged_slow_dependency(client: TestClient) -> None:
+    seeded = client.post(
+        "/scenario/seed", json={"scenario_id": PRICING_SERVICE_DEGRADED}
+    )
+
+    assert seeded.status_code == 200
+
+
+def the_pod_of(client: TestClient, application: str) -> str | None:
+    nodes = client.get(f"/argocd/{application}/resource-tree").json()["nodes"]
+
+    return nodes[0]["createdAt"] if nodes else None
+
+
+def test_the_registry_answers_without_anything_staged(client: TestClient) -> None:
+    # The coupling was there all along, and that nobody had looked is the
+    # incident. A registry that only answered during one would be a fixture
+    # telling the reader where to look.
+    listed = client.get("/registry/services/io-shop").json()
+
+    assert listed["service"] == "io-shop"
+    assert {entry["name"] for entry in listed["dependencies"]} >= {
+        "io-pricing", "io-pay"
+    }
+
+
+def test_the_registry_says_which_dependency_is_this_companys(
+    client: TestClient
+) -> None:
+    whose = {
+        entry["name"]: entry["ownership"]
+        for entry in client.get("/registry/services/io-shop").json()["dependencies"]
+    }
+
+    assert whose["io-pricing"] == "internal"
+    assert whose["io-pay"] == "third-party"
+
+
+def test_each_application_reports_its_own_pod(client: TestClient) -> None:
+    a_staged_slow_dependency(client)
+
+    assert the_pod_of(client, "io-shop") is not None
+    assert the_pod_of(client, "io-pricing") is not None
+
+
+def test_nothing_staged_means_no_pods_to_report(client: TestClient) -> None:
+    # A creation time invented here would let a restart be confirmed against a
+    # world that does not exist.
+    assert the_pod_of(client, "io-shop") is None
+
+
+def test_restarting_the_shop_leaves_the_pricing_services_pod_alone(
+    client: TestClient
+) -> None:
+    a_staged_slow_dependency(client)
+    was = the_pod_of(client, "io-pricing")
+
+    restarted = client.post(
+        "/argocd/io-shop/resource/actions/v2", json={"action": RESTART_ACTION}
+    )
+
+    assert restarted.status_code == 200
+    assert the_pod_of(client, "io-pricing") == was
+
+
+def test_restarting_the_pricing_service_leaves_the_shops_pod_alone(
+    client: TestClient
+) -> None:
+    # The two halves of the same claim, and the reason the address on the action
+    # is load-bearing rather than decorative: a stand-in that restarted the shop
+    # whoever was named would grade every mitigation as correct.
+    a_staged_slow_dependency(client)
+    was = the_pod_of(client, "io-shop")
+
+    restarted = client.post(
+        "/argocd/io-pricing/resource/actions/v2", json={"action": RESTART_ACTION}
+    )
+
+    assert restarted.status_code == 200
+    assert the_pod_of(client, "io-shop") == was
+    assert the_pod_of(client, "io-pricing") != was
+
+
+def test_the_slow_dependency_scenario_is_seedable_by_id(client: TestClient) -> None:
+    a_staged_slow_dependency(client)
+
+    assert client.get("/scenario/status").json()["active_scenario"] == (
+        PRICING_SERVICE_DEGRADED
+    )
+
+
+def test_a_slow_dependency_moves_every_quantile_and_no_error_rate(
+    client: TestClient
+) -> None:
+    a_staged_slow_dependency(client)
+
+    minute = the_newest_minute(client)
+
+    assert minute["p50_ms"] > 1000
+    assert minute["p95_ms"] > 1000
+    assert minute["p99_ms"] > 1000
+    assert minute["error_rate"] < 0.05
+
+
+def test_a_slow_dependency_leaves_the_deploy_history_empty(
+    client: TestClient
+) -> None:
+    # The shape says "a deployment" and there is no deployment. That is what
+    # sends a reader to the logs, which is where the answer is.
+    a_staged_slow_dependency(client)
+
+    history = client.get("/argocd/io-shop").json()["status"]["history"]
+
+    assert history == []
+
+
+def test_a_slow_dependency_says_in_the_logs_where_the_time_went(
+    client: TestClient
+) -> None:
+    a_staged_slow_dependency(client)
+
+    lines = client.get("/logs").json()
+    named = [line for line in lines if "pricing.io-internal.svc" in line]
+
+    assert named
+    assert all("WARN" in line for line in named)
 
 
 def test_a_settled_shop_came_up_before_the_window_it_is_read_in() -> None:

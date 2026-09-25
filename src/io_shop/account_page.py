@@ -11,6 +11,7 @@ from io_shop.monthly_statement import (
     render_monthly_statement,
 )
 from io_shop.payment_provider import AskTheProvider, card_on_file
+from io_shop.pricing_service import AskThePricingService, basket_total
 from io_shop.spend_summary import render_spend_summary
 from io_shop.summary_cache import (
     CacheEndpoint,
@@ -57,6 +58,12 @@ class RenderedPage:
     sits beside `failure` rather than in it, and the distinction is the whole
     scenario: this is a page that *succeeded* while something underneath it was
     broken, so a reader sees it in the logs without seeing it in the error rate.
+
+    `pricing_delay` is the same shape of thing for the same reason: the words of
+    a pricing call that took longer than the shop thinks worth passing over. The
+    page was correct and the shopper was charged the right amount; what a reader
+    gets from this line is where the request's time went, which is the one thing
+    no amount of the shop's own telemetry can say.
     """
 
     figure_cents: int | None
@@ -65,11 +72,14 @@ class RenderedPage:
     served_from_cache: bool = False
     cache_failure: str | None = None
     statement: MonthlyStatement | None = None
+    basket_total_cents: int | None = None
+    pricing_delay: str | None = None
 
 
 def serve_account_page(account: Account,
                        use_monthly_summary: bool,
                        ask_the_provider: AskTheProvider,
+                       ask_the_pricing_service: AskThePricingService,
                        look_up_summary: LookUpSummary | None = None,
                        cache_endpoint: CacheEndpoint | None = None,
                        use_typical_spend: bool = False,
@@ -78,11 +88,17 @@ def serve_account_page(account: Account,
                        ) -> RenderedPage:
     """Renders the account page, reporting a failure rather than raising one.
 
-    Two things are shown and both are needed: what the shopper averages per
-    item, which Io works out for itself, and the card it would charge, which
-    only the payment provider knows. The second is a call to another company
-    from inside a page render, which is ordinary and is also why an outage over
-    there arrives here as Io's own error rate.
+    Three things are shown and all three are needed: what the shopper averages
+    per item, which Io works out for itself; what their basket comes to, which
+    the pricing service works out; and the card it would charge, which only the
+    payment provider knows. The last two are calls to other services from inside
+    a page render, which is ordinary and is why a slowdown or an outage over
+    there arrives here as Io's own latency and Io's own error rate.
+
+    The two are not the same kind of neighbour, and nothing in this function
+    tells them apart: one is another team's service and one is another company's,
+    and which is which is published in the service catalogue rather than
+    inferred from a host name.
 
     `use_monthly_summary` and `use_typical_spend` are the rollout decisions
     already made - whether this request is one of the ones each new figure is
@@ -111,6 +127,7 @@ def serve_account_page(account: Account,
         statement = _the_statement_for(
             account, use_monthly_statement, statement_period
         )
+        basket = basket_total(account.shopper_id, ask_the_pricing_service)
         card = card_on_file(account.shopper_id, ask_the_provider)
     except Exception as error:  # noqa: BLE001 - the boundary records anything
         failure = f"{type(error).__name__}: {error} at {_where_it_was_raised(error)}"
@@ -125,7 +142,9 @@ def serve_account_page(account: Account,
                         failure=None,
                         served_from_cache=from_cache,
                         cache_failure=cache_failure,
-                        statement=statement)
+                        statement=statement,
+                        basket_total_cents=basket.total_cents,
+                        pricing_delay=basket.slow_call)
 
 
 def _the_statement_for(account: Account,
