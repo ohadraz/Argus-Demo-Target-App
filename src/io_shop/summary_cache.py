@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -10,15 +11,22 @@ account page is the most-visited page the shop has. So the figure is cached
 under the shopper it belongs to, and the page reads the cache before it
 computes - which is what makes the shop fast rather than merely correct.
 
-Nothing here fails a page. A cache that has nothing for this shopper, and a
-cache that cannot be reached at all, both end the same way: the page works the
-figure out for itself and renders. That is the designed behaviour and it is
-load-bearing - a shop that failed when its cache did would be a shop whose cache
-is a dependency rather than an optimisation, and losing it would be an outage
-instead of a slowdown.
+Nothing here fails a page. A cache that has nothing for this shopper, a cache
+that cannot be reached at all, and a cache that is too slow to be worth waiting
+for all end the same way: the page works the figure out for itself and renders.
+That is the designed behaviour and it is load-bearing - a shop that failed when
+its cache did would be a shop whose cache is a dependency rather than an
+optimisation, and losing it would be an outage instead of a slowdown.
 
 Which is also why losing it is so easy to miss. Every page is still correct.
 The only thing that changes is how long each one takes.
+
+And that is why the wait is bounded. A cache that refuses a connection hands
+the page straight back to the fallback; a cache that simply takes a second and
+a half to answer never does, and the shop inherits its latency one request for
+one. An optimisation the page waits on without limit has stopped being an
+optimisation - so the shop gives it a budget, and spends the fallback rather
+than the time.
 
 Where the cache lives is not this module's to know. The endpoint is deployment
 configuration, handed in by whoever is running the shop, and how it is reached
@@ -30,6 +38,26 @@ is a seam the caller supplies.
 # - a reader comparing it against what the configuration says is doing the one
 # comparison that diagnoses this.
 _ENDPOINT_FORMAT = "redis://{host}:{port}"
+
+# How long the page will wait for the cache before working the figure out
+# itself. Generous for a lookup that normally answers in single-digit
+# milliseconds, and well inside what the page as a whole is expected to take -
+# the point of the number is that it is a number, not that it is this one. An
+# unbounded wait is the only setting that turns somebody else's slowness into
+# all of ours.
+HOW_LONG_THE_SHOP_WAITS_SECONDS = 0.1
+
+# How many renders may be waiting on the cache at once. The waiting is done on
+# a shared pool rather than a thread per render, for the reason the seam itself
+# exists: the shop is rendered many times over to produce a minute of
+# telemetry. A render that finds the pool full is a render that waits out its
+# budget and falls back, which is the same degradation as a slow answer and the
+# right one - nothing queues behind an upstream that has stopped answering.
+_MOST_RENDERS_WAITING = 32
+
+_WAITING_ON_THE_CACHE = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_MOST_RENDERS_WAITING, thread_name_prefix="summary-cache"
+)
 
 
 @dataclass(frozen=True)
@@ -79,6 +107,18 @@ class CacheUnreachable(Exception):
     """
 
 
+class CacheTooSlow(CacheUnreachable):
+    """The cache did not answer inside the time the page had for it.
+
+    A kind of unreachable rather than a thing of its own, because that is what
+    it is to the page: there is no figure to be had here in time, and the
+    fallback is the same fallback. Saying so in its own type is what lets a
+    reader tell the two apart in a log - a refused connection and an answer
+    that never arrived have the same effect on a render and completely
+    different causes on the other end of the socket.
+    """
+
+
 # How the cache is reached, given a shopper. A seam rather than a client, for
 # the reason the payment provider's is one: the shop is rendered many times over
 # to produce a minute of telemetry, and a connection per render would be
@@ -88,7 +128,9 @@ type LookUpSummary = Callable[[str], CacheAnswer]
 
 def cached_summary(shopper_id: str,
                    look_up: LookUpSummary,
-                   endpoint: CacheEndpoint) -> int | None:
+                   endpoint: CacheEndpoint,
+                   patience_seconds: float = HOW_LONG_THE_SHOP_WAITS_SECONDS
+                   ) -> int | None:
     """The figure the cache holds for this shopper, or `None` where it holds
     none.
 
@@ -98,10 +140,45 @@ def cached_summary(shopper_id: str,
     knowing the cache is gone and unable to work out why - where the endpoint,
     set against the endpoint the configuration was supposed to carry, is the
     whole diagnosis.
+
+    Raises `CacheTooSlow` - which is a `CacheUnreachable` - when the answer did
+    not arrive inside `patience_seconds`. The page has a figure it can work out
+    for itself, so waiting longer buys nothing except the upstream's latency on
+    every request that renders.
     """
-    answer = look_up(shopper_id)
+    answer = _answer_within(shopper_id, look_up, endpoint, patience_seconds)
 
     if not answer.reached:
         raise CacheUnreachable(f"connection refused to {endpoint}")
 
     return answer.summary_cents
+
+
+def _answer_within(shopper_id: str,
+                   look_up: LookUpSummary,
+                   endpoint: CacheEndpoint,
+                   patience_seconds: float) -> CacheAnswer:
+    """The cache's reply, or `CacheTooSlow` once the budget is spent.
+
+    Whatever the seam raises is raised on to the caller unchanged, exactly as
+    it was when the call was made inline: a lookup that fails is still the
+    caller's to see, and only the waiting is bounded here.
+
+    A lookup that is abandoned is left to finish and its answer dropped. There
+    is nothing to cancel on the other side of a blocking client, and a render
+    that has already fallen back has no use for a figure that arrives late.
+    """
+    waiting = _WAITING_ON_THE_CACHE.submit(look_up, shopper_id)
+
+    try:
+        return waiting.result(timeout=patience_seconds)
+    except concurrent.futures.TimeoutError:
+        waiting.cancel()
+
+        raise CacheTooSlow(
+            f"{endpoint} did not answer within "
+            f"{round(patience_seconds * _MILLISECONDS)}ms"
+        ) from None
+
+
+_MILLISECONDS = 1000

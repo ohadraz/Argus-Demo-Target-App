@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
-from io_shop import payment_provider, spend_summary
+from io_shop import payment_provider, spend_summary, summary_cache
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
@@ -10,10 +11,11 @@ from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
 
 """The shop's request boundary: what a caller sees when the page fails.
 
-Three things worth pinning: a failure is reported rather than raised - a handler
+Four things worth pinning: a failure is reported rather than raised - a handler
 that let it escape would take the worker down - the report keeps the error's own
-words, which are what a reader diagnoses from, and a payment provider that will
-not answer fails the page in words that name the provider rather than the shop.
+words, which are what a reader diagnoses from, a payment provider that will
+not answer fails the page in words that name the provider rather than the shop,
+and an upstream that answers too slowly is given up on rather than waited for.
 """
 
 
@@ -157,6 +159,22 @@ def a_cache_that_cannot_be_reached() -> LookUpSummary:
     return lambda dont_care_shopper: CacheAnswer(reached=False)
 
 
+# Ten times what the page will wait, so a render that still waited it out is
+# unmistakable in the timing rather than a matter of tolerance.
+SLOWER_THAN_THE_SHOP_WILL_WAIT = (
+    summary_cache.HOW_LONG_THE_SHOP_WAITS_SECONDS * 10
+)
+
+
+def a_cache_too_slow_to_be_worth_waiting_for() -> LookUpSummary:
+    def look_up(dont_care_shopper: str) -> CacheAnswer:
+        time.sleep(SLOWER_THAN_THE_SHOP_WILL_WAIT)
+
+        return CacheAnswer(reached=True, summary_cents=999)
+
+    return look_up
+
+
 SOME_CACHE_ENDPOINT = CacheEndpoint(host="cache.io-shop.svc.cluster.local", port=6379)
 
 
@@ -219,3 +237,27 @@ def test_an_unreachable_cache_is_reported_beside_the_failure_not_in_it() -> None
     assert page.failure is None
     assert page.cache_failure is not None
     assert "6379" in page.cache_failure
+
+
+def test_a_cache_too_slow_to_wait_for_does_not_slow_the_page() -> None:
+    # The incident, in miniature. The upstream answers - correctly, and far too
+    # late - and a page that waited for it would take the upstream's latency on
+    # every render, which is exactly what the shop's own figures showed. The
+    # fallback the cache exists to permit is reached in time instead: the page
+    # is correct, says it was not served from the cache, and reports the slow
+    # upstream beside the response rather than in the error rate.
+    account = an_account_idle_this_month(1000, 3000)
+
+    started = time.monotonic()
+    page = serve_account_page(account,
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              look_up_summary=a_cache_too_slow_to_be_worth_waiting_for(),
+                              cache_endpoint=SOME_CACHE_ENDPOINT)
+    took = time.monotonic() - started
+
+    assert page.failure is None
+    assert page.figure_cents == 2000
+    assert not page.served_from_cache
+    assert page.cache_failure is not None
+    assert took < SLOWER_THAN_THE_SHOP_WILL_WAIT / 2
