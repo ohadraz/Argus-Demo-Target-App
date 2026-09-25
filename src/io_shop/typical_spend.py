@@ -1,7 +1,3 @@
-from __future__ import annotations
-
-from io_shop.accounts import Account
-
 """What this shopper's middle purchase cost.
 
 The newest thing on the account page, and the one still behind a rollout. An
@@ -13,6 +9,10 @@ The figure it produces is right for every history the shop has. What it is not
 is cheap, and the cost follows the shape of the code rather than anything it is
 waiting on.
 """
+
+from __future__ import annotations
+
+from io_shop.accounts import Account
 
 
 def typical_spend_per_item(account: Account) -> int:

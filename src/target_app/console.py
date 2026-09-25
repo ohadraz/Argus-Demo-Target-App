@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Io's operator console: one page, no build step, no framework.
 
 What a Grafana or Kibana user would have in front of them - the shop's own
@@ -15,6 +13,9 @@ in this page's script and appears nowhere in the shop's Python - a fixture
 configured with the address of the tool observing it would not be much of a
 fixture.
 """
+
+from __future__ import annotations
+
 
 PAGE = """<!doctype html>
 <html lang="en">

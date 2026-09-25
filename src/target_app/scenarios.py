@@ -1,8 +1,3 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
-
 """The scenarios this service can stage, and how each one produces its telemetry.
 
 Two mechanisms sit side by side here, deliberately.
@@ -18,6 +13,12 @@ behind the seed instant. Nothing staged here uses it today: every scenario has a
 live condition, because a scenario whose telemetry cannot react is one no
 mitigation can be graded against.
 """
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 

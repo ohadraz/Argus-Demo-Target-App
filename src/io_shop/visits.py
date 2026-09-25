@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Who has looked at their account page, and what they were shown.
 
 The shop keeps this so the page can greet a returning shopper with the figure
@@ -11,6 +9,9 @@ more than the panel is worth.
 One entry per shopper, the newest render winning. Io has a few million
 registered shoppers and this holds whichever of them have been by.
 """
+
+from __future__ import annotations
+
 
 _LAST_SEEN: dict[str, str] = {}
 

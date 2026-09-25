@@ -1,11 +1,3 @@
-from __future__ import annotations
-
-from collections.abc import Sequence
-
-import psycopg
-
-from target_app.settings import UnleashSettings, get_unleash_settings
-
 """The flag provider's audit log, as far as a fixture is allowed to touch it.
 
 Unleash's event log is an audit log by design: it can be read through the API
@@ -21,6 +13,15 @@ this reason and says so. Nothing else in this service does it, nothing outside
 a reset does it, and Argus neither knows it is possible nor could do it - it
 holds a flag-provider token and no database at all.
 """
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import psycopg
+
+from target_app.settings import UnleashSettings, get_unleash_settings
+
 
 # Unleash's audit log, and the column naming the flag an entry is about. An
 # entry that is about no flag - a project or a token - has it null, and is left

@@ -1,19 +1,3 @@
-from __future__ import annotations
-
-import random
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
-from functools import lru_cache
-
-from io_shop.account_page import serve_account_page
-from io_shop.accounts import Account, Purchase
-from io_shop.monthly_statement import StatementPeriod, period_for
-from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
-from io_shop.pricing_service import AskThePricingService, PricingAnswer
-from io_shop.rollout import CANARY_SHARE
-from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
-from target_app.settings import get_unleash_settings
-
 """Telemetry generated from live state, at the moment it is asked for.
 
 The service's metrics and logs are a pure function of what time it is and of
@@ -43,6 +27,23 @@ every `/metrics` and every `/logs` call made the window a cost rather than a
 setting - and the window has to be six hours, because that is what a responder
 actually asks this service for.
 """
+
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from functools import lru_cache
+
+from io_shop.account_page import serve_account_page
+from io_shop.accounts import Account, Purchase
+from io_shop.monthly_statement import StatementPeriod, period_for
+from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
+from io_shop.pricing_service import AskThePricingService, PricingAnswer
+from io_shop.rollout import CANARY_SHARE
+from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
+from target_app.settings import get_unleash_settings
+
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 

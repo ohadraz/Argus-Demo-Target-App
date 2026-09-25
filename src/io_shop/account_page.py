@@ -1,3 +1,13 @@
+"""Serving one account page - the shop's request boundary.
+
+This is the line at which an exception stops being a bug and becomes an
+incident: everything below it raises, and here it is caught, recorded in the
+shop's own words, and turned into a failed response. It is the only place in the
+shop that catches broadly, and it does so on purpose - a request handler that let
+an unexpected error escape would take the worker with it instead of reporting a
+rate somebody can alert on.
+"""
+
 from __future__ import annotations
 
 import traceback
@@ -20,16 +30,6 @@ from io_shop.summary_cache import (
     cached_summary,
 )
 from io_shop.visits import record_visit
-
-"""Serving one account page - the shop's request boundary.
-
-This is the line at which an exception stops being a bug and becomes an
-incident: everything below it raises, and here it is caught, recorded in the
-shop's own words, and turned into a failed response. It is the only place in the
-shop that catches broadly, and it does so on purpose - a request handler that let
-an unexpected error escape would take the worker with it instead of reporting a
-rate somebody can alert on.
-"""
 
 
 @dataclass(frozen=True)

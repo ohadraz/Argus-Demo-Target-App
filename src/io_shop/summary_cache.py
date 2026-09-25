@@ -1,8 +1,3 @@
-from __future__ import annotations
-
-from collections.abc import Callable
-from dataclasses import dataclass
-
 """The spend figure Io has already worked out once, kept so it need not again.
 
 Working the figure out means walking a shopper's whole purchase history, and an
@@ -24,6 +19,12 @@ Where the cache lives is not this module's to know. The endpoint is deployment
 configuration, handed in by whoever is running the shop, and how it is reached
 is a seam the caller supplies.
 """
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+
 
 # How the cache is addressed, in the scheme its client speaks. Spelled out so
 # that the endpoint in a failure line is the endpoint the shop actually dialled

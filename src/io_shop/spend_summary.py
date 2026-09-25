@@ -1,8 +1,3 @@
-from __future__ import annotations
-
-from io_shop.accounts import Account
-from io_shop.typical_spend import typical_spend_per_item
-
 """What a shopper has spent, and what that averages to.
 
 Three figures about one history. The lifetime average has been on the account
@@ -11,6 +6,11 @@ purchase abandons the average altogether for the middle of the history. The
 last two are the ones still behind a rollout, and which of them a request gets
 is decided before it reaches here.
 """
+
+from __future__ import annotations
+
+from io_shop.accounts import Account
+from io_shop.typical_spend import typical_spend_per_item
 
 
 def average_spend_per_item(account: Account) -> int:

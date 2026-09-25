@@ -1,9 +1,3 @@
-from __future__ import annotations
-
-from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Final
-
 """What a shopper's basket comes to, which Io works out somewhere else.
 
 Discounts are not the shop's arithmetic. Which offers a shopper qualifies for,
@@ -28,6 +22,13 @@ How the service is reached is the caller's to supply, for the reason the payment
 provider's is: the shop is rendered many times over to produce a minute of
 telemetry, and a socket per render would be thousands of them per read.
 """
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Final
+
 
 # Where the pricing service answers. A host rather than a team name, because a
 # host is what appears in a slow call's own words - and those words are what

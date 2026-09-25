@@ -1,3 +1,9 @@
+"""What is currently staged, and keeping it honest against the live flag.
+
+In-memory only: a restart clears it. The scenario definitions are code, not
+state, so they survive restarts unaffected.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
@@ -30,11 +36,6 @@ from target_app.settings import (
     the_working_cache_endpoint,
 )
 
-"""What is currently staged, and keeping it honest against the live flag.
-
-In-memory only: a restart clears it. The scenario definitions are code, not
-state, so they survive restarts unaffected.
-"""
 
 # The phases a scenario passes through, as anything watching them sees it.
 # `RUNNING` and `RECOVERING` are the ones during which something is happening

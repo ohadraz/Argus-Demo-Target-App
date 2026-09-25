@@ -1,9 +1,3 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
-
-from io_shop.accounts import Account, Purchase
-
 """The account page's monthly statement - this month, said in full.
 
 The other three figures on the account page are each a single number: the
@@ -41,6 +35,13 @@ describe would be a statement nobody could trust for the months it *could*
 describe, and the account page's boundary is where a failure becomes a rate
 somebody can alert on - see `io_shop.account_page`.
 """
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from io_shop.accounts import Account, Purchase
+
 
 # The shop keeps money in pence and shows it in pounds, which is the ordinary
 # arrangement and the ordinary source of the ordinary bug: a figure formatted

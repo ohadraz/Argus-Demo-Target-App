@@ -1,8 +1,3 @@
-from __future__ import annotations
-
-from collections.abc import Callable
-from dataclasses import dataclass
-
 """The card Io keeps on file for a shopper, which Io does not keep.
 
 The account page shows the card a shopper will be charged with, and the shop has
@@ -21,6 +16,12 @@ How the provider is reached is the caller's to supply. The shop states what it
 asks for and what it does with the answer, and whoever is running it says where
 that answer comes from.
 """
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+
 
 # Who Io banks with. A host rather than a product name, because a host is what
 # appears in a failed request's own words - and those words are what somebody
