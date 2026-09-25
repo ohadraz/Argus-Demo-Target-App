@@ -12,7 +12,31 @@ from io_shop.spend_summary import (
 
 The monthly figure is newer and ships behind a rollout flag, so the cases below
 cover the shape the page has had for years plus the one the flag adds.
+
+One of them covers what the figure costs rather than what it is. It does not
+time anything - a timed loop measures the machine it ran on - it counts how
+many times the history is read, which is the shape of the code and is the same
+number everywhere.
 """
+
+
+class CountingPurchase:
+    """A purchase that remembers how often its price was asked for.
+
+    Stands in for `Purchase` rather than subclassing it, because the real one
+    is a frozen dataclass and the point here is to put a counter behind the one
+    attribute the arithmetic reads.
+    """
+
+    def __init__(self, price_cents: int, in_current_month: bool = False) -> None:
+        self._price_cents = price_cents
+        self.in_current_month = in_current_month
+        self.reads = 0
+
+    @property
+    def price_cents(self) -> int:
+        self.reads += 1
+        return self._price_cents
 
 
 def an_account_with_no_purchases_this_month(*prices: int) -> Account:
@@ -47,6 +71,32 @@ def test_the_lifetime_average_follows_the_purchases_not_the_carried_total() -> N
     )
 
     assert average_spend_per_item(an_account_whose_total_drifted) == 2000
+
+
+def test_the_lifetime_average_reads_each_purchase_once() -> None:
+    # The incident, asserted as the shape of the code rather than as a
+    # stopwatch. Re-summing the history from the start once per purchase reads
+    # a sixty-purchase history 1,830 times to reach the same total this reads
+    # it sixty times for - and a shopper with a long history pays for every one
+    # of those reads inside their page render.
+    a_long_history = tuple(CountingPurchase(price_cents=100) for _ in range(60))
+    account = Account(
+        shopper_id="shopper-with-a-long-history",
+        purchases=a_long_history,
+        total_cents=6000,
+        total_this_month_cents=0,
+    )
+
+    assert average_spend_per_item(account) == 100
+    assert sum(purchase.reads for purchase in a_long_history) == len(a_long_history)
+
+
+def test_the_lifetime_average_of_a_very_long_history_is_still_quick() -> None:
+    # The same fault said at the size that made it an incident: quadratic work
+    # over forty thousand purchases does not finish inside a request.
+    account = an_account_with_no_purchases_this_month(*([250] * 40_000))
+
+    assert average_spend_per_item(account) == 250
 
 
 def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
