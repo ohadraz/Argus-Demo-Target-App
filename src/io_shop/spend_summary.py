@@ -10,6 +10,13 @@ page for years; the monthly one narrows it to the current month; the typical
 purchase abandons the average altogether for the middle of the history. The
 last two are the ones still behind a rollout, and which of them a request gets
 is decided before it reaches here.
+
+Every figure here is on the page's fallback path - the one a request takes when
+the cache held nothing for this shopper, or could not be reached at all. That
+path is allowed to be taken by every request at once, so what it costs is part
+of what it means: work that grows with the square of a history is invisible
+while the cache is hitting and is the whole of the page's latency the moment it
+stops.
 """
 
 
@@ -20,18 +27,15 @@ def average_spend_per_item(account: Account) -> int:
     bought anything at all, which no real shopper is.
 
     Derives the total from the purchases rather than reading the one the account
-    carries, taking each purchase in and recomputing what has been spent by
-    then, so that the figure agrees with the list the shopper is looking at even
-    where the totals the query returned have drifted from it.
+    carries, so that the figure agrees with the list the shopper is looking at
+    even where the totals the query returned have drifted from it. One pass over
+    the purchases is all that takes: the running totals this used to rebuild at
+    every index were each thrown away but the last, and rebuilding them cost a
+    pass apiece.
     """
-    spent_by_then = 0
+    spent = sum(purchase.price_cents for purchase in account.purchases)
 
-    for index, _ in enumerate(account.purchases):
-        spent_by_then = sum(
-            earlier.price_cents for earlier in account.purchases[:index + 1]
-        )
-
-    return spent_by_then // len(account.purchases)
+    return spent // len(account.purchases)
 
 
 def average_spend_per_item_this_month(account: Account) -> int:

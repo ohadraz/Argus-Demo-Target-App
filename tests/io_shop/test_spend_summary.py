@@ -12,7 +12,51 @@ from io_shop.spend_summary import (
 
 The monthly figure is newer and ships behind a rollout flag, so the cases below
 cover the shape the page has had for years plus the one the flag adds.
+
+One case covers what the arithmetic costs rather than what it says. This is the
+figure a request falls back to when the cache holds nothing or cannot be
+reached, so every request can be running it at once, and work that grows with
+the square of a history turns a lost cache into a latency incident. The cost is
+counted, not timed: a clock would measure the machine the test ran on.
 """
+
+
+class _CountedPrice(int):
+    """A price that tallies every addition and comparison it takes part in.
+
+    A price is only ever added up or compared, so the tally is a faithful count
+    of the work a figure does over a history - and unlike a stopwatch it is the
+    same number on every machine.
+    """
+
+    operations = 0
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.operations = 0
+
+    def _counted(self) -> None:
+        type(self).operations += 1
+
+    def __add__(self, other: int) -> int:  # type: ignore[override]
+        self._counted()
+        return int(self) + int(other)
+
+    __radd__ = __add__
+
+    def __lt__(self, other: int) -> bool:
+        self._counted()
+        return int(self) < int(other)
+
+    def __gt__(self, other: int) -> bool:
+        self._counted()
+        return int(self) > int(other)
+
+    def __eq__(self, other: object) -> bool:
+        self._counted()
+        return int(self) == other
+
+    __hash__ = int.__hash__
 
 
 def an_account_with_no_purchases_this_month(*prices: int) -> Account:
@@ -47,6 +91,30 @@ def test_the_lifetime_average_follows_the_purchases_not_the_carried_total() -> N
     )
 
     assert average_spend_per_item(an_account_whose_total_drifted) == 2000
+
+
+def test_the_lifetime_average_costs_a_pass_over_the_history_not_a_pass_each() -> None:
+    # The cache-miss path. Rebuilding the running total at every index gave the
+    # right figure for a cost that grows with the square of the history - fine
+    # while the cache hit almost everything, and the page's whole latency the
+    # minute the cache went away.
+    how_many = 200
+    a_long_history = Account(
+        shopper_id="shopper-with-a-long-history",
+        purchases=tuple(
+            Purchase(price_cents=_CountedPrice(1000 + index), in_current_month=False)
+            for index in range(how_many)
+        ),
+        total_cents=0,
+        total_this_month_cents=0,
+    )
+
+    _CountedPrice.reset()
+    figure = average_spend_per_item(a_long_history)
+
+    assert figure == (sum(1000 + index for index in range(how_many)) // how_many)
+    # One pass is `how_many` additions; a pass per purchase would be ~20,000.
+    assert _CountedPrice.operations <= 5 * how_many
 
 
 def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
