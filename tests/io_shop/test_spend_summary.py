@@ -11,8 +11,31 @@ from io_shop.spend_summary import (
 """Io's account-page arithmetic - the lifetime figure and the monthly one.
 
 The monthly figure is newer and ships behind a rollout flag, so the cases below
-cover the shape the page has had for years plus the one the flag adds.
+cover the shape the page has had for years plus the one the flag adds - and what
+each of them costs, because the page runs them while it renders.
 """
+
+
+class CountingPurchase(Purchase):
+    """A purchase that records every time its price is read.
+
+    Reading the price is the unit of work the lifetime average does; counting
+    the reads says whether the history is walked once or once per purchase,
+    without timing anything.
+    """
+
+    reads = 0
+
+    @property  # type: ignore[misc]
+    def price_cents(self) -> int:  # type: ignore[override]
+        CountingPurchase.reads += 1
+        return self.__dict__["_price_cents"]
+
+
+def a_counting_purchase(price: int) -> CountingPurchase:
+    purchase = CountingPurchase(price_cents=price, in_current_month=False)
+    object.__setattr__(purchase, "_price_cents", price)
+    return purchase
 
 
 def an_account_with_no_purchases_this_month(*prices: int) -> Account:
@@ -47,6 +70,25 @@ def test_the_lifetime_average_follows_the_purchases_not_the_carried_total() -> N
     )
 
     assert average_spend_per_item(an_account_whose_total_drifted) == 2000
+
+
+def test_a_long_history_is_summed_once_rather_than_re_summed_per_purchase() -> None:
+    # The incident: re-summing everything bought so far at every purchase reads
+    # each price once per purchase - n^2/2 reads over a history - and the page
+    # that renders this figure pays for it on every request that misses cache.
+    history = 400
+    purchases = tuple(a_counting_purchase(i + 1) for i in range(history))
+    account = Account(
+        shopper_id="shopper-with-a-long-history",
+        purchases=purchases,
+        total_cents=0,
+        total_this_month_cents=0,
+    )
+
+    CountingPurchase.reads = 0
+
+    assert average_spend_per_item(account) == sum(range(1, history + 1)) // history
+    assert CountingPurchase.reads <= history * 2
 
 
 def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
