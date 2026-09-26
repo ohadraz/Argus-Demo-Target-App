@@ -20,7 +20,12 @@ from io_shop.monthly_statement import (
     StatementPeriod,
     render_monthly_statement,
 )
-from io_shop.payment_provider import AskTheProvider, card_on_file
+from io_shop.payment_provider import (
+    AskTheProvider,
+    PaymentProviderFailed,
+    StoredCard,
+    card_on_file,
+)
 from io_shop.pricing_service import AskThePricingService, basket_total
 from io_shop.spend_summary import render_spend_summary
 from io_shop.summary_cache import (
@@ -36,12 +41,12 @@ from io_shop.visits import record_visit
 class RenderedPage:
     """How serving one account page went.
 
-    Either the page rendered, in which case both of the things it shows are
-    here, or it failed, in which case neither is and `failure` carries the
-    error's own words and the line they were raised on - because those are what
-    reach the log and what a reader diagnoses from. A generic "request failed"
-    would describe every incident equally, and the error's words alone name a
-    fault without naming where it lives.
+    Either the page rendered, in which case the things it shows are here, or it
+    failed, in which case none of them are and `failure` carries the error's own
+    words and the line they were raised on - because those are what reach the
+    log and what a reader diagnoses from. A generic "request failed" would
+    describe every incident equally, and the error's words alone name a fault
+    without naming where it lives.
 
     `statement` is the monthly statement panel, on the pages the newest rollout
     reached and absent everywhere else. It sits beside the figure rather than
@@ -64,6 +69,14 @@ class RenderedPage:
     page was correct and the shopper was charged the right amount; what a reader
     gets from this line is where the request's time went, which is the one thing
     no amount of the shop's own telemetry can say.
+
+    `card_failure` is the same shape again, and it is there because of what the
+    alternative cost: a payment provider in another company, down for reasons
+    nobody here can act on, used to fail the whole page - the figure Io works
+    out for itself and the basket total an internal service had already
+    answered with, thrown away because a card's last four digits could not be
+    shown. Now `card_last_four` is absent, the provider's own words are here,
+    and the rest of the page is the page.
     """
 
     figure_cents: int | None
@@ -74,6 +87,7 @@ class RenderedPage:
     statement: MonthlyStatement | None = None
     basket_total_cents: int | None = None
     pricing_delay: str | None = None
+    card_failure: str | None = None
 
 
 def serve_account_page(account: Account,
@@ -88,17 +102,20 @@ def serve_account_page(account: Account,
                        ) -> RenderedPage:
     """Renders the account page, reporting a failure rather than raising one.
 
-    Three things are shown and all three are needed: what the shopper averages
-    per item, which Io works out for itself; what their basket comes to, which
-    the pricing service works out; and the card it would charge, which only the
-    payment provider knows. The last two are calls to other services from inside
-    a page render, which is ordinary and is why a slowdown or an outage over
-    there arrives here as Io's own latency and Io's own error rate.
+    Three things are shown: what the shopper averages per item, which Io works
+    out for itself; what their basket comes to, which the pricing service works
+    out; and the card it would charge, which only the payment provider knows.
+    The last two are calls to other services from inside a page render, which is
+    ordinary and is why a slowdown or an outage over there arrives here as Io's
+    own latency and Io's own error rate.
 
     The two are not the same kind of neighbour, and nothing in this function
     tells them apart: one is another team's service and one is another company's,
     and which is which is published in the service catalogue rather than
-    inferred from a host name.
+    inferred from a host name. What the page does do is tell apart what it can
+    render without: the card can be missing from a correct page, so a provider
+    that will not answer costs the shopper their last four digits rather than
+    their account page.
 
     `use_monthly_summary` and `use_typical_spend` are the rollout decisions
     already made - whether this request is one of the ones each new figure is
@@ -128,7 +145,7 @@ def serve_account_page(account: Account,
             account, use_monthly_statement, statement_period
         )
         basket = basket_total(account.shopper_id, ask_the_pricing_service)
-        card = card_on_file(account.shopper_id, ask_the_provider)
+        card, card_failure = _the_card_for(account.shopper_id, ask_the_provider)
     except Exception as error:  # noqa: BLE001 - the boundary records anything
         failure = f"{type(error).__name__}: {error} at {_where_it_was_raised(error)}"
         record_visit(account.shopper_id, failure)
@@ -138,13 +155,39 @@ def serve_account_page(account: Account,
     record_visit(account.shopper_id, str(figure_cents))
 
     return RenderedPage(figure_cents=figure_cents,
-                        card_last_four=card.last_four,
+                        card_last_four=card.last_four if card else None,
                         failure=None,
                         served_from_cache=from_cache,
                         cache_failure=cache_failure,
                         statement=statement,
                         basket_total_cents=basket.total_cents,
-                        pricing_delay=basket.slow_call)
+                        pricing_delay=basket.slow_call,
+                        card_failure=card_failure)
+
+
+def _the_card_for(shopper_id: str,
+                  ask_the_provider: AskTheProvider
+                  ) -> tuple[StoredCard | None, str | None]:
+    """The card the provider holds, and what it said if it would not say.
+
+    The provider is another company's service, and when it is down there is
+    nothing the shop can do about it. What the shop can decide is what that
+    costs: a page that still shows the figure and the basket total, with the
+    card missing and the provider's own words - its host, the path, the status -
+    reported beside the render rather than as the render's failure.
+
+    Only `PaymentProviderFailed` is caught, and it is never swallowed: it comes
+    back as `RenderedPage.card_failure`, which is a line in the logs whether or
+    not it is a point on the error rate. Anything else raised from here is a
+    fault in the shop and belongs to the boundary.
+    """
+    try:
+        return card_on_file(shopper_id, ask_the_provider), None
+    except PaymentProviderFailed as unavailable:
+        return None, (
+            f"{type(unavailable).__name__}: {unavailable} at "
+            f"{_where_it_was_raised(unavailable)}"
+        )
 
 
 def _the_statement_for(account: Account,

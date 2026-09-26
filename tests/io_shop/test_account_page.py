@@ -2,20 +2,40 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from io_shop import payment_provider, spend_summary
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
-from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
+from io_shop.payment_provider import (
+    FAILURES_BEFORE_GIVING_UP,
+    AskTheProvider,
+    ProviderAnswer,
+    StoredCard,
+    forget_provider_health,
+)
 from io_shop.pricing_service import AskThePricingService, PricingAnswer
 from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
 
 """The shop's request boundary: what a caller sees when the page fails.
 
-Three things worth pinning: a failure is reported rather than raised - a handler
+Four things worth pinning: a failure is reported rather than raised - a handler
 that let it escape would take the worker down - the report keeps the error's own
-words, which are what a reader diagnoses from, and a payment provider that will
-not answer fails the page in words that name the provider rather than the shop.
+words, which are what a reader diagnoses from, a payment provider that will not
+answer is named in the shop's output rather than blamed on the shop, and a
+provider that will not answer does not take the rest of the page with it.
 """
+
+
+@pytest.fixture(autouse=True)
+def a_shop_that_has_heard_nothing_about_the_provider() -> None:
+    """Every case begins with the shop willing to ask the provider.
+
+    What the shop has lately seen the provider do is process state, so without
+    this a case would inherit the previous one's outage - and the cases about
+    giving up would be the ones doing it to everybody else.
+    """
+    forget_provider_health()
 
 
 def a_provider_holding_a_card() -> AskTheProvider:
@@ -26,6 +46,28 @@ def a_provider_holding_a_card() -> AskTheProvider:
 
 def a_provider_that_is_down() -> AskTheProvider:
     return lambda dont_care_shopper: ProviderAnswer(status=503)
+
+
+def a_provider_that_is_down_and_counts(asked: list[str]) -> AskTheProvider:
+    """A dead provider that records every call, because what a dead provider
+    costs the shop is the number of times the shop waits for it."""
+    def ask(shopper_id: str) -> ProviderAnswer:
+        asked.append(shopper_id)
+
+        return ProviderAnswer(status=503)
+
+    return ask
+
+
+def a_provider_holding_a_card_and_counting(asked: list[str]) -> AskTheProvider:
+    def ask(shopper_id: str) -> ProviderAnswer:
+        asked.append(shopper_id)
+
+        return ProviderAnswer(
+            status=200, card=StoredCard(brand="visa", last_four="4242")
+        )
+
+    return ask
 
 
 def a_prompt_pricing_service() -> AskThePricingService:
@@ -80,6 +122,7 @@ def test_a_page_that_renders_carries_the_figure_and_no_failure() -> None:
     assert page.figure_cents == 2000
     assert page.card_last_four == "4242"
     assert page.failure is None
+    assert page.card_failure is None
 
 
 def test_a_page_that_breaks_is_reported_rather_than_raised() -> None:
@@ -142,33 +185,111 @@ def test_the_line_a_failure_names_is_the_one_that_raised_it() -> None:
     assert "//" in source[named - 1]
 
 
-def test_a_provider_that_will_not_answer_fails_the_page() -> None:
-    # Nothing is retried and nothing is rendered without the card: when the
-    # provider is down there is nothing the shop can do about it, and code that
-    # softened this would turn somebody else's outage into a question about Io's
-    # resilience.
+def test_a_provider_that_will_not_answer_no_longer_fails_the_page() -> None:
+    # The incident, as a case. io-pay is another company's service and when it
+    # is down there is nothing the shop can do about it - but the figure Io
+    # works out for itself and the basket total an internal service already
+    # answered with are both here, and throwing them away over a card's last
+    # four digits turned somebody else's outage into all of Io's account pages.
     page = serve_account_page(an_account_idle_this_month(1000, 3000),
                               use_monthly_summary=False,
                               ask_the_provider=a_provider_that_is_down(),
                               ask_the_pricing_service=a_prompt_pricing_service())
 
-    assert page.figure_cents is None
+    assert page.failure is None
+    assert page.figure_cents == 2000
+    assert page.basket_total_cents == 8400
     assert page.card_last_four is None
-    assert page.failure is not None
 
 
-def test_a_provider_failure_names_the_provider_and_the_status() -> None:
+def test_a_provider_failure_is_reported_beside_the_failure_not_in_it() -> None:
     # The host and the status, because those are what tell a reader at three in
-    # the morning that the fault is not in this repository.
+    # the morning that the fault is not in this repository. They are still said
+    # in full - what changed is that saying them does not cost the page.
     page = serve_account_page(an_account_idle_this_month(1000, 3000),
                               use_monthly_summary=False,
                               ask_the_provider=a_provider_that_is_down(),
                               ask_the_pricing_service=a_prompt_pricing_service())
 
-    assert page.failure is not None
-    assert page.failure.startswith("PaymentProviderFailed: ")
-    assert payment_provider.PROVIDER_HOST in page.failure
-    assert "503" in page.failure
+    assert page.failure is None
+    assert page.card_failure is not None
+    assert page.card_failure.startswith("PaymentProviderFailed: ")
+    assert payment_provider.PROVIDER_HOST in page.card_failure
+    assert "503" in page.card_failure
+
+
+def test_the_shop_stops_asking_a_provider_that_keeps_failing() -> None:
+    # Not what the page says - how much waiting it did to say it. Every call to
+    # a provider that is timing out is a request of Io's spent on it, which is
+    # what took p50 from 44ms to two seconds. After a run of failures the shop
+    # stops asking, so the cost of the outage stops growing with traffic.
+    asked: list[str] = []
+    provider = a_provider_that_is_down_and_counts(asked)
+
+    for _ in range(40):
+        page = serve_account_page(
+            an_account_idle_this_month(1000, 3000),
+            use_monthly_summary=False,
+            ask_the_provider=provider,
+            ask_the_pricing_service=a_prompt_pricing_service()
+        )
+
+        assert page.failure is None
+        assert page.figure_cents == 2000
+        assert page.card_failure is not None
+
+    assert len(asked) <= FAILURES_BEFORE_GIVING_UP
+
+
+def test_a_provider_that_is_answering_is_asked_every_time() -> None:
+    # The other half: giving up is about a run of failures, not about a count of
+    # calls. A shop that quietly stopped asking a healthy provider would show
+    # every shopper a page with no card on it.
+    asked: list[str] = []
+    provider = a_provider_holding_a_card_and_counting(asked)
+
+    for _ in range(40):
+        page = serve_account_page(
+            an_account_idle_this_month(1000, 3000),
+            use_monthly_summary=False,
+            ask_the_provider=provider,
+            ask_the_pricing_service=a_prompt_pricing_service()
+        )
+
+        assert page.card_last_four == "4242"
+
+    assert len(asked) == 40
+
+
+def test_one_card_forgives_the_failures_before_it() -> None:
+    # A single answer proves the provider is answering, which is the only thing
+    # the count was ever asking about - so a shopper the provider happens to
+    # refuse never counts towards giving up on everyone else.
+    asked: list[str] = []
+    account = an_account_idle_this_month(1000, 3000)
+
+    for _ in range(FAILURES_BEFORE_GIVING_UP - 1):
+        serve_account_page(account,
+                           use_monthly_summary=False,
+                           ask_the_provider=a_provider_that_is_down(),
+                           ask_the_pricing_service=a_prompt_pricing_service())
+
+    serve_account_page(account,
+                       use_monthly_summary=False,
+                       ask_the_provider=a_provider_holding_a_card(),
+                       ask_the_pricing_service=a_prompt_pricing_service())
+
+    for _ in range(FAILURES_BEFORE_GIVING_UP - 1):
+        page = serve_account_page(
+            account,
+            use_monthly_summary=False,
+            ask_the_provider=a_provider_holding_a_card_and_counting(asked),
+            ask_the_pricing_service=a_prompt_pricing_service()
+        )
+
+        assert page.card_last_four == "4242"
+
+    assert len(asked) == FAILURES_BEFORE_GIVING_UP - 1
 
 
 def a_cache_holding(summary_cents: int) -> LookUpSummary:
