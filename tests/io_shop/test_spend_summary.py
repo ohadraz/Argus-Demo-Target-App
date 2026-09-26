@@ -11,7 +11,9 @@ from io_shop.spend_summary import (
 """Io's account-page arithmetic - the lifetime figure and the monthly one.
 
 The monthly figure is newer and ships behind a rollout flag, so the cases below
-cover the shape the page has had for years plus the one the flag adds.
+cover the shape the page has had for years plus the one the flag adds - and
+what the lifetime figure costs, because it is walked on every request the
+rollout does not reach.
 """
 
 
@@ -47,6 +49,53 @@ def test_the_lifetime_average_follows_the_purchases_not_the_carried_total() -> N
     )
 
     assert average_spend_per_item(an_account_whose_total_drifted) == 2000
+
+
+_PRICE_READS = [0]
+
+
+class _CountedPurchase:
+    """A purchase that remembers how often its price was read.
+
+    Everything the lifetime figure touches and nothing else, so what the count
+    measures is how many times the history was walked.
+    """
+
+    in_current_month = False
+
+    def __init__(self, price_cents: int) -> None:
+        self._price_cents = price_cents
+
+    @property
+    def price_cents(self) -> int:
+        _PRICE_READS[0] += 1
+        return self._price_cents
+
+
+def test_the_lifetime_average_reads_each_price_about_once() -> None:
+    # Re-summing the history once per purchase gives the right answer at a cost
+    # that grows with the square of the history, which is paid by the shoppers
+    # who have bought the most - the same tail that the rollout's figure made
+    # worse. Adding the prices up once is a single pass, so a bound of two
+    # reads per purchase fails against the loop and passes against the sum.
+    how_many = 400
+    purchases = tuple(
+        _CountedPurchase(price_cents=100 + index) for index in range(how_many)
+    )
+    a_long_history = Account(
+        shopper_id="shopper-with-a-very-long-history",
+        purchases=purchases,  # type: ignore[arg-type]
+        total_cents=0,
+        total_this_month_cents=0,
+    )
+    expected = sum(100 + index for index in range(how_many)) // how_many
+
+    _PRICE_READS[0] = 0
+    average = average_spend_per_item(a_long_history)
+    reads = _PRICE_READS[0]
+
+    assert average == expected
+    assert reads <= how_many * 2
 
 
 def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
