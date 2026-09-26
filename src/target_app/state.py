@@ -69,6 +69,43 @@ def _settled_at(turned_off_at: datetime) -> datetime:
     )
 
 
+def _has_fallen_behind(timeline: FlagTimeline, moved_now: bool) -> bool:
+    """Whether this timeline still describes where its flag actually sits.
+
+    A timeline recording no end says the flag is away from its quiet state; one
+    recording an end says it is back. So the two agree exactly when they
+    disagree as booleans, and a timeline has fallen behind when they read alike.
+    """
+    return moved_now is (timeline.turned_off_at is not None)
+
+
+def _caught_up_with_the_flag(timeline: FlagTimeline,
+                             moved_now: bool) -> FlagTimeline:
+    """One timeline caught up with its flag, in whichever direction it moved.
+
+    Both directions, because an agent that moves a flag may put it back: every
+    mitigation Argus takes is undone when it fails to help, so a flag switched at
+    one reading is switched back at a later one. Read in one direction only -
+    which is how both of these were written - a timeline froze at the first
+    revert, and the shop went on reporting the flag where it no longer was. That
+    is the fixture lying in the one channel an agent checks to find out what its
+    own action did.
+
+    Reopening starts a fresh stretch rather than extending the old one. A
+    timeline holds one on-and-off pair, so the minutes between a revert and a
+    re-enable cannot be expressed as a gap - and claiming the flag was away
+    throughout would erase the evidence that the revert worked, which is the one
+    thing those minutes are read for. What is lost instead is the earlier
+    stretch's dates: minutes before the re-enable read as quiet. That is the
+    right way round for a fixture, whose job is to be honest about the state an
+    agent is about to act on.
+    """
+    if moved_now:
+        return FlagTimeline(turned_on_at=utc_now())
+
+    return replace(timeline, turned_off_at=utc_now())
+
+
 def _the_decoys_quiet_state(scenario: Scenario) -> bool:
     """The state the decoy sits in when nothing is going on.
 
@@ -1015,9 +1052,6 @@ class ScenarioState:
         if active is None or active.timeline is None:
             return None
 
-        if active.timeline.turned_off_at is not None:
-            return active.timeline
-
         # A scenario whose fault is not the flag's doing never ends, however the
         # flag moves. Reverting it is then a real action against a real cause
         # that was not the cause - which an agent should discover from the
@@ -1025,12 +1059,15 @@ class ScenarioState:
         if not active.scenario.recovers_when_flag_reverts:
             return active.timeline
 
-        if self._is_in_the_breaking_state(active.scenario):
+        broken_now = self._is_in_the_breaking_state(active.scenario)
+
+        if not _has_fallen_behind(active.timeline, broken_now):
             return active.timeline
 
-        ended = replace(active.timeline, turned_off_at=utc_now())
-        self._active = replace(active, timeline=ended)
-        return ended
+        caught_up = _caught_up_with_the_flag(active.timeline, broken_now)
+        self._active = replace(active, timeline=caught_up)
+
+        return caught_up
 
     def decoy_timeline_now(self) -> FlagTimeline | None:
         """The decoy flag's history, reconciled against the provider.
@@ -1047,19 +1084,22 @@ class ScenarioState:
         if active is None or active.decoy_timeline is None:
             return None
 
-        if active.decoy_timeline.turned_off_at is not None:
-            return active.decoy_timeline
-
         client = self._decoy_flags_for(active.scenario)
 
-        if client is None or client.is_enabled() is not _the_decoys_quiet_state(
-            active.scenario
-        ):
+        if client is None:
             return active.decoy_timeline
 
-        reverted = replace(active.decoy_timeline, turned_off_at=utc_now())
-        self._active = replace(active, decoy_timeline=reverted)
-        return reverted
+        moved_now = client.is_enabled() is not _the_decoys_quiet_state(
+            active.scenario
+        )
+
+        if not _has_fallen_behind(active.decoy_timeline, moved_now):
+            return active.decoy_timeline
+
+        caught_up = _caught_up_with_the_flag(active.decoy_timeline, moved_now)
+        self._active = replace(active, decoy_timeline=caught_up)
+
+        return caught_up
 
     def _is_in_the_breaking_state(self, scenario: Scenario) -> bool:
         """Whether the flag still sits where it broke the shop.

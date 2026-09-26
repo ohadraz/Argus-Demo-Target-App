@@ -192,6 +192,50 @@ def test_the_incident_stays_ended_once_it_has_ended() -> None:
     assert first == second
 
 
+def test_a_flag_switched_back_on_starts_the_incident_again() -> None:
+    # What every failed mitigation leaves behind. Argus undoes an action that did
+    # not help, so a flag it switched off is switched on again a few minutes
+    # later - and the feature is then live for a second time.
+    #
+    # Reconciled in one direction only, which is how this was written, the
+    # timeline froze at the first revert: the shop went on reporting healthy
+    # minutes with the feature live, and every later verdict rested on telemetry
+    # that no longer followed the flag. A fixture that lies about the state an
+    # agent is about to act on is worse than one that stages nothing.
+    flags = a_flag_client_reporting(True)
+    state = a_scenario_state(flags)
+    state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
+
+    flags.is_enabled.return_value = False
+    ended = state.timeline_now()
+
+    flags.is_enabled.return_value = True
+    live_again = state.timeline_now()
+
+    assert ended.turned_off_at is not None
+    assert live_again.turned_off_at is None
+    assert live_again.turned_on_at >= ended.turned_off_at
+
+
+def test_an_incident_started_again_does_not_freeze_the_window() -> None:
+    # The consequence the reconciliation exists for. A window frozen at the first
+    # revert stops advancing, so the minutes an agent reads to judge its second
+    # action are the same minutes it read to judge its first.
+    flags = a_flag_client_reporting(True)
+    state = a_scenario_state(flags)
+    state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
+
+    flags.is_enabled.return_value = False
+    state.timeline_now()
+
+    flags.is_enabled.return_value = True
+
+    _, up_to = state.generated_window()
+    a_generous_allowance_seconds = 5
+
+    assert (utc_now() - up_to).total_seconds() < a_generous_allowance_seconds
+
+
 def test_an_ended_incident_stays_active_as_a_scenario() -> None:
     # Recovery is not the same as un-staging. The scenario is still the one
     # running, and its recovered minutes are exactly what a verifier reads.
@@ -356,8 +400,16 @@ def test_a_revert_on_a_minute_boundary_still_leaves_its_clean_minute_behind() ->
     # minute that would carry the recovery has nought elapsed seconds - which is
     # no reading rather than a quiet one, so the window freezes without it and an
     # action that worked is refuted for want of a measurement.
-    state = a_scenario_state(a_flag_client_reporting(True))
+    flags = a_flag_client_reporting(True)
+    state = a_scenario_state(flags)
     state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
+    # The flag has to say what the timeline below says, because the timeline is
+    # reconciled against the provider in both directions: a flag reading as on
+    # beside a timeline recording an end is the state an agent leaves behind when
+    # it puts a failed mitigation back, and it is read as the incident having
+    # started again. Staged inconsistently, this test would be arranging that
+    # instead of a revert.
+    flags.is_enabled.return_value = False
 
     settle = timedelta(minutes=get_scenario_settings().settle_minutes)
     on_the_boundary = (utc_now() - settle - timedelta(minutes=2)).replace(
@@ -559,6 +611,29 @@ def test_a_reverted_decoy_is_stamped_on_the_next_read() -> None:
     flags.is_enabled.return_value = False
 
     assert state.decoy_timeline_now().turned_off_at is not None
+
+
+def test_a_decoy_put_back_where_it_broke_nothing_is_stamped_as_moved_again() -> None:
+    # The scenario this reconciliation exists for. `competing-flag-changes` is
+    # built so that reverting the feature flag changes nothing and has to be
+    # undone - and the feature flag there is the decoy. So the one scenario that
+    # makes Argus revert a decoy and put it back is the one whose decoy log line
+    # is read straight off this timeline: frozen at the first revert, the shop
+    # reports the decoy off while the provider says on.
+    flags = a_flag_client_reporting(True)
+    fallback_flags = a_flag_client_reporting(False)
+    state = a_scenario_state(flags, fallback_flags)
+    state.seed(SCENARIOS[COMPETING_FLAG_CHANGES])
+
+    flags.is_enabled.return_value = False
+    put_back = state.decoy_timeline_now()
+
+    flags.is_enabled.return_value = True
+    moved_again = state.decoy_timeline_now()
+
+    assert put_back.turned_off_at is not None
+    assert moved_again.turned_off_at is None
+    assert moved_again.turned_on_at >= put_back.turned_off_at
 
 
 def test_reverting_the_decoy_leaves_the_incident_running() -> None:
