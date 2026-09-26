@@ -611,6 +611,12 @@ def purchases_this_month(account: Account) -> tuple[Purchase, ...]:
     statement module that re-derived the month from a timestamp would be
     answering a question the query has already answered, and answering it in a
     different timezone.
+
+    One walk of the whole history, and the reason everything below it takes the
+    month rather than the account: this is the only function here whose cost
+    grows with how long a shopper has been shopping, and a statement that
+    called it once per figure would multiply that cost by the number of figures
+    on the panel.
     """
     return tuple(
         purchase for purchase in account.purchases if purchase.in_current_month
@@ -624,7 +630,7 @@ def the_biggest_purchase_this_month(account: Account) -> int:
     shopper checks first: a month that surprised them usually surprised them
     once, and this is the purchase that did it.
     """
-    return max(purchase.price_cents for purchase in purchases_this_month(account))
+    return _the_biggest_of(purchases_this_month(account))
 
 
 def the_smallest_purchase_this_month(account: Account) -> int:
@@ -635,7 +641,7 @@ def the_smallest_purchase_this_month(account: Account) -> int:
     one big thing or a month of many similar things, before the band breakdown
     says it in detail.
     """
-    return min(purchase.price_cents for purchase in purchases_this_month(account))
+    return _the_smallest_of(purchases_this_month(account))
 
 
 def the_mean_purchase_this_month(account: Account) -> int:
@@ -646,9 +652,27 @@ def the_mean_purchase_this_month(account: Account) -> int:
     produce a mean above the largest purchase on a month of identical prices,
     which is the kind of figure that costs a support conversation.
     """
-    bought = purchases_this_month(account)
+    return _the_mean_of(
+        purchases_this_month(account), account.total_this_month_cents
+    )
 
-    return account.total_this_month_cents // len(bought)
+
+def _the_biggest_of(bought: tuple[Purchase, ...]) -> int:
+    """The largest of a month already in hand.
+
+    Raises on an empty month, as it always has: a month with nothing in it has
+    no largest purchase, and the page above turns that into a failed response
+    rather than a made-up zero.
+    """
+    return max(purchase.price_cents for purchase in bought)
+
+
+def _the_smallest_of(bought: tuple[Purchase, ...]) -> int:
+    return min(purchase.price_cents for purchase in bought)
+
+
+def _the_mean_of(bought: tuple[Purchase, ...], month_total_cents: int) -> int:
+    return month_total_cents // len(bought)
 
 
 def _share_of(part_cents: int, whole_cents: int) -> float:
@@ -674,23 +698,33 @@ def _band_summaries(bought: tuple[Purchase, ...],
     a breakdown assembled from only the non-empty bands cannot tell "no
     purchases between £20 and £50" from "£20 to £50 is not a band this shop
     has", and the first of those is a fact about the shopper's month.
+
+    One pass over the month rather than one per band. The bands are ordered and
+    half-open, so the first that holds a purchase is the only one that can -
+    which is what makes stopping there identical to asking every band in turn,
+    rather than merely close to it. A price no band holds is counted into none
+    of them, exactly as before, so `reconciles` still catches it instead of it
+    being quietly filed somewhere.
     """
-    summaries = []
+    counts = [0] * len(THE_PRICE_BANDS)
+    totals = [0] * len(THE_PRICE_BANDS)
 
-    for band in THE_PRICE_BANDS:
-        in_this_band = [purchase for purchase in bought if band.holds(purchase)]
-        total_cents = sum(purchase.price_cents for purchase in in_this_band)
+    for purchase in bought:
+        for index, band in enumerate(THE_PRICE_BANDS):
+            if band.holds(purchase):
+                counts[index] += 1
+                totals[index] += purchase.price_cents
+                break
 
-        summaries.append(
-            BandSummary(
-                band=band,
-                purchase_count=len(in_this_band),
-                total_cents=total_cents,
-                share_of_month=_share_of(total_cents, month_total_cents)
-            )
+    return tuple(
+        BandSummary(
+            band=band,
+            purchase_count=counts[index],
+            total_cents=totals[index],
+            share_of_month=_share_of(totals[index], month_total_cents)
         )
-
-    return tuple(summaries)
+        for index, band in enumerate(THE_PRICE_BANDS)
+    )
 
 
 def _category_summaries(bought: tuple[Purchase, ...],
@@ -704,30 +738,33 @@ def _category_summaries(bought: tuple[Purchase, ...],
     purchase carrying a category the shop does not have does not silently
     invent a row for it. It lands in `UNCLASSIFIED`, which is where the
     catalogue puts it too, and the statement still adds up.
+
+    One pass over the month, filing each purchase under the one category it
+    belongs to, rather than one pass per category asking every purchase whether
+    it belongs to that one. The rows still come back in the shop's own order,
+    which is the only thing about them a reader can see.
     """
     known = set(THE_CATEGORIES)
-    summaries = []
+    counts = {name: 0 for name in THE_CATEGORIES}
+    totals = {name: 0 for name in THE_CATEGORIES}
+    refunded = {name: 0 for name in THE_CATEGORIES}
 
-    for name in THE_CATEGORIES:
-        in_this_category = [
-            purchase for purchase in bought
-            if _category_of(purchase, known) == name
-        ]
-        total_cents = sum(purchase.price_cents for purchase in in_this_category)
+    for purchase in bought:
+        name = _category_of(purchase, known)
+        counts[name] += 1
+        totals[name] += purchase.price_cents
+        refunded[name] += purchase.refunded_cents
 
-        summaries.append(
-            CategorySummary(
-                name=name,
-                purchase_count=len(in_this_category),
-                total_cents=total_cents,
-                refunded_cents=sum(
-                    purchase.refunded_cents for purchase in in_this_category
-                ),
-                share_of_month=_share_of(total_cents, month_total_cents)
-            )
+    return tuple(
+        CategorySummary(
+            name=name,
+            purchase_count=counts[name],
+            total_cents=totals[name],
+            refunded_cents=refunded[name],
+            share_of_month=_share_of(totals[name], month_total_cents)
         )
-
-    return tuple(summaries)
+        for name in THE_CATEGORIES
+    )
 
 
 def _category_of(purchase: Purchase, known: set[str]) -> str:
@@ -846,7 +883,7 @@ def _instalment_of(purchase: Purchase) -> int:
     return purchase.price_cents // (purchase.instalments_remaining + 1)
 
 
-def _the_usual_month(account: Account) -> int:
+def _the_usual_month(account: Account, bought: tuple[Purchase, ...]) -> int:
     """What this shopper spends in a month, taken across their whole history.
 
     An approximation, and openly one: the account carries a lifetime total and a
@@ -861,16 +898,20 @@ def _the_usual_month(account: Account) -> int:
     spent twice as much as usual, which they already know. Comparing at equal
     volume isolates the thing they cannot see: whether the things they bought
     were dearer than the things they normally buy.
+
+    The month is handed in rather than worked out again, because the caller has
+    already walked the history to find it.
     """
     if not account.purchases:
         return 0
 
     lifetime_mean = account.total_cents // len(account.purchases)
 
-    return lifetime_mean * len(purchases_this_month(account))
+    return lifetime_mean * len(bought)
 
 
-def _compared_with_usual(account: Account) -> MonthComparison:
+def _compared_with_usual(account: Account,
+                         bought: tuple[Purchase, ...]) -> MonthComparison:
     """This month against what this shopper's months usually cost.
 
     The direction is resolved to a word here, and the share is made positive
@@ -879,7 +920,7 @@ def _compared_with_usual(account: Account) -> MonthComparison:
     eventually print "12% less" for a month that was 12% more, and the only
     person who would notice is the shopper.
     """
-    usual_cents = _the_usual_month(account)
+    usual_cents = _the_usual_month(account, bought)
     this_month_cents = account.total_this_month_cents
     difference = this_month_cents - usual_cents
 
@@ -908,6 +949,13 @@ def render_monthly_statement(account: Account,
     which is how two parts of a shop come to disagree about what a shopper
     spent.
 
+    The history is walked once, here, and every figure below is worked out from
+    the month that walk produced. That is what `MonthlyStatement` means by one
+    pass, and it is load-bearing rather than tidy: this is the only work on the
+    account page whose cost grows with how much a shopper has ever bought, so a
+    figure that re-derived the month for itself would charge the shoppers with
+    the longest histories again for every figure on the panel.
+
     Raises rather than returning an empty statement. A month with nothing in it
     has no largest purchase, no smallest, no mean and no shape, and every one of
     those is a row this panel promises. The page above catches it, records the
@@ -922,16 +970,16 @@ def render_monthly_statement(account: Account,
         period=period,
         headline_cents=month_total_cents,
         purchase_count=len(bought),
-        biggest_cents=the_biggest_purchase_this_month(account),
-        smallest_cents=the_smallest_purchase_this_month(account),
-        mean_cents=the_mean_purchase_this_month(account),
+        biggest_cents=_the_biggest_of(bought),
+        smallest_cents=_the_smallest_of(bought),
+        mean_cents=_the_mean_of(bought, month_total_cents),
         bands=_band_summaries(bought, month_total_cents),
         categories=_category_summaries(bought, month_total_cents),
         refunds=_refunds_this_month(bought),
         delivery=_delivery_this_month(bought),
         savings=_savings_this_month(bought),
         instalments=_instalments_this_month(bought),
-        compared_with_usual=_compared_with_usual(account)
+        compared_with_usual=_compared_with_usual(account, bought)
     )
 
 

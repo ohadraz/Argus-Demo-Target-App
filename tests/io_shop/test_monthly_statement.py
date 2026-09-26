@@ -25,6 +25,13 @@ cover what would be expensive to find out from a shopper. The one that matters
 most is the empty month, because that is the fault the
 `monthly-statement-panel` scenario stages, and a change that quietly made it
 stop raising would leave that scenario staging nothing at all.
+
+One of them is not about a figure at all. `monthly-spend-feature` put this
+panel on every account page and took p99 with it, because assembling a
+statement was walking the shopper's whole history once per figure - so there is
+a test here that counts the walks rather than checking an answer. The answers
+were never wrong; only the amount of work was, and a test that only read the
+figures would have passed throughout the incident.
 """
 
 MARCH = period_for(3, 2026)
@@ -53,6 +60,29 @@ def a_shopper_who_bought_nothing_this_month() -> Account:
     )
 
 
+class CountedHistory:
+    """A purchase history that remembers how often it was walked end to end.
+
+    Stands in for the tuple an account carries, and answers `len` without
+    counting a walk - a length is not a pass over the history, and counting it
+    as one would make the bound below mean something other than what it says.
+    """
+
+    def __init__(self, purchases: tuple[Purchase, ...]) -> None:
+        self._purchases = purchases
+        self.walks = 0
+
+    def __iter__(self):
+        self.walks += 1
+        return iter(self._purchases)
+
+    def __len__(self) -> int:
+        return len(self._purchases)
+
+    def __getitem__(self, index):
+        return self._purchases[index]
+
+
 def test_the_statement_reports_the_month_it_was_asked_for() -> None:
     statement = render_monthly_statement(a_shopper_who_bought_this_month(), MARCH)
 
@@ -68,6 +98,36 @@ def test_the_statement_takes_its_shape_from_this_month_alone() -> None:
 
     assert statement.biggest_cents == 6400
     assert statement.smallest_cents == 1200
+
+
+def test_the_statement_walks_the_history_once() -> None:
+    # The incident `monthly-spend-feature` caused. Assembling a statement used
+    # to re-derive the month for the largest purchase, the smallest, the mean
+    # and the comparison, walking the shopper's whole history five times over -
+    # invisible on a short history and the whole of the p99 on a long one.
+    history = CountedHistory(
+        tuple(
+            Purchase(
+                price_cents=100 + index,
+                in_current_month=index % 2 == 0,
+                category="Books",
+            )
+            for index in range(400)
+        )
+    )
+    account = Account(
+        shopper_id="shopper-with-a-long-history",
+        purchases=history,
+        total_cents=sum(100 + index for index in range(400)),
+        total_this_month_cents=sum(
+            100 + index for index in range(400) if index % 2 == 0
+        ),
+    )
+
+    statement = render_monthly_statement(account, MARCH)
+
+    assert statement.purchase_count == 200
+    assert history.walks == 1
 
 
 def test_a_month_with_nothing_in_it_fails_rather_than_reporting_zero() -> None:
