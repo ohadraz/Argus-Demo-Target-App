@@ -30,22 +30,34 @@ def a_provider_that_is_down() -> AskTheProvider:
 
 def a_prompt_pricing_service() -> AskThePricingService:
     """A pricing service behaving itself, which is what every test here wants
-    from it except the two that are about it.
+    from it except the three that are about it.
 
     Well under the threshold the shop remarks on, so a page served through this
     reports no delay at all.
     """
-    return lambda dont_care_shopper: PricingAnswer(total_cents=8400, took_ms=12)
+    return lambda dont_care_shopper, dont_care_budget: PricingAnswer(
+        total_cents=8400, took_ms=12
+    )
 
 
-def a_slow_pricing_service(took_ms: int = 1500) -> AskThePricingService:
-    return lambda dont_care_shopper: PricingAnswer(
+def a_slow_pricing_service(took_ms: int = 400) -> AskThePricingService:
+    return lambda dont_care_shopper, dont_care_budget: PricingAnswer(
         total_cents=8400, took_ms=took_ms
     )
 
 
+def a_pricing_service_that_does_not_answer() -> AskThePricingService:
+    """The incident's dependency: nothing comes back before the shop's budget
+    runs out, and the client says so rather than pretending to a refusal."""
+    return lambda dont_care_shopper, budget_ms: PricingAnswer(
+        total_cents=None, took_ms=budget_ms, timed_out=True
+    )
+
+
 def a_pricing_service_with_no_price() -> AskThePricingService:
-    return lambda dont_care_shopper: PricingAnswer(total_cents=None, took_ms=8)
+    return lambda dont_care_shopper, dont_care_budget: PricingAnswer(
+        total_cents=None, took_ms=8
+    )
 
 
 def an_account_idle_this_month(*prices: int) -> Account:
@@ -278,6 +290,26 @@ def test_a_slow_pricing_service_delays_the_page_without_failing_it() -> None:
     assert page.basket_total_cents == 8400
     assert page.pricing_delay is not None
     assert payment_provider.PROVIDER_HOST not in page.pricing_delay
+
+
+def test_a_pricing_service_that_does_not_answer_costs_the_budget_not_the_page(
+) -> None:
+    # The incident. The page renders - figure, card and all - with the basket
+    # panel missing and the words for why, because the shop stopped waiting at
+    # its own deadline instead of inheriting the dependency's latency.
+    page = serve_account_page(
+        an_account_idle_this_month(1000, 3000),
+        use_monthly_summary=False,
+        ask_the_provider=a_provider_holding_a_card(),
+        ask_the_pricing_service=a_pricing_service_that_does_not_answer()
+    )
+
+    assert page.failure is None
+    assert page.figure_cents == 2000
+    assert page.card_last_four == "4242"
+    assert page.basket_total_cents is None
+    assert page.pricing_delay is not None
+    assert "pricing.io-internal.svc" in page.pricing_delay
 
 
 def test_a_pricing_service_with_no_price_fails_the_page() -> None:

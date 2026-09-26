@@ -45,7 +45,9 @@ def a_provider_holding_a_card() -> AskTheProvider:
 def a_prompt_pricing_service() -> AskThePricingService:
     """The pricing service answering promptly, for the same reason the provider
     above answers at all: these cases are about what the page remembers."""
-    return lambda dont_care_shopper: PricingAnswer(total_cents=8400, took_ms=12)
+    return lambda dont_care_shopper, dont_care_budget: PricingAnswer(
+        total_cents=8400, took_ms=12
+    )
 
 
 def an_account(shopper_id: str, *prices: int) -> Account:

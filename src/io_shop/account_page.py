@@ -60,10 +60,13 @@ class RenderedPage:
     broken, so a reader sees it in the logs without seeing it in the error rate.
 
     `pricing_delay` is the same shape of thing for the same reason: the words of
-    a pricing call that took longer than the shop thinks worth passing over. The
-    page was correct and the shopper was charged the right amount; what a reader
-    gets from this line is where the request's time went, which is the one thing
-    no amount of the shop's own telemetry can say.
+    a pricing call that took longer than the shop thinks worth passing over, or
+    of one the shop stopped waiting for. `basket_total_cents` is absent in that
+    second case - the shop spends only its budget on the basket panel, and a
+    page missing one panel is a far smaller thing than every page on the site
+    taking as long as the pricing service happens to be taking today. What a
+    reader gets from this line is where the request's time went, which is the
+    one thing no amount of the shop's own telemetry can say.
     """
 
     figure_cents: int | None
@@ -93,7 +96,9 @@ def serve_account_page(account: Account,
     the pricing service works out; and the card it would charge, which only the
     payment provider knows. The last two are calls to other services from inside
     a page render, which is ordinary and is why a slowdown or an outage over
-    there arrives here as Io's own latency and Io's own error rate.
+    there arrives here as Io's own latency and Io's own error rate - unless the
+    call is made with a deadline, which is what `basket_total` does with the
+    pricing service's.
 
     The two are not the same kind of neighbour, and nothing in this function
     tells them apart: one is another team's service and one is another company's,
