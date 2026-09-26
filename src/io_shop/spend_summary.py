@@ -5,6 +5,12 @@ page for years; the monthly one narrows it to the current month; the typical
 purchase abandons the average altogether for the middle of the history. The
 last two are the ones still behind a rollout, and which of them a request gets
 is decided before it reaches here.
+
+Every figure here is worked out while a request is being served, so what each
+one costs is latency a shopper waits through. One pass over the history is the
+budget: anything that walks it once per purchase is quadratic, and a history of
+a few thousand purchases turns a page render into hundreds of milliseconds of
+arithmetic no dependency is responsible for.
 """
 
 from __future__ import annotations
@@ -20,18 +26,14 @@ def average_spend_per_item(account: Account) -> int:
     bought anything at all, which no real shopper is.
 
     Derives the total from the purchases rather than reading the one the account
-    carries, taking each purchase in and recomputing what has been spent by
-    then, so that the figure agrees with the list the shopper is looking at even
-    where the totals the query returned have drifted from it.
+    carries, so that the figure agrees with the list the shopper is looking at
+    even where the totals the query returned have drifted from it. One pass: the
+    total is the sum of the prices, and re-summing what has been spent by then
+    once per purchase is the same answer at n times the cost.
     """
-    spent_by_then = 0
+    spent = sum(purchase.price_cents for purchase in account.purchases)
 
-    for index, _ in enumerate(account.purchases):
-        spent_by_then = sum(
-            earlier.price_cents for earlier in account.purchases[:index + 1]
-        )
-
-    return spent_by_then // len(account.purchases)
+    return spent // len(account.purchases)
 
 
 def average_spend_per_item_this_month(account: Account) -> int:

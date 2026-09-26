@@ -11,7 +11,10 @@ from io_shop.spend_summary import (
 """Io's account-page arithmetic - the lifetime figure and the monthly one.
 
 The monthly figure is newer and ships behind a rollout flag, so the cases below
-cover the shape the page has had for years plus the one the flag adds.
+cover the shape the page has had for years plus the one the flag adds. One case
+is about what the lifetime figure costs rather than what it says: it is computed
+while a shopper waits, so the number of times it walks the history is the page's
+own latency.
 """
 
 
@@ -25,6 +28,25 @@ def an_account_with_no_purchases_this_month(*prices: int) -> Account:
         total_cents=sum(prices),
         total_this_month_cents=0,
     )
+
+
+class CountingPurchase:
+    """A purchase that remembers how often its price was read.
+
+    Stands in for `Purchase` so that what a figure costs can be asserted without
+    timing anything: a test that timed a loop would measure the machine it ran
+    on, where the number of times a history is walked is a property of the code.
+    """
+
+    def __init__(self, price_cents: int, in_current_month: bool = False) -> None:
+        self._price_cents = price_cents
+        self.in_current_month = in_current_month
+        self.reads = 0
+
+    @property
+    def price_cents(self) -> int:
+        self.reads += 1
+        return self._price_cents
 
 
 def test_the_lifetime_average_spreads_the_total_over_every_purchase() -> None:
@@ -47,6 +69,26 @@ def test_the_lifetime_average_follows_the_purchases_not_the_carried_total() -> N
     )
 
     assert average_spend_per_item(an_account_whose_total_drifted) == 2000
+
+
+def test_the_lifetime_average_walks_the_history_once() -> None:
+    # The latency incident in one assertion. Re-summing everything spent so far,
+    # once per purchase, gives the same figure for n times the work - and the
+    # figure is computed while a shopper waits, so the cost is the page's own
+    # latency rather than a dependency's.
+    purchases = tuple(CountingPurchase(100 + index) for index in range(200))
+    a_long_history = Account(
+        shopper_id="shopper-with-a-long-history",
+        purchases=purchases,
+        total_cents=0,
+        total_this_month_cents=0,
+    )
+
+    assert average_spend_per_item(a_long_history) == 199
+
+    reads = sum(purchase.reads for purchase in purchases)
+
+    assert reads <= 2 * len(purchases)
 
 
 def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:

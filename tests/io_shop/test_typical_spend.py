@@ -5,11 +5,26 @@ from io_shop.typical_spend import typical_spend_per_item
 
 """The middle of a shopper's history - the account page's newest figure.
 
-Correct on every history the shop has, which is the whole of what this file
-covers. That it is also expensive is not asserted here: what it costs is
-modelled by the generator, and a test timing a loop over twelve integers would
-measure the machine it ran on rather than the shape of the code.
+Correct on every history the shop has, and cheap on every history the shop has.
+The last case is about the cost: it counts comparisons rather than milliseconds,
+because a test timing a loop would measure the machine it ran on where the
+number of passes over the history is a property of the code.
 """
+
+
+class CountedPrice(int):
+    """A price that counts how often it is compared with another.
+
+    An int, so everything under test treats it as the money it is. The counter
+    is on the class because what is being measured is the whole ordering rather
+    than one price's part in it.
+    """
+
+    comparisons = 0
+
+    def __lt__(self, other: int) -> bool:  # type: ignore[override]
+        CountedPrice.comparisons += 1
+        return int.__lt__(self, other)
 
 
 def an_account_of(*prices: int) -> Account:
@@ -39,9 +54,9 @@ def test_a_single_purchase_is_its_own_middle() -> None:
 
 
 def test_repeated_prices_do_not_lose_the_middle() -> None:
-    # Taking the cheapest that is left, over and over, has to count a repeated
-    # price once per purchase rather than once per value - a shopper who bought
-    # the same thing five times has a middle, and it is that thing.
+    # Ordering the history has to count a repeated price once per purchase
+    # rather than once per value - a shopper who bought the same thing five
+    # times has a middle, and it is that thing.
     assert typical_spend_per_item(an_account_of(500, 500, 500, 9000, 9000)) == 500
 
 
@@ -51,3 +66,18 @@ def test_one_expensive_buy_does_not_drag_the_middle_the_way_it_drags_a_mean() ->
     a_history_of_coffees_and_a_laptop = an_account_of(*([300] * 20), 180_000)
 
     assert typical_spend_per_item(a_history_of_coffees_and_a_laptop) == 300
+
+
+def test_the_middle_is_not_found_by_a_pass_per_purchase() -> None:
+    # The latency incident, for the figure behind the newest rollout. Taking the
+    # cheapest that is left, over and over, scans the whole remaining history
+    # once per removal - quadratic work inside a request a shopper is waiting
+    # on, for an answer one ordering already gives.
+    how_many = 201
+    scrambled = [
+        CountedPrice(100 + (index * 37) % how_many) for index in range(how_many)
+    ]
+    CountedPrice.comparisons = 0
+
+    assert typical_spend_per_item(an_account_of(*scrambled)) == 200
+    assert CountedPrice.comparisons <= 20 * how_many
