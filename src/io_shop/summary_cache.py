@@ -13,7 +13,20 @@ is a dependency rather than an optimisation, and losing it would be an outage
 instead of a slowdown.
 
 Which is also why losing it is so easy to miss. Every page is still correct.
-The only thing that changes is how long each one takes.
+The only thing that changes is how long each one takes - and that is the part
+this module has to defend. A cache that is not there costs a connection attempt
+per render, and a render happens on the busiest page the shop serves, so an
+optional dependency that is dialled unconditionally is not optional at all: its
+absence is paid for by every request in full. So the module remembers. A cache
+that has refused several times running is left alone for a while, and the page
+goes straight to working the figure out at the speed it would have had if no
+cache had ever been configured.
+
+Left alone rather than forgotten: every so often one request is allowed through
+to find out whether the cache has come back, so recovery needs nobody to deploy
+anything. And every request that would have used the cache is still told the
+cache is gone, because a shop that stopped saying so would have hidden the only
+signal this failure produces.
 
 Where the cache lives is not this module's to know. The endpoint is deployment
 configuration, handed in by whoever is running the shop, and how it is reached
@@ -22,8 +35,10 @@ is a seam the caller supplies.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Final
 
 
 # How the cache is addressed, in the scheme its client speaks. Spelled out so
@@ -31,6 +46,18 @@ from dataclasses import dataclass
 # - a reader comparing it against what the configuration says is doing the one
 # comparison that diagnoses this.
 _ENDPOINT_FORMAT = "redis://{host}:{port}"
+
+# How many refusals in a row mean the cache is gone rather than unlucky. Small,
+# because the thing being protected is a per-request connection attempt on the
+# shop's busiest page - and more than a couple of those is already the whole
+# fast path's cost paid for nothing.
+FAILURES_BEFORE_GIVING_UP: Final = 3
+
+# How long the shop leaves a cache alone once it has given up on it. Long
+# enough that a dead endpoint costs one connection attempt a minute rather than
+# one per render; short enough that a cache which comes back is used again
+# without anybody deploying anything.
+HOW_LONG_TO_GIVE_UP_FOR_SECONDS: Final = 30.0
 
 
 @dataclass(frozen=True)
@@ -77,6 +104,11 @@ class CacheUnreachable(Exception):
     A miss returns `None` and is unremarkable; this is a different fact about
     the world, and a shop that returned `None` for both would have no way to
     say which of them it is living through.
+
+    Raised on a request the shop deliberately did not dial as well as on one it
+    dialled and lost. The cache is just as gone either way, and a request that
+    reported nothing because the shop had stopped asking would make the logs go
+    quiet in the middle of the outage.
     """
 
 
@@ -86,10 +118,32 @@ class CacheUnreachable(Exception):
 # thousands of them per read.
 type LookUpSummary = Callable[[str], CacheAnswer]
 
+# What time it is, in seconds that only ever go forwards. A seam because the
+# giving-up is a duration, and a duration nobody can move is a duration nobody
+# can test.
+type Now = Callable[[], float]
+
+
+@dataclass
+class _HowItHasBeenGoing:
+    """What this endpoint has done lately: how many refusals in a row, and the
+    moment before which the shop will not dial it again."""
+
+    failures_in_a_row: int = 0
+    do_not_dial_before: float = 0.0
+
+
+# One record per endpoint, in the process, for the reason visits are kept in the
+# process: the thing being avoided is a connection, so the memory has to live
+# where the connections are made. Keyed by endpoint so that a deployment moving
+# the cache starts with a clean record rather than inheriting the old address's.
+_HOW_EACH_ENDPOINT_HAS_BEEN_GOING: dict[CacheEndpoint, _HowItHasBeenGoing] = {}
+
 
 def cached_summary(shopper_id: str,
                    look_up: LookUpSummary,
-                   endpoint: CacheEndpoint) -> int | None:
+                   endpoint: CacheEndpoint,
+                   now: Now = time.monotonic) -> int | None:
     """The figure the cache holds for this shopper, or `None` where it holds
     none.
 
@@ -99,10 +153,48 @@ def cached_summary(shopper_id: str,
     knowing the cache is gone and unable to work out why - where the endpoint,
     set against the endpoint the configuration was supposed to carry, is the
     whole diagnosis.
+
+    Raises it without dialling at all where this endpoint has just refused
+    several times running. That is the difference between losing the cache and
+    paying for it: the page renders at the speed it would have had with no cache
+    configured, instead of waiting on a socket nobody is listening to. The words
+    say which of the two happened, and name the endpoint either way.
     """
+    lately = _HOW_EACH_ENDPOINT_HAS_BEEN_GOING.setdefault(
+        endpoint, _HowItHasBeenGoing()
+    )
+
+    if now() < lately.do_not_dial_before:
+        raise CacheUnreachable(
+            f"not dialled - {endpoint} refused "
+            f"{lately.failures_in_a_row} connections in a row"
+        )
+
     answer = look_up(shopper_id)
 
     if not answer.reached:
+        lately.failures_in_a_row += 1
+
+        if lately.failures_in_a_row >= FAILURES_BEFORE_GIVING_UP:
+            lately.do_not_dial_before = now() + HOW_LONG_TO_GIVE_UP_FOR_SECONDS
+
         raise CacheUnreachable(f"connection refused to {endpoint}")
 
+    # It answered, so whatever was wrong with it is over - including a run of
+    # refusals that had not yet reached the point of giving up.
+    lately.failures_in_a_row = 0
+    lately.do_not_dial_before = 0.0
+
     return answer.summary_cents
+
+
+def forget_every_cache_failure() -> None:
+    """Drops what the shop remembers about every endpoint.
+
+    What a new process starts with anyway - the shop's own reset, for a
+    deployment that has fixed the endpoint and does not want to wait out a
+    cooldown, and for a test that wants the previous one's failures not to be
+    its own.
+    """
+    _HOW_EACH_ENDPOINT_HAS_BEEN_GOING.clear()
+</content>
