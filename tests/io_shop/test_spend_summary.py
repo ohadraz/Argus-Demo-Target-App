@@ -11,7 +11,9 @@ from io_shop.spend_summary import (
 """Io's account-page arithmetic - the lifetime figure and the monthly one.
 
 The monthly figure is newer and ships behind a rollout flag, so the cases below
-cover the shape the page has had for years plus the one the flag adds.
+cover the shape the page has had for years plus the one the flag adds. One of
+them covers what the figure *costs*, because the lifetime average is on every
+request and a correct figure worked out quadratically is still an incident.
 """
 
 
@@ -25,6 +27,28 @@ def an_account_with_no_purchases_this_month(*prices: int) -> Account:
         total_cents=sum(prices),
         total_this_month_cents=0,
     )
+
+
+class CountingPurchase:
+    """A purchase that remembers how often its price was read.
+
+    Stands in for a `Purchase` because the figure under test reads exactly one
+    field, and how many times it reads it is the whole difference between a
+    single pass over the history and a pass per purchase. Counting reads rather
+    than seconds is what makes the case about the shape of the code instead of
+    about the machine it ran on.
+    """
+
+    def __init__(self, price_cents: int, reads: list[int]) -> None:
+        self._price_cents = price_cents
+        self._reads = reads
+
+    in_current_month = False
+
+    @property
+    def price_cents(self) -> int:
+        self._reads[0] += 1
+        return self._price_cents
 
 
 def test_the_lifetime_average_spreads_the_total_over_every_purchase() -> None:
@@ -47,6 +71,23 @@ def test_the_lifetime_average_follows_the_purchases_not_the_carried_total() -> N
     )
 
     assert average_spend_per_item(an_account_whose_total_drifted) == 2000
+
+
+def test_the_lifetime_average_reads_each_purchase_a_bounded_number_of_times() -> None:
+    # The figure is on every account page render, flags on or off, so its cost
+    # is the shop's p50. Deriving it by re-summing the whole prefix once per
+    # purchase reads a five-hundred-purchase history 125,250 times and uses
+    # only the last of those sums; one pass reads it five hundred times.
+    reads = [0]
+    a_long_history = Account(
+        shopper_id="shopper-who-shops-a-lot",
+        purchases=tuple(CountingPurchase(1000, reads) for _ in range(500)),
+        total_cents=500_000,
+        total_this_month_cents=0,
+    )
+
+    assert average_spend_per_item(a_long_history) == 1000
+    assert reads[0] <= 2 * len(a_long_history.purchases)
 
 
 def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
