@@ -66,10 +66,37 @@ def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
     assert average_spend_per_item_this_month(an_active_shopper) == 3000
 
 
+def test_the_monthly_average_is_zero_for_a_shopper_who_has_not_bought_this_month(
+) -> None:
+    # The shape that took the account page down when the rollout flipped on:
+    # a shopper with a history but nothing in the current month, so there is
+    # nothing to divide by. Zero spent over no purchases is zero per item.
+    an_idle_shopper = an_account_with_no_purchases_this_month(1000, 3000)
+
+    assert average_spend_per_item_this_month(an_idle_shopper) == 0
+
+
+def test_the_monthly_average_is_zero_for_a_shopper_with_no_history_at_all() -> None:
+    a_shopper_who_never_bought_anything = Account(
+        shopper_id="shopper-with-no-history", purchases=(), total_cents=0,
+        total_this_month_cents=0
+    )
+
+    assert average_spend_per_item_this_month(a_shopper_who_never_bought_anything) == 0
+
+
 def test_the_page_takes_the_stable_summary_when_the_rollout_is_off() -> None:
     account = an_account_with_no_purchases_this_month(1000, 3000)
 
     assert render_spend_summary(account, use_monthly_summary=False) == 2000
+
+
+def test_the_page_renders_the_monthly_figure_for_an_idle_shopper() -> None:
+    # With the rollout on, the idle shopper's page renders a figure rather than
+    # failing - which is what the flag being on has to mean for everyone.
+    account = an_account_with_no_purchases_this_month(1000, 3000)
+
+    assert render_spend_summary(account, use_monthly_summary=True) == 0
 
 
 def test_the_page_lets_a_failure_reach_its_caller() -> None:
