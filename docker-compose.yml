@@ -177,13 +177,21 @@ services:
       # depends on anything listening there: an alert nobody accepts is reported
       # as undelivered and the staged incident carries on regardless.
       MONITORING_ALERT_WEBHOOK_URL: "http://host.docker.internal:8000/webhooks/alerts"
-      # One minute of settling, for the demo. The default is three, and three is
-      # what a real service should keep: the settling period exists to show the
-      # recovery *held*, and a single clean minute is as easily a lull as a fix.
-      # One is chosen here because a demo has an audience standing in front of
-      # it, and two more minutes of watching a flat graph cost more than the
-      # extra certainty buys.
-      SCENARIO_SETTLE_MINUTES: 1
+      # Three minutes of settling, which is the default and what a real service
+      # should keep: the settling period exists to show the recovery *held*, and
+      # a single clean minute is as easily a lull as a fix.
+      #
+      # It was one for a while, on the grounds that a demo has an audience
+      # standing in front of it and two more minutes of watching a flat graph
+      # cost more than the extra certainty buys. What that missed is that the
+      # same file serves the automated suite, and one settling minute freezes the
+      # window with exactly one minute after a revert. A verdict read off a
+      # single minute can only take the branch that asks whether *every* minute
+      # is still at the incident's level, so the rule's own tolerance for a lone
+      # noisy minute is unreachable - and polling for the whole verification
+      # window cannot change a frozen answer. One bad minute then refutes a
+      # mitigation that worked, which is what it did.
+      SCENARIO_SETTLE_MINUTES: 3
       # A second listener, on TLS, for clients that will not speak anything
       # else - PagerDuty's SDK refuses a base URL that is not `https://`. Same
       # process as the plain one, because everything this service knows about a
