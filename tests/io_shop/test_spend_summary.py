@@ -66,6 +66,24 @@ def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
     assert average_spend_per_item_this_month(an_active_shopper) == 3000
 
 
+def test_the_monthly_average_is_zero_for_a_shopper_who_has_not_bought_this_month(
+) -> None:
+    # The incident: an idle month leaves nothing to divide by, and the page was
+    # raising ZeroDivisionError for every such shopper the moment the rollout
+    # sent them down this path.
+    account = an_account_with_no_purchases_this_month(1000, 3000)
+
+    assert average_spend_per_item_this_month(account) == 0
+
+
+def test_the_page_renders_the_monthly_figure_for_an_idle_shopper() -> None:
+    # Through the rollout, the way a request arrives: flag on, history present,
+    # nothing bought this month.
+    account = an_account_with_no_purchases_this_month(1000, 3000)
+
+    assert render_spend_summary(account, use_monthly_summary=True) == 0
+
+
 def test_the_page_takes_the_stable_summary_when_the_rollout_is_off() -> None:
     account = an_account_with_no_purchases_this_month(1000, 3000)
 
