@@ -22,9 +22,10 @@ from io_shop.monthly_statement import (
 
 A safety net rather than a specification: the panel was written first and these
 cover what would be expensive to find out from a shopper. The one that matters
-most is the empty month, because that is the fault the
-`monthly-statement-panel` scenario stages, and a change that quietly made it
-stop raising would leave that scenario staging nothing at all.
+most is the empty month, because that is the shape that took the account page
+down when `monthly-spend-feature` was turned on - a shopper who bought nothing
+has no largest purchase, and the panel used to raise on them rather than say
+so.
 """
 
 MARCH = period_for(3, 2026)
@@ -70,12 +71,34 @@ def test_the_statement_takes_its_shape_from_this_month_alone() -> None:
     assert statement.smallest_cents == 1200
 
 
-def test_a_month_with_nothing_in_it_fails_rather_than_reporting_zero() -> None:
-    # The fault the `monthly-statement-panel` scenario stages. A statement
-    # reporting a made-up zero would be a panel nobody could trust on the
-    # months it can describe.
-    with pytest.raises(ValueError):
-        render_monthly_statement(a_shopper_who_bought_nothing_this_month(), MARCH)
+def test_a_month_with_nothing_in_it_renders_as_an_empty_month() -> None:
+    # The fault behind the incident: `max()` over no purchases raised
+    # ValueError, the page boundary turned it into a failed request, and the
+    # error rate was however many shoppers had a quiet month. An empty month is
+    # an ordinary month and the panel says so.
+    statement = render_monthly_statement(
+        a_shopper_who_bought_nothing_this_month(), MARCH
+    )
+
+    assert statement.purchase_count == 0
+    assert statement.headline_cents == 0
+    assert statement.biggest_cents == 0
+    assert statement.smallest_cents == 0
+    assert statement.mean_cents == 0
+
+
+def test_an_empty_month_holds_together_and_renders_every_way() -> None:
+    statement = render_monthly_statement(
+        a_shopper_who_bought_nothing_this_month(), MARCH
+    )
+
+    assert reconciles(statement)
+    assert problems_with(statement) == []
+    assert all(section.rows for section in statement_sections(statement))
+    assert as_plain_text(statement).startswith("MARCH 2026")
+    assert as_csv_rows(statement)[0] == STATEMENT_COLUMNS
+    assert as_html(statement).startswith('<section class="monthly-statement">')
+    assert describe_month(statement).endswith(".")
 
 
 def test_the_breakdowns_add_up_to_the_headline() -> None:
