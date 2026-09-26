@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from io_shop import visits
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
@@ -16,10 +17,10 @@ from io_shop.visits import (
 """What the account page keeps about the shoppers who have been by.
 
 The store itself is small and does what it says. What these pin down is the
-part that matters to an incident: it grows with every new shopper and shrinks
-for no reason at all, which is the shape of the fault the leak scenario is
-about - and that a new process starts empty, which is why restarting the shop
-is worth anything.
+part that matters to an incident: it grows with every new shopper *up to a
+bound* and then stops, which is the difference between a cache and a leak - and
+that a new process starts empty, which is why restarting the shop is worth
+anything.
 """
 
 
@@ -28,8 +29,7 @@ def a_shop_that_has_just_started() -> None:
     """Every case begins with an empty store.
 
     The store is module state, so without this each test would inherit
-    whatever the last one left - which is the bug under discussion, and a poor
-    thing to also have in the tests about it.
+    whatever the last one left.
     """
     forget_every_visit()
 
@@ -77,8 +77,6 @@ def test_the_newest_visit_is_the_one_kept() -> None:
 
 
 def test_every_new_shopper_adds_to_what_the_process_is_holding() -> None:
-    # The fault, stated plainly: what this holds is a function of how many
-    # different shoppers have been by, and nothing takes any of it away.
     for shopper in range(50):
         record_visit(f"shopper-{shopper}", "2000")
 
@@ -86,13 +84,46 @@ def test_every_new_shopper_adds_to_what_the_process_is_holding() -> None:
 
 
 def test_a_shopper_coming_back_adds_nothing() -> None:
-    # Worth pinning because it is what makes the climb track *traffic* rather
+    # Worth pinning because it is what makes the store track *shoppers* rather
     # than requests: a shop serving the same hundred shoppers all day holds a
-    # hundred entries, and one serving the internet holds the internet.
+    # hundred entries.
     for _ in range(50):
         record_visit("shopper-1", "2000")
 
     assert how_many_shoppers_are_remembered() == 1
+
+
+def test_what_the_process_holds_stops_growing_at_the_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The fault this file is about. Io has millions of registered shoppers, so
+    # a store with one entry per shopper ever seen is a heap that climbs all
+    # day under flat load and comes down only at a restart. Past the bound the
+    # store keeps taking new shoppers and stops taking more memory.
+    monkeypatch.setattr(visits, "_HOW_MANY_SHOPPERS_ARE_KEPT", 10)
+
+    for shopper in range(1000):
+        record_visit(f"shopper-{shopper}", "2000")
+
+    assert how_many_shoppers_are_remembered() == 10
+    assert what_they_saw_last_time("shopper-999") == "2000"
+    assert what_they_saw_last_time("shopper-0") is None
+
+
+def test_the_shopper_who_keeps_coming_back_is_not_the_one_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # What makes the bound cost nothing in practice: the entries given up are
+    # the ones nobody has asked for.
+    monkeypatch.setattr(visits, "_HOW_MANY_SHOPPERS_ARE_KEPT", 5)
+
+    record_visit("regular", "2000")
+
+    for shopper in range(20):
+        record_visit(f"passer-by-{shopper}", "3000")
+        assert what_they_saw_last_time("regular") == "2000"
+
+    assert what_they_saw_last_time("regular") == "2000"
 
 
 def test_serving_a_page_records_the_visit() -> None:
@@ -105,9 +136,9 @@ def test_serving_a_page_records_the_visit() -> None:
 
 
 def test_a_page_that_failed_is_a_visit_too() -> None:
-    # The shopper was here. A store that only grew on success would leave the
-    # shop leaking at a rate that depended on how well it was working, which is
-    # not how retained state behaves.
+    # The shopper was here. A store that only grew on success would behave
+    # differently depending on how well the shop was working, which is not how
+    # retained state behaves.
     serve_account_page(an_account("shopper-1"),
                        use_monthly_summary=False,
                        ask_the_provider=a_provider_holding_a_card(),
@@ -132,9 +163,7 @@ def test_serving_pages_to_many_shoppers_holds_one_entry_each() -> None:
 
 
 def test_a_restarted_shop_is_holding_nothing() -> None:
-    # What a new process starts with, and the whole of what a restart buys. The
-    # fault is still in the code when it comes back, which is why the climb
-    # begins again - but it begins from here.
+    # What a new process starts with, and what a restart buys.
     for shopper in range(20):
         record_visit(f"shopper-{shopper}", "2000")
 
