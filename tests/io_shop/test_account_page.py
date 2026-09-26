@@ -6,7 +6,12 @@ from io_shop import payment_provider, spend_summary
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
-from io_shop.pricing_service import AskThePricingService, PricingAnswer
+from io_shop.pricing_service import (
+    CONSECUTIVE_SLOW_CALLS_BEFORE_SHEDDING,
+    AskThePricingService,
+    PricingAnswer,
+    PricingCircuit,
+)
 from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
 
 """The shop's request boundary: what a caller sees when the page fails.
@@ -262,6 +267,7 @@ def test_a_page_carries_what_the_basket_comes_to() -> None:
 
     assert page.basket_total_cents == 8400
     assert page.pricing_delay is None
+    assert page.pricing_shed is None
 
 
 def test_a_slow_pricing_service_delays_the_page_without_failing_it() -> None:
@@ -271,7 +277,8 @@ def test_a_slow_pricing_service_delays_the_page_without_failing_it() -> None:
     page = serve_account_page(an_account_idle_this_month(1000, 3000),
                               use_monthly_summary=False,
                               ask_the_provider=a_provider_holding_a_card(),
-                              ask_the_pricing_service=a_slow_pricing_service())
+                              ask_the_pricing_service=a_slow_pricing_service(),
+                              pricing_circuit=PricingCircuit())
 
     assert page.failure is None
     assert page.figure_cents == 2000
@@ -288,3 +295,40 @@ def test_a_pricing_service_with_no_price_fails_the_page() -> None:
 
     assert page.failure is not None
     assert "pricing.io-internal.svc" in page.failure
+
+
+def test_a_pricing_service_that_stays_slow_stops_delaying_every_page() -> None:
+    # The incident, end to end. Every render waited 1500ms for a basket total
+    # because nothing here ever stopped asking, and the shop's own p50 went up
+    # thirtyfold for a dependency that was still answering correctly. Now the
+    # page comes back one panel short instead: figure, card and no failure.
+    account = an_account_idle_this_month(1000, 3000)
+    circuit = PricingCircuit()
+    calls: list[str] = []
+
+    def ask_the_pricing_service(shopper_id: str) -> PricingAnswer:
+        calls.append(shopper_id)
+
+        return PricingAnswer(total_cents=8400, took_ms=1500)
+
+    for _ in range(CONSECUTIVE_SLOW_CALLS_BEFORE_SHEDDING):
+        serve_account_page(account,
+                           use_monthly_summary=False,
+                           ask_the_provider=a_provider_holding_a_card(),
+                           ask_the_pricing_service=ask_the_pricing_service,
+                           pricing_circuit=circuit)
+
+    asked_before = len(calls)
+    page = serve_account_page(account,
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=ask_the_pricing_service,
+                              pricing_circuit=circuit)
+
+    assert len(calls) == asked_before
+    assert page.failure is None
+    assert page.figure_cents == 2000
+    assert page.card_last_four == "4242"
+    assert page.basket_total_cents is None
+    assert page.pricing_shed is not None
+    assert "pricing.io-internal.svc" in page.pricing_shed

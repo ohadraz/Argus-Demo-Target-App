@@ -13,18 +13,25 @@ host name settles it - `pricing.io-internal.svc` looks internal because somebody
 chose that spelling - which is why the fact is published in the service
 catalogue rather than left to be inferred here.
 
-The shop does not retry and does not price the basket itself when the service
-is slow. It waits, and it says how long it waited. A slow dependency is not this
-request's failure: the page is correct, the shopper is charged the right amount,
-and the only thing that changed is how long it took to say so.
+The shop does not retry and does not price the basket itself. What it does do is
+stop asking a service that has proved it is not answering in time: one call may
+wait, but a service that is slow for everybody would otherwise be slow for every
+render at once, and a page render holding a worker for a second and a half is
+how somebody else's slowdown becomes Io's outage. So a run of calls beyond
+`UNACCEPTABLE_CALL_MS` sheds the call for a cooldown - the page comes back
+without the basket panel and says so, which costs one panel instead of every
+page.
 
 How the service is reached is the caller's to supply, for the reason the payment
 provider's is: the shop is rendered many times over to produce a minute of
-telemetry, and a socket per render would be thousands of them per read.
+telemetry, and a socket per render would be thousands of them per read. The
+clock is a seam for the same reason a cooldown has to be testable without
+waiting out a cooldown.
 """
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final
@@ -44,6 +51,22 @@ BASKET_PATH: Final = "/v1/shoppers/{shopper_id}/basket-total"
 # in its own logs, and a service that has never been near this number is one
 # nobody writes a line about.
 SLOW_CALL_MS: Final = 200
+
+# How long a call may take before the shop counts it against the service rather
+# than merely remarking on it. Well clear of anything a healthy day produces, so
+# an ordinary slow afternoon never sheds anything: this is the number that says
+# "that call did not arrive in time to be worth having made".
+UNACCEPTABLE_CALL_MS: Final = 1000
+
+# How many unacceptable calls in a row before the shop stops asking. More than
+# one, because a single slow call is noise and a page that gave up on the first
+# one would lose the panel over nothing.
+CONSECUTIVE_SLOW_CALLS_BEFORE_SHEDDING: Final = 3
+
+# How long the shop goes without asking once it has stopped. Long enough that a
+# service in trouble is not being asked by every render, short enough that a
+# service that recovers is serving panels again within a minute.
+SHEDDING_SECONDS: Final = 30.0
 
 
 @dataclass(frozen=True)
@@ -66,15 +89,23 @@ class PricingAnswer:
 class PricedBasket:
     """A priced basket, and the words for a call that was worth remarking on.
 
+    `total_cents` is `None` only where the call was not made at all - see
+    `shed_call`. A call that was made and answered carries its price.
+
     `slow_call` is `None` on a call that came back in the time it always does,
     and is a sentence naming the service, the path and the milliseconds when it
     did not. It sits here rather than being raised, because a slow answer is
     still an answer - the same shape as `RenderedPage.cache_failure`, which
     reports something broken underneath a page that rendered perfectly well.
+
+    `shed_call` is the words for a call the shop declined to make, because the
+    service has been answering too slowly to be worth waiting for. Also beside
+    rather than raised: the page is still served, one panel lighter.
     """
 
-    total_cents: int
+    total_cents: int | None
     slow_call: str | None = None
+    shed_call: str | None = None
 
 
 class PricingServiceFailed(Exception):
@@ -91,8 +122,69 @@ class PricingServiceFailed(Exception):
 # How the pricing service is reached, given a shopper.
 type AskThePricingService = Callable[[str], PricingAnswer]
 
+# What time it is, in seconds that only go forwards. A seam so that a cooldown
+# can be tested without living through one.
+type Clock = Callable[[], float]
 
-def basket_total(shopper_id: str, ask: AskThePricingService) -> PricedBasket:
+
+class PricingCircuit:
+    """What the shop has learned about the pricing service's timekeeping.
+
+    One of these outlives a request, because that is the only place the fact
+    lives: no single render can tell a slow call from a slow service, and the
+    difference between the two is the whole of this incident. Consecutive calls
+    beyond `UNACCEPTABLE_CALL_MS` are what say the service itself is in trouble;
+    any acceptable answer says it is not, and clears the count.
+
+    Not thread-safe in the strict sense, and deliberately not made so: the worst
+    a racing update can do is shed one call too few or too many, and a lock on
+    the request path to protect a counter would cost more than it saves.
+    """
+
+    def __init__(self, now: Clock = time.monotonic) -> None:
+        self._now = now
+        self._consecutive_slow = 0
+        self._shedding_until: float | None = None
+
+    def is_shedding(self) -> bool:
+        """Whether the shop is currently declining to call the service.
+
+        Asking also ends a cooldown that has run out, and lets exactly one call
+        through to find out whether anything has changed. That probe is left one
+        strike short of shedding, so a service that is still slow is shed again
+        on its own evidence rather than after another full run of slow calls.
+        """
+        if self._shedding_until is None:
+            return False
+
+        if self._now() < self._shedding_until:
+            return True
+
+        self._shedding_until = None
+        self._consecutive_slow = CONSECUTIVE_SLOW_CALLS_BEFORE_SHEDDING - 1
+
+        return False
+
+    def record(self, took_ms: int) -> None:
+        """What one answered call says about the service.
+
+        Only the duration, because only the duration is this circuit's business.
+        A service answering promptly with no price is a different fault, it
+        fails its page loudly, and shedding calls to it would hide it.
+        """
+        if took_ms < UNACCEPTABLE_CALL_MS:
+            self._consecutive_slow = 0
+            return
+
+        self._consecutive_slow += 1
+
+        if self._consecutive_slow >= CONSECUTIVE_SLOW_CALLS_BEFORE_SHEDDING:
+            self._shedding_until = self._now() + SHEDDING_SECONDS
+
+
+def basket_total(shopper_id: str,
+                 ask: AskThePricingService,
+                 circuit: PricingCircuit | None = None) -> PricedBasket:
     """What this shopper's basket comes to, and what the call cost to make.
 
     Raises `PricingServiceFailed` for anything that is not a price. A slow price
@@ -104,8 +196,21 @@ def basket_total(shopper_id: str, ask: AskThePricingService) -> PricedBasket:
     "account page took 1900ms" describes every slow incident equally, and leaves
     a reader to guess which of the shop's own lines was the slow one - when in
     fact none of them was.
+
+    Where a `circuit` says the service has been answering too slowly to wait
+    for, no call is made at all: the basket comes back without a total and with
+    the words for why. Passing no circuit means every call is made, which is the
+    behaviour a caller gets who has nowhere to keep what it learned.
     """
+    if circuit is not None and circuit.is_shedding():
+        return PricedBasket(
+            total_cents=None, shed_call=_shed_call_words(shopper_id)
+        )
+
     answer = ask(shopper_id)
+
+    if circuit is not None:
+        circuit.record(answer.took_ms)
 
     if answer.total_cents is None:
         raise PricingServiceFailed(
@@ -133,4 +238,19 @@ def _slow_call_words(shopper_id: str, took_ms: int) -> str | None:
     return (
         f"{PRICING_HOST} took {took_ms}ms for "
         f"{BASKET_PATH.format(shopper_id=shopper_id)}"
+    )
+
+
+def _shed_call_words(shopper_id: str) -> str:
+    """What to say about a call the shop did not make.
+
+    Names the service, the path and the rule that stopped the call, so a reader
+    sees that the missing panel is the shop protecting itself from a named
+    dependency rather than the shop failing to price a basket.
+    """
+    return (
+        f"not calling {PRICING_HOST} for "
+        f"{BASKET_PATH.format(shopper_id=shopper_id)}: "
+        f"{CONSECUTIVE_SLOW_CALLS_BEFORE_SHEDDING} consecutive calls took "
+        f"{UNACCEPTABLE_CALL_MS}ms or more"
     )

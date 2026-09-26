@@ -6,6 +6,9 @@ shop's own words, and turned into a failed response. It is the only place in the
 shop that catches broadly, and it does so on purpose - a request handler that let
 an unexpected error escape would take the worker with it instead of reporting a
 rate somebody can alert on.
+
+It is also where what the shop has learned about the pricing service lives,
+because no single render can learn it: see `_THE_PRICING_CIRCUIT`.
 """
 
 from __future__ import annotations
@@ -21,7 +24,11 @@ from io_shop.monthly_statement import (
     render_monthly_statement,
 )
 from io_shop.payment_provider import AskTheProvider, card_on_file
-from io_shop.pricing_service import AskThePricingService, basket_total
+from io_shop.pricing_service import (
+    AskThePricingService,
+    PricingCircuit,
+    basket_total,
+)
 from io_shop.spend_summary import render_spend_summary
 from io_shop.summary_cache import (
     CacheEndpoint,
@@ -30,6 +37,14 @@ from io_shop.summary_cache import (
     cached_summary,
 )
 from io_shop.visits import record_visit
+
+
+# What the shop has learned about the pricing service, for callers with nowhere
+# of their own to keep it. It lives at the boundary because that is the only
+# thing here that sees more than one request: a slow call and a slow service
+# look identical from inside a single render, and telling them apart is what
+# stops a dependency's bad minute from being spent again by every page.
+_THE_PRICING_CIRCUIT = PricingCircuit()
 
 
 @dataclass(frozen=True)
@@ -64,6 +79,12 @@ class RenderedPage:
     page was correct and the shopper was charged the right amount; what a reader
     gets from this line is where the request's time went, which is the one thing
     no amount of the shop's own telemetry can say.
+
+    `pricing_shed` is the words of a pricing call the shop declined to make at
+    all, because the service had been answering too slowly to wait for. The page
+    then carries no `basket_total_cents`: one panel short and served promptly,
+    which is the trade a request path makes with a dependency that has stopped
+    keeping time.
     """
 
     figure_cents: int | None
@@ -74,6 +95,7 @@ class RenderedPage:
     statement: MonthlyStatement | None = None
     basket_total_cents: int | None = None
     pricing_delay: str | None = None
+    pricing_shed: str | None = None
 
 
 def serve_account_page(account: Account,
@@ -84,7 +106,8 @@ def serve_account_page(account: Account,
                        cache_endpoint: CacheEndpoint | None = None,
                        use_typical_spend: bool = False,
                        use_monthly_statement: bool = False,
-                       statement_period: StatementPeriod | None = None
+                       statement_period: StatementPeriod | None = None,
+                       pricing_circuit: PricingCircuit | None = None
                        ) -> RenderedPage:
     """Renders the account page, reporting a failure rather than raising one.
 
@@ -98,7 +121,10 @@ def serve_account_page(account: Account,
     The two are not the same kind of neighbour, and nothing in this function
     tells them apart: one is another team's service and one is another company's,
     and which is which is published in the service catalogue rather than
-    inferred from a host name.
+    inferred from a host name. What does differ is what the page can do without:
+    there is no page without the card, and there is a page - one panel lighter -
+    without the basket total. So the pricing call is the one the shop is allowed
+    to stop making when the service stops answering in time.
 
     `use_monthly_summary` and `use_typical_spend` are the rollout decisions
     already made - whether this request is one of the ones each new figure is
@@ -118,7 +144,13 @@ def serve_account_page(account: Account,
     request is asking about, which the page is told rather than deriving: the
     shop's purchase records carry a month flag and no date, so the only thing
     here that knows the calendar is whoever handled the request.
+
+    `pricing_circuit` is what the shop has learned about the pricing service's
+    timekeeping, for a caller that keeps its own - a test, or a process serving
+    more than one shop. A caller that passes none shares the boundary's.
     """
+    circuit = pricing_circuit if pricing_circuit is not None else _THE_PRICING_CIRCUIT
+
     try:
         figure_cents, from_cache, cache_failure = _the_figure_for(
             account, use_monthly_summary, look_up_summary, cache_endpoint,
@@ -127,7 +159,7 @@ def serve_account_page(account: Account,
         statement = _the_statement_for(
             account, use_monthly_statement, statement_period
         )
-        basket = basket_total(account.shopper_id, ask_the_pricing_service)
+        basket = basket_total(account.shopper_id, ask_the_pricing_service, circuit)
         card = card_on_file(account.shopper_id, ask_the_provider)
     except Exception as error:  # noqa: BLE001 - the boundary records anything
         failure = f"{type(error).__name__}: {error} at {_where_it_was_raised(error)}"
@@ -144,7 +176,8 @@ def serve_account_page(account: Account,
                         cache_failure=cache_failure,
                         statement=statement,
                         basket_total_cents=basket.total_cents,
-                        pricing_delay=basket.slow_call)
+                        pricing_delay=basket.slow_call,
+                        pricing_shed=basket.shed_call)
 
 
 def _the_statement_for(account: Account,
