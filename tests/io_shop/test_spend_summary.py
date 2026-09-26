@@ -27,6 +27,24 @@ def an_account_with_no_purchases_this_month(*prices: int) -> Account:
     )
 
 
+class CountedPrice:
+    """A purchase that records how often its price is read.
+
+    The lifetime figure has to read every price once. Reading any of them again
+    is the O(n^2) shape that made the account page time out.
+    """
+
+    def __init__(self, price_cents: int, reads: list[int]) -> None:
+        self._price_cents = price_cents
+        self._reads = reads
+        self.in_current_month = False
+
+    @property
+    def price_cents(self) -> int:
+        self._reads[0] += 1
+        return self._price_cents
+
+
 def test_the_lifetime_average_spreads_the_total_over_every_purchase() -> None:
     account = an_account_with_no_purchases_this_month(1000, 2000, 3000)
 
@@ -47,6 +65,21 @@ def test_the_lifetime_average_follows_the_purchases_not_the_carried_total() -> N
     )
 
     assert average_spend_per_item(an_account_whose_total_drifted) == 2000
+
+
+def test_the_lifetime_average_reads_each_purchase_once() -> None:
+    # A shopper with a real history. The work the page does has to grow with
+    # the history, not with its square.
+    reads = [0]
+    a_shopper_with_a_long_history = Account(
+        shopper_id="shopper-who-buys-a-lot",
+        purchases=tuple(CountedPrice(1000, reads) for _ in range(200)),
+        total_cents=200_000,
+        total_this_month_cents=0,
+    )
+
+    assert average_spend_per_item(a_shopper_with_a_long_history) == 1000
+    assert reads[0] == 200
 
 
 def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
