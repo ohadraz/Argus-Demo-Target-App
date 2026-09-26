@@ -66,6 +66,23 @@ def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
     assert average_spend_per_item_this_month(an_active_shopper) == 3000
 
 
+def test_the_monthly_average_is_zero_for_a_shopper_who_did_not_buy() -> None:
+    # The case that took the account page down when the rollout flag went on: a
+    # shopper with years of history and nothing in the current month. There is
+    # nothing spent and nothing to spread it over, so the figure is zero rather
+    # than a division by an empty count.
+    account = an_account_with_no_purchases_this_month(1000, 2000, 3000)
+
+    assert average_spend_per_item_this_month(account) == 0
+
+
+def test_the_page_renders_for_an_idle_shopper_with_the_rollout_on() -> None:
+    # The same shopper through the flag the rollout actually flips.
+    account = an_account_with_no_purchases_this_month(1000, 2000, 3000)
+
+    assert render_spend_summary(account, use_monthly_summary=True) == 0
+
+
 def test_the_page_takes_the_stable_summary_when_the_rollout_is_off() -> None:
     account = an_account_with_no_purchases_this_month(1000, 3000)
 
