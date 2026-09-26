@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
+
+import pytest
 
 from io_shop import payment_provider, spend_summary
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
 from io_shop.pricing_service import AskThePricingService, PricingAnswer
-from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
+from io_shop.summary_cache import (
+    CacheAnswer,
+    CacheEndpoint,
+    LookUpSummary,
+    dial_every_cache_again,
+)
 
 """The shop's request boundary: what a caller sees when the page fails.
 
@@ -16,6 +24,18 @@ that let it escape would take the worker down - the report keeps the error's own
 words, which are what a reader diagnoses from, and a payment provider that will
 not answer fails the page in words that name the provider rather than the shop.
 """
+
+
+@pytest.fixture(autouse=True)
+def _forget_remembered_refusals() -> Iterator[None]:
+    """A fresh neighbourhood for every test.
+
+    The cache's refusal memory is process-wide, so a test that reaches an
+    unreachable cache would otherwise decide whether the next one dials at all.
+    """
+    dial_every_cache_again()
+    yield
+    dial_every_cache_again()
 
 
 def a_provider_holding_a_card() -> AskTheProvider:
@@ -252,6 +272,36 @@ def test_an_unreachable_cache_is_reported_beside_the_failure_not_in_it() -> None
     assert page.failure is None
     assert page.cache_failure is not None
     assert "6379" in page.cache_failure
+
+
+def test_a_refused_cache_is_not_dialled_by_every_page() -> None:
+    # The incident as the page sees it: two hundred renders, every one of them
+    # correct, and the only thing that went wrong was that every one of them
+    # paid to be refused. Counting the dials is the only assertion that can
+    # tell the fixed shop from the one that stalled.
+    dials = 0
+
+    def a_refusing_cache(dont_care_shopper: str) -> CacheAnswer:
+        nonlocal dials
+        dials += 1
+
+        return CacheAnswer(reached=False)
+
+    for _ in range(200):
+        page = serve_account_page(
+            an_account_idle_this_month(1000, 3000),
+            use_monthly_summary=False,
+            ask_the_provider=a_provider_holding_a_card(),
+            ask_the_pricing_service=a_prompt_pricing_service(),
+            look_up_summary=a_refusing_cache,
+            cache_endpoint=SOME_CACHE_ENDPOINT
+        )
+
+        assert page.failure is None
+        assert page.figure_cents == 2000
+        assert page.cache_failure is not None
+
+    assert dials == 1
 
 
 def test_a_page_carries_what_the_basket_comes_to() -> None:
