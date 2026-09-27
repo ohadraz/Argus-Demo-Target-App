@@ -64,6 +64,11 @@ class RenderedPage:
     page was correct and the shopper was charged the right amount; what a reader
     gets from this line is where the request's time went, which is the one thing
     no amount of the shop's own telemetry can say.
+
+    `pricing_unavailable` is what the page says when the shop stopped waiting
+    for that call: `basket_total_cents` is absent, everything else is there, and
+    the words name the service and the budget. A missing panel is the price of
+    not letting one dependency's latency become every request's.
     """
 
     figure_cents: int | None
@@ -74,6 +79,7 @@ class RenderedPage:
     statement: MonthlyStatement | None = None
     basket_total_cents: int | None = None
     pricing_delay: str | None = None
+    pricing_unavailable: str | None = None
 
 
 def serve_account_page(account: Account,
@@ -98,7 +104,10 @@ def serve_account_page(account: Account,
     The two are not the same kind of neighbour, and nothing in this function
     tells them apart: one is another team's service and one is another company's,
     and which is which is published in the service catalogue rather than
-    inferred from a host name.
+    inferred from a host name. What the page does do is put a limit on the
+    pricing call - see `io_shop.pricing_service.PRICING_DEADLINE_MS` - so that a
+    service answering slowly costs this request a bounded amount and costs the
+    shopper one panel rather than the page.
 
     `use_monthly_summary` and `use_typical_spend` are the rollout decisions
     already made - whether this request is one of the ones each new figure is
@@ -144,7 +153,8 @@ def serve_account_page(account: Account,
                         cache_failure=cache_failure,
                         statement=statement,
                         basket_total_cents=basket.total_cents,
-                        pricing_delay=basket.slow_call)
+                        pricing_delay=basket.slow_call,
+                        pricing_unavailable=basket.unavailable)
 
 
 def _the_statement_for(account: Account,

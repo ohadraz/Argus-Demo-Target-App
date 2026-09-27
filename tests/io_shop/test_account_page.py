@@ -6,15 +6,21 @@ from io_shop import payment_provider, spend_summary
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
-from io_shop.pricing_service import AskThePricingService, PricingAnswer
+from io_shop.pricing_service import (
+    PRICING_DEADLINE_MS,
+    AskThePricingService,
+    PricingAnswer,
+)
 from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
 
 """The shop's request boundary: what a caller sees when the page fails.
 
-Three things worth pinning: a failure is reported rather than raised - a handler
+Four things worth pinning: a failure is reported rather than raised - a handler
 that let it escape would take the worker down - the report keeps the error's own
-words, which are what a reader diagnoses from, and a payment provider that will
-not answer fails the page in words that name the provider rather than the shop.
+words, which are what a reader diagnoses from, a payment provider that will not
+answer fails the page in words that name the provider rather than the shop, and
+a pricing service that cannot answer inside the shop's budget costs the page one
+panel rather than the whole request's time.
 """
 
 
@@ -30,22 +36,35 @@ def a_provider_that_is_down() -> AskTheProvider:
 
 def a_prompt_pricing_service() -> AskThePricingService:
     """A pricing service behaving itself, which is what every test here wants
-    from it except the two that are about it.
+    from it except the ones that are about it.
 
     Well under the threshold the shop remarks on, so a page served through this
     reports no delay at all.
     """
-    return lambda dont_care_shopper: PricingAnswer(total_cents=8400, took_ms=12)
+    return lambda dont_care_shopper, dont_care_deadline: PricingAnswer(
+        total_cents=8400, took_ms=12
+    )
 
 
-def a_slow_pricing_service(took_ms: int = 1500) -> AskThePricingService:
-    return lambda dont_care_shopper: PricingAnswer(
+def a_slow_pricing_service(took_ms: int = 400) -> AskThePricingService:
+    """Slow enough to be remarked on, still inside the budget - so it answers."""
+    return lambda dont_care_shopper, dont_care_deadline: PricingAnswer(
         total_cents=8400, took_ms=took_ms
     )
 
 
+def a_pricing_service_that_never_answers_in_time() -> AskThePricingService:
+    """A transport honouring the deadline it was handed: the budget is spent,
+    the call is given up, and no price comes back."""
+    return lambda dont_care_shopper, deadline_ms: PricingAnswer(
+        total_cents=None, took_ms=deadline_ms
+    )
+
+
 def a_pricing_service_with_no_price() -> AskThePricingService:
-    return lambda dont_care_shopper: PricingAnswer(total_cents=None, took_ms=8)
+    return lambda dont_care_shopper, dont_care_deadline: PricingAnswer(
+        total_cents=None, took_ms=8
+    )
 
 
 def an_account_idle_this_month(*prices: int) -> Account:
@@ -262,12 +281,12 @@ def test_a_page_carries_what_the_basket_comes_to() -> None:
 
     assert page.basket_total_cents == 8400
     assert page.pricing_delay is None
+    assert page.pricing_unavailable is None
 
 
 def test_a_slow_pricing_service_delays_the_page_without_failing_it() -> None:
-    # The whole scenario rests on this, exactly as the cache's rests on the
-    # fallback: the page is correct, the shopper is charged the right amount,
-    # and the only trace is a line nobody is paged for.
+    # Slow but inside the budget: the page is correct, the shopper is charged
+    # the right amount, and the only trace is a line nobody is paged for.
     page = serve_account_page(an_account_idle_this_month(1000, 3000),
                               use_monthly_summary=False,
                               ask_the_provider=a_provider_holding_a_card(),
@@ -278,6 +297,42 @@ def test_a_slow_pricing_service_delays_the_page_without_failing_it() -> None:
     assert page.basket_total_cents == 8400
     assert page.pricing_delay is not None
     assert payment_provider.PROVIDER_HOST not in page.pricing_delay
+
+
+def test_the_page_hands_the_pricing_service_a_deadline() -> None:
+    # Without one, a dependency that answers in 1500ms makes every render take
+    # 1500ms, which is the incident. The budget is what bounds it.
+    handed: list[int] = []
+
+    def ask(dont_care_shopper: str, deadline_ms: int) -> PricingAnswer:
+        handed.append(deadline_ms)
+
+        return PricingAnswer(total_cents=8400, took_ms=12)
+
+    serve_account_page(an_account_idle_this_month(1000, 3000),
+                       use_monthly_summary=False,
+                       ask_the_provider=a_provider_holding_a_card(),
+                       ask_the_pricing_service=ask)
+
+    assert handed == [PRICING_DEADLINE_MS]
+
+
+def test_a_pricing_service_that_never_answers_in_time_does_not_fail_the_page() -> None:
+    # One panel, not the page and not the request's whole time. The shopper
+    # loses the basket total; a reader gets the reason in the logs.
+    page = serve_account_page(
+        an_account_idle_this_month(1000, 3000),
+        use_monthly_summary=False,
+        ask_the_provider=a_provider_holding_a_card(),
+        ask_the_pricing_service=a_pricing_service_that_never_answers_in_time()
+    )
+
+    assert page.failure is None
+    assert page.figure_cents == 2000
+    assert page.card_last_four == "4242"
+    assert page.basket_total_cents is None
+    assert page.pricing_unavailable is not None
+    assert "pricing.io-internal.svc" in page.pricing_unavailable
 
 
 def test_a_pricing_service_with_no_price_fails_the_page() -> None:
