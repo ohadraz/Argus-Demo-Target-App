@@ -8,13 +8,17 @@ from io_shop.pricing_service import PRICING_HOST
 from io_shop.summary_cache import CacheEndpoint
 from target_app.generator import (
     BASELINE_MEMORY_BYTES,
+    CORES_PER_REPLICA,
     LEAK_CLIMB_BYTES_PER_MINUTE,
     MEMORY_LIMIT_BYTES,
     CacheOutage,
+    Capacity,
+    DemandSurge,
     FlagTimeline,
     GeneratedMinute,
     PricingSlowdown,
     ProviderOutage,
+    Scaling,
     SlowDeployment,
     SlowRollout,
     generate,
@@ -1327,3 +1331,181 @@ def test_restarting_the_pricing_service_brings_the_quantiles_back() -> None:
 
     assert waiting.p50_ms > calm.p50_ms * 5
     assert after.p50_ms < waiting.p50_ms / 5
+
+
+def a_window_with_the_traffic_surging(
+    began_minutes_ago: int,
+    scaled_to: int | None = None,
+    scaled_minutes_ago: int | None = None,
+    sized_for: int = 3,
+) -> list[GeneratedMinute]:
+    """A shop whose traffic has been climbing since then.
+
+    No cache configured, for the reason the slow deployment's window and the slow
+    pricing service's configure none: a queue for a core is paid by every request
+    whichever path its figure took, and the baseline quantile model is what
+    carries a multiplier at all.
+    """
+    scalings = (
+        (Scaling(at=SOME_NOW - timedelta(minutes=scaled_minutes_ago), replicas=scaled_to),)
+        if scaled_to is not None and scaled_minutes_ago is not None
+        else ()
+    )
+
+    return generate(
+        None,
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="dont-care-flag",
+        demand_surge=DemandSurge(began_at=SOME_NOW - timedelta(minutes=began_minutes_ago)),
+        capacity=Capacity(sized_for=sized_for, scalings=scalings),
+    )
+
+
+def test_a_quiet_shop_reports_a_quarter_of_its_capacity() -> None:
+    # A baseline nobody can see is not a baseline: the series has to have been
+    # quiet somewhere for anything to be said to have departed from it.
+    minutes = generate(None, SOME_NOW, SOME_SPAN_MINUTES, flag="dont-care-flag")
+
+    minute = minute_at(3, minutes)
+
+    assert minute.cpu_limit_cores == 3 * CORES_PER_REPLICA
+    assert 0.6 < minute.cpu_used_cores < 1.0
+
+
+def test_a_quiet_shops_utilisation_wobbles_without_pinning() -> None:
+    minutes = generate(None, SOME_NOW, SOME_SPAN_MINUTES, flag="dont-care-flag")
+
+    used = {minute.cpu_used_cores for minute in minutes}
+
+    assert len(used) > 1
+    assert all(figure < 3 * CORES_PER_REPLICA for figure in used)
+
+
+def test_a_surge_climbs_the_reported_volume_and_then_holds() -> None:
+    minutes = a_window_with_the_traffic_surging(began_minutes_ago=15)
+
+    before = minute_at(16, minutes)
+    climbing = minute_at(11, minutes)
+    held = minute_at(2, minutes)
+
+    assert before.request_volume < climbing.request_volume < held.request_volume
+    assert held.request_volume == minute_at(4, minutes).request_volume
+
+
+def test_a_saturated_shop_reports_usage_pinned_at_its_capacity() -> None:
+    minutes = a_window_with_the_traffic_surging(began_minutes_ago=15)
+
+    minute = minute_at(2, minutes)
+
+    assert minute.cpu_used_cores == minute.cpu_limit_cores
+
+
+def test_two_saturated_minutes_are_separated_by_latency_and_not_by_the_gauge() -> None:
+    # The gauge clamps and the demand behind it does not, which is what keeps a
+    # shop at four times its capacity distinguishable from one just over it.
+    just_over = a_window_with_the_traffic_surging(began_minutes_ago=15, sized_for=3)
+    far_over = a_window_with_the_traffic_surging(began_minutes_ago=15, sized_for=1)
+
+    tight = minute_at(2, just_over)
+    swamped = minute_at(2, far_over)
+
+    assert tight.cpu_used_cores == tight.cpu_limit_cores
+    assert swamped.cpu_used_cores == swamped.cpu_limit_cores
+    assert swamped.p50_ms > tight.p50_ms * 2
+
+
+def test_a_surge_moves_every_quantile_together() -> None:
+    minutes = a_window_with_the_traffic_surging(began_minutes_ago=15)
+
+    calm = minute_at(16, minutes)
+    saturated = minute_at(2, minutes)
+
+    assert saturated.p50_ms > calm.p50_ms * 5
+    assert saturated.p95_ms > calm.p95_ms * 5
+    assert saturated.p99_ms > calm.p99_ms * 5
+
+
+def test_a_surge_fails_no_request_and_eats_no_memory() -> None:
+    # Errors are the leak's late signal and a climbing heap is the leak's signal
+    # entirely. Borrowing either would blur the one distinction this scenario is
+    # for.
+    minutes = a_window_with_the_traffic_surging(began_minutes_ago=15)
+
+    saturated = minute_at(2, minutes)
+
+    assert saturated.error_rate < CLEARLY_HEALTHY
+    assert saturated.memory_used_bytes < BASELINE_MEMORY_BYTES * 1.1
+
+
+def test_scaling_out_brings_the_quantiles_back() -> None:
+    # Begun far enough back that the ramp has finished before the resize: a minute
+    # halfway up the climb is busy rather than saturated, which is a different
+    # claim from the one this case is making.
+    minutes = a_window_with_the_traffic_surging(
+        began_minutes_ago=18, scaled_to=6, scaled_minutes_ago=5
+    )
+
+    calm = minute_at(19, minutes)
+    saturated = minute_at(8, minutes)
+    after = minute_at(2, minutes)
+
+    assert saturated.p50_ms > calm.p50_ms * 5
+    assert after.p50_ms < saturated.p50_ms / 5
+    assert after.cpu_limit_cores == 6 * CORES_PER_REPLICA
+    assert after.cpu_used_cores < after.cpu_limit_cores
+
+
+def test_scaling_out_leaves_the_minutes_already_served_where_they_were() -> None:
+    # The whole reason capacity is a history: a count that moved would regenerate
+    # the saturated minutes at the size the deployment reached afterwards, and the
+    # stretch a mitigation wants to be judged against would vanish the moment it
+    # was performed.
+    saturated = a_window_with_the_traffic_surging(began_minutes_ago=18)
+    scaled = a_window_with_the_traffic_surging(
+        began_minutes_ago=18, scaled_to=6, scaled_minutes_ago=5
+    )
+
+    before = minute_at(8, saturated)
+    same_minute = minute_at(8, scaled)
+
+    assert same_minute.cpu_limit_cores == before.cpu_limit_cores
+    assert same_minute.p50_ms == before.p50_ms
+
+
+def test_putting_the_count_back_returns_the_shop_to_saturation() -> None:
+    minutes = generate(
+        None,
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="dont-care-flag",
+        demand_surge=DemandSurge(began_at=SOME_NOW - timedelta(minutes=15)),
+        capacity=Capacity(
+            sized_for=3,
+            scalings=(
+                Scaling(at=SOME_NOW - timedelta(minutes=8), replicas=6),
+                Scaling(at=SOME_NOW - timedelta(minutes=3), replicas=3),
+            ),
+        ),
+    )
+
+    relieved = minute_at(5, minutes)
+    saturated_again = minute_at(1, minutes)
+
+    assert relieved.cpu_limit_cores == 6 * CORES_PER_REPLICA
+    assert saturated_again.cpu_limit_cores == 3 * CORES_PER_REPLICA
+    assert saturated_again.p50_ms > relieved.p50_ms * 5
+
+
+def test_capacity_reports_the_size_in_force_during_a_minute() -> None:
+    capacity = Capacity(
+        sized_for=3,
+        scalings=(Scaling(at=SOME_NOW - timedelta(minutes=5), replicas=6),),
+    )
+
+    assert capacity.replicas_during(SOME_NOW - timedelta(minutes=6)) == 3
+    assert capacity.replicas_during(SOME_NOW) == 6
+
+
+def test_a_deployment_nobody_has_scaled_is_the_size_it_is_configured_for() -> None:
+    assert Capacity(sized_for=3).replicas_during(SOME_NOW) == 3

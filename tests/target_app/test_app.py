@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime, timedelta
@@ -15,17 +16,25 @@ from io_shop.visits import (
     record_visit,
 )
 from target_app import app as app_module
-from target_app.app import GENERATED_SPAN_MINUTES, RESTART_ACTION, app
+from target_app.app import (
+    GENERATED_SPAN_MINUTES,
+    REPLICAS_PARAMETER,
+    RESTART_ACTION,
+    SCALE_ACTION,
+    app,
+)
 from target_app.flags import FlagClient
 from target_app.generator import BASELINE_MEMORY_BYTES, SETTLED_UPTIME
 from target_app.scenarios import (
     CACHE_MISCONFIGURED,
+    CPU_SATURATION,
     MONTHLY_STATEMENT_PANEL,
     PRICING_SERVICE_DEGRADED,
     RESOURCE_LEAK,
     SLOW_CANARY_ROLLOUT,
     UPSTREAM_DEPENDENCY_FAILURE,
 )
+from target_app.settings import the_deployed_replica_count
 from target_app.state import ScenarioState
 
 """The service's own endpoints, asked the way anybody actually asks them.
@@ -722,6 +731,103 @@ def test_a_slow_dependency_says_in_the_logs_where_the_time_went(
     assert all("WARN" in line for line in named)
 
 
+def the_replicas_of(client: TestClient, application: str) -> int:
+    """How many replicas the platform says that application is running.
+
+    Through the manifest, because that is how the endpoint answers: a string the
+    caller parses, which is Argo CD's own shape and therefore the work a real
+    adapter has to do.
+    """
+    resource = client.get(f"/argocd/{application}/resource")
+
+    assert resource.status_code == 200
+
+    return int(json.loads(resource.json()["manifest"])["spec"]["replicas"])
+
+
+def scaled(client: TestClient, application: str, replicas: str) -> Response:
+    return client.post(
+        f"/argocd/{application}/resource/actions/v2",
+        json={
+            "action": SCALE_ACTION,
+            "resourceActionParameters": [
+                {"name": REPLICAS_PARAMETER, "value": replicas}
+            ],
+        },
+    )
+
+
+def test_the_deployment_starts_at_the_count_its_values_file_asks_for(
+    client: TestClient
+) -> None:
+    assert the_replicas_of(client, "io-shop") == the_deployed_replica_count()
+
+
+def test_scaling_through_the_platform_changes_what_is_running(
+    client: TestClient
+) -> None:
+    assert scaled(client, "io-shop", "6").status_code == 200
+    assert the_replicas_of(client, "io-shop") == 6
+
+
+def test_what_is_running_stops_agreeing_with_the_repository(
+    client: TestClient
+) -> None:
+    # The whole reason the count is read from the platform rather than the values
+    # file: after one scale-out they are different numbers, and a caller
+    # recording the count it replaced needs the one in force.
+    scaled(client, "io-shop", "6")
+
+    assert the_deployed_replica_count() == 3
+    assert the_replicas_of(client, "io-shop") == 6
+
+
+def test_a_scale_with_no_count_is_refused(client: TestClient) -> None:
+    refused = client.post(
+        "/argocd/io-shop/resource/actions/v2", json={"action": SCALE_ACTION}
+    )
+
+    assert refused.status_code == 400
+    assert the_replicas_of(client, "io-shop") == the_deployed_replica_count()
+
+
+def test_a_count_that_is_not_a_number_is_refused(client: TestClient) -> None:
+    # Argo CD's own action errors on this, and the server reports a failed
+    # action - which is what a caller has to be able to tell from a size it set.
+    assert scaled(client, "io-shop", "not_a_number").status_code == 400
+    assert the_replicas_of(client, "io-shop") == the_deployed_replica_count()
+
+
+def test_a_count_below_one_is_refused(client: TestClient) -> None:
+    assert scaled(client, "io-shop", "0").status_code == 400
+    assert the_replicas_of(client, "io-shop") == the_deployed_replica_count()
+
+
+def test_scaling_the_pricing_service_is_refused(client: TestClient) -> None:
+    # The fixture holds no size for it, and a 200 would have a caller believe a
+    # neighbour grew.
+    assert scaled(client, "io-pricing", "6").status_code == 400
+    assert the_replicas_of(client, "io-shop") == the_deployed_replica_count()
+
+
+def test_the_pricing_service_reports_no_managed_deployment(
+    client: TestClient
+) -> None:
+    assert client.get("/argocd/io-pricing/resource").status_code == 400
+
+
+def test_a_reset_returns_the_deployment_to_the_size_it_is_configured_for(
+    client: TestClient
+) -> None:
+    # A run abandoned between a scale-out and its withdrawal is exactly how the
+    # next scenario gets staged onto capacity the deployment never asked for.
+    scaled(client, "io-shop", "6")
+
+    client.post("/scenario/reset")
+
+    assert the_replicas_of(client, "io-shop") == the_deployed_replica_count()
+
+
 def test_a_settled_shop_came_up_before_the_window_it_is_read_in() -> None:
     # These two were level once: the uptime was six hours while the window was
     # ninety minutes, and widening the window to six hours put a settled shop's
@@ -730,3 +836,99 @@ def test_a_settled_shop_came_up_before_the_window_it_is_read_in() -> None:
     # single thing this field exists to report - so a shop nobody restarted
     # would have been reporting a restart.
     assert SETTLED_UPTIME > timedelta(minutes=GENERATED_SPAN_MINUTES)
+
+
+def a_staged_surge(client: TestClient) -> None:
+    seeded = client.post("/scenario/seed", json={"scenario_id": CPU_SATURATION})
+
+    assert seeded.status_code == 200
+
+
+def test_the_surge_scenario_is_seedable_by_id(client: TestClient) -> None:
+    a_staged_surge(client)
+
+    assert client.get("/scenario/status").json()["active_scenario"] == CPU_SATURATION
+
+
+def test_a_surge_moves_every_quantile_and_no_error_rate(client: TestClient) -> None:
+    a_staged_surge(client)
+
+    minute = the_newest_minute(client)
+
+    assert minute["p50_ms"] > 200
+    assert minute["p95_ms"] > 1000
+    assert minute["p99_ms"] > 1000
+    assert minute["error_rate"] < 0.05
+
+
+def test_a_surge_reports_its_traffic_and_pins_its_cpu(client: TestClient) -> None:
+    a_staged_surge(client)
+
+    minute = the_newest_minute(client)
+
+    assert minute["request_volume"] > 5000
+    assert minute["cpu_used_cores"] == minute["cpu_limit_cores"]
+
+
+def test_a_surge_leaves_the_heap_where_it_was(client: TestClient) -> None:
+    # A climbing heap is the leak's signal entirely. A scenario that moved both
+    # would leave a reader unable to say which resource ran out.
+    a_staged_surge(client)
+
+    assert the_newest_minute(client)["memory_used_bytes"] < BASELINE_MEMORY_BYTES * 1.1
+
+
+def test_a_surge_leaves_the_deploy_history_empty(client: TestClient) -> None:
+    # The shape says "a deployment" and nothing was deployed, which is what makes
+    # the volume and the utilisation the only evidence naming a cause.
+    a_staged_surge(client)
+
+    assert client.get("/argocd/io-shop").json()["status"]["history"] == []
+
+
+def test_scaling_the_shop_out_ends_the_surge(client: TestClient) -> None:
+    a_staged_surge(client)
+    saturated = the_newest_minute(client)
+
+    assert scaled(client, "io-shop", "6").status_code == 200
+
+    after = the_newest_minute(client)
+
+    assert after["cpu_limit_cores"] == 6.0
+    assert after["cpu_used_cores"] < after["cpu_limit_cores"]
+    assert after["p50_ms"] < saturated["p50_ms"] / 3
+
+
+def test_restarting_the_shop_does_not_end_a_surge(client: TestClient) -> None:
+    # The wrong answer, and the reason the split between the two halves of
+    # resource exhaustion is worth having: demand and capacity are both where they
+    # were, so the shop is saturated again from its first served minute.
+    a_staged_surge(client)
+    saturated = the_newest_minute(client)
+
+    restarted = client.post(RESTART_ACTION_PATH, json={"action": RESTART_ACTION})
+
+    assert restarted.status_code == 200
+
+    after = the_newest_minute(client)
+
+    assert after["process_start_time_seconds"] != (
+        saturated["process_start_time_seconds"]
+    )
+    assert after["cpu_used_cores"] == after["cpu_limit_cores"]
+    assert after["p50_ms"] > saturated["p50_ms"] / 2
+
+
+def test_putting_the_count_back_returns_the_shop_to_saturation(
+    client: TestClient
+) -> None:
+    a_staged_surge(client)
+    scaled(client, "io-shop", "6")
+    relieved = the_newest_minute(client)
+
+    scaled(client, "io-shop", "3")
+
+    after = the_newest_minute(client)
+
+    assert after["cpu_used_cores"] == after["cpu_limit_cores"] == 3.0
+    assert after["p50_ms"] > relieved["p50_ms"] * 3

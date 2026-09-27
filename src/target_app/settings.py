@@ -23,6 +23,11 @@ _CACHE = "cache"
 _HOST = "host"
 _PORT = "port"
 
+# How many replicas the file asks for. Named beside the cache's two keys for the
+# same reason: a reader comparing the shop's capacity against the deployment's
+# configuration knows which line decides it.
+_REPLICAS = "replicas"
+
 # Where the cache actually listens, which is where the revision *before* the
 # current one pointed the shop. A constant rather than a second read, because
 # this service cannot read git: the previous revision's values live in the
@@ -114,6 +119,16 @@ class ScenarioSettings(BaseSettings):
     # moved at all.
     leak_backdate_minutes: int = Field(default=30, gt=0)
 
+    # How long the traffic has been climbing by the time a surge is seeded, which
+    # is the leak's trick again and needs its own number for its own reason. A
+    # surge ramps over ten minutes and the shop is merely busy for the first six
+    # of them, so a five-minute backdate would stage an incident whose latency has
+    # not moved yet - diagnosable as nothing, and only because the fixture had not
+    # finished arriving. Twenty minutes puts the plateau ten minutes behind the
+    # seed: the whole ascent is in the window, with the quiet minutes it departed
+    # from ahead of it, and the shop is already saturated when anybody first looks.
+    surge_backdate_minutes: int = Field(default=20, gt=0)
+
 
 def the_deployed_cache_endpoint(values_file: Path = VALUES_FILE) -> CacheEndpoint:
     """Where the deployment says the cache is.
@@ -133,6 +148,27 @@ def the_deployed_cache_endpoint(values_file: Path = VALUES_FILE) -> CacheEndpoin
     cache = values[_CACHE]
 
     return CacheEndpoint(host=cache[_HOST], port=int(cache[_PORT]))
+
+
+def the_deployed_replica_count(values_file: Path = VALUES_FILE) -> int:
+    """How many replicas the deployment is sized for.
+
+    What the repository asks the platform to converge on, which is not the same
+    number as the count currently running: a scale-out changes the live
+    Deployment and leaves this file alone, which is the whole reason such a
+    mitigation is mitigation rather than a fix. So this is where a count *starts*
+    and what a reset returns it to, never what is in force - `ScenarioState`
+    holds that.
+
+    Read from the values file on every call and raising where the key is absent,
+    for the reasons the cache's address is read that way: configuration is the
+    part of a deployment that changes under a running service, and a shop that
+    invented a capacity when its configuration was missing would be a shop whose
+    configuration decides nothing.
+    """
+    values: dict[str, Any] = yaml.safe_load(values_file.read_text(encoding="utf-8"))
+
+    return int(values[_REPLICAS])
 
 
 def the_working_cache_endpoint(values_file: Path = VALUES_FILE) -> CacheEndpoint:

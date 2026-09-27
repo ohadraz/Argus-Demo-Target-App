@@ -35,6 +35,7 @@ NOTHING_FAILED = 0.0
 # how slow its slowest requests were, are required on a bucket and decide
 # nothing here.
 DONT_CARE_MEMORY_BYTES = 400 * 1024**2
+DONT_CARE_CPU_CORES = 0.75
 DONT_CARE_P99_MS = 380
 DONT_CARE_STARTED_AT = SOME_MINUTE.timestamp()
 
@@ -145,5 +146,6 @@ def _a_minute(error_rate: float,
         p99_ms=DONT_CARE_P99_MS,
         request_volume=request_volume,
         memory_used_bytes=DONT_CARE_MEMORY_BYTES,
+        cpu_used_cores=DONT_CARE_CPU_CORES,
         process_start_time_seconds=DONT_CARE_STARTED_AT,
     )

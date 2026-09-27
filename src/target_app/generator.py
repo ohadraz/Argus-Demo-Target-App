@@ -42,7 +42,7 @@ from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
 from io_shop.pricing_service import AskThePricingService, PricingAnswer
 from io_shop.rollout import CANARY_SHARE
 from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
-from target_app.settings import get_unleash_settings
+from target_app.settings import get_unleash_settings, the_deployed_replica_count
 
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -118,6 +118,53 @@ _TAIL_WOBBLE_AS_FRACTION_OF_BASELINE = 0.04
 MEMORY_LIMIT_BYTES = 2 * 1024**3
 BASELINE_MEMORY_BYTES = 440 * 1024**2
 _MEMORY_WOBBLE_BYTES = 12 * 1024**2
+
+# What one replica's worth of CPU is, and how much traffic it serves in a minute.
+# Together they are the only thing that turns a request count into a demand for a
+# finite resource, which is what a capacity incident is about.
+#
+# Reported on every minute of every scenario, for the reason memory and the tail
+# are: a series that appeared when it mattered would be a signal by its presence,
+# and a utilisation nobody has seen quiet is not one anything can be said to have
+# departed from. At the baseline volume across three replicas it sits at a quarter
+# of capacity, which is what a correctly-sized deployment looks like - and is far
+# enough below the threshold below that every scenario which is not about capacity
+# reports exactly the latency it did before.
+CORES_PER_REPLICA = 1.0
+_REQUESTS_PER_CORE_MINUTE = 1600
+# How much of a minute's CPU figure is jitter. A fraction of the figure rather
+# than an absolute number of cores, because utilisation is a proportion and a
+# fixed spread would be a different claim at every capacity.
+_CPU_WOBBLE_AS_FRACTION_OF_USE = 0.06
+
+# Where a service stops having headroom. Below this the queue drains as fast as it
+# fills and nothing outside notices; above it, requests begin waiting for a core
+# that is already busy. Higher than memory's half, because CPU is the resource a
+# healthy service is *meant* to be using - a deployment idling at a quarter of its
+# cores is oversized, where a heap at three quarters of its limit is in trouble.
+_CPU_PRESSURE_BEGINS_AT = 0.7
+# How much slower the shop is when demand exactly equals capacity, and the slope
+# it keeps climbing at beyond that. Unlike the heap's curve this one does not stop
+# at the limit: a heap cannot exceed the limit it is measured against, where
+# demand exceeds capacity routinely and that is the whole of this incident. So the
+# multiple keeps rising after the gauge has stopped.
+_SLOWEST_AT_CAPACITY = 6.0
+
+# How much traffic a surge ends up carrying, and how long it takes to get there.
+#
+# Four and a half times the baseline is chosen against the capacity it meets: over
+# three replicas it puts demand at about nine tenths of a core past what the shop
+# has, which is an incident nobody could miss and one that a single doubling of the
+# replica count clears with room to spare. Sized that way on purpose - a surge that
+# needed two doublings would make the second attempt compulsory rather than
+# possible, and a surge one doubling barely cleared would grade a correct
+# mitigation as a failure on a minute's jitter.
+#
+# Ten minutes of ramp is long enough that the shop passes through "busy" on its way
+# to "saturated", which is the property that makes this mode hard, and short enough
+# that the whole ascent fits in a window beside the quiet minutes it departed from.
+_SURGE_PEAK_MULTIPLE = 4.5
+_SURGE_RAMPS_OVER = timedelta(minutes=10)
 
 # How long a shop nobody has restarted has been up. Further back than any
 # window served here reaches, on purpose: a start time *inside* the window
@@ -583,6 +630,97 @@ class ProcessLifetime:
 
 
 @dataclass(frozen=True)
+class DemandSurge:
+    """When the traffic began climbing, and how much of it there is now.
+
+    Not a stretch, which is what every other condition here is. An outage, a
+    misconfiguration and a slow neighbour are all things that are either happening
+    or not, so each reports what share of a minute it was happening for. Demand is
+    a level: it rose over some minutes and then stayed up, and what a minute needs
+    to know is how high it was by then.
+
+    So the shape is a ramp with no end. Nothing here ends a surge, because nothing
+    Argus does to a deployment makes shoppers stop arriving - which is the
+    difference between this mode and every other one staged in this file, and the
+    reason its mitigation is to add capacity rather than to put something back.
+
+    The ramp matters as much as the level. What makes saturation hard to catch is
+    that it arrives gradually enough for the service to look merely busy first, and
+    a step would hand a reader an onset no real capacity incident gives them.
+    """
+
+    began_at: datetime
+    peak_multiple: float = _SURGE_PEAK_MULTIPLE
+    ramps_over: timedelta = _SURGE_RAMPS_OVER
+
+    def multiple_at(self, minute: datetime) -> float:
+        """How many times the baseline volume this minute carried.
+
+        One before the surge began, the peak once the ramp has finished, and
+        linear in between. Read from the minute rather than from the clock, so a
+        window fetched twice reads the same both times.
+        """
+        if minute < self.began_at:
+            return 1.0
+
+        how_far_in = (minute - self.began_at) / self.ramps_over
+
+        if how_far_in >= 1.0:
+            return self.peak_multiple
+
+        return 1.0 + how_far_in * (self.peak_multiple - 1.0)
+
+
+@dataclass(frozen=True)
+class Scaling:
+    """One resize of the deployment: when it happened, and to what.
+
+    A moment and a count, because a resize is an event. What it is not is a new
+    value replacing the old one - see `Capacity`.
+    """
+
+    at: datetime
+    replicas: int
+
+
+@dataclass(frozen=True)
+class Capacity:
+    """How many replicas have been serving, over time.
+
+    The same shape `ProcessLifetime` has, for the same reason. A minute that has
+    already been served was served by the capacity the deployment had then, so a
+    single count that moved would flatten the incident retrospectively: every
+    saturated minute would report the size the deployment reached afterwards, and
+    the stretch a mitigation wants to be judged against would vanish the moment
+    it was performed.
+
+    `sized_for` is what the repository asks for, which is where a deployment
+    nobody has resized sits. `scalings` are the resizes since, oldest first, and
+    they include the ones that put a count *back*: a withdrawal is one more
+    moment, because the minutes the shop spent large are also what happened.
+    """
+
+    sized_for: int
+    scalings: tuple[Scaling, ...] = ()
+
+    def replicas_during(self, minute: datetime) -> int:
+        """How many replicas served this minute.
+
+        The latest resize at or before it. A resize lands mid-minute and the
+        minute it lands in is mostly served at the new size, so the minute takes
+        the new count rather than splitting - a bucket carries one capacity, and
+        the one worth reporting is the one still in force when anybody reads it.
+        """
+        in_force = [
+            scaling.replicas
+            for scaling in self.scalings
+            if scaling.at.replace(second=0, microsecond=0) <= minute
+        ]
+
+        return in_force[-1] if in_force else self.sized_for
+
+
+@dataclass(frozen=True)
 class GeneratedMinute:
     """One minute, as both channels see it.
 
@@ -600,6 +738,12 @@ class GeneratedMinute:
     memory_used_bytes: int
     memory_limit_bytes: int | None
     process_start_time_seconds: float
+    # What the shop's replicas were using, and what they had. Usage is clamped at
+    # capacity - a service cannot use more CPU than it has - which is why a
+    # saturated minute is one where the two are equal rather than one where the
+    # first is the larger.
+    cpu_used_cores: float
+    cpu_limit_cores: float | None
     log_lines: tuple[str, ...]
     # `None` where the deployment configured no cache, which is a different
     # fact from a cache answering nothing - see `_how_much_the_cache_carried`.
@@ -622,6 +766,8 @@ def generate(timeline: FlagTimeline | None,
              slow_rollout: SlowRollout | None = None,
              slow_deployment: SlowDeployment | None = None,
              pricing_slowdown: PricingSlowdown | None = None,
+             demand_surge: DemandSurge | None = None,
+             capacity: Capacity | None = None,
              ships_the_statement: bool = False) -> list[GeneratedMinute]:
     """Every minute from `span_minutes` ago up to and including the one in
     progress, once any of it has happened.
@@ -694,6 +840,16 @@ def generate(timeline: FlagTimeline | None,
     basket total, so the wait lands on every request and the baseline quantile
     model carries it.
 
+    `demand_surge` is the traffic climbing past what the deployment was sized
+    for. Left unsaid, the shop serves its baseline volume, which is what every
+    scenario that is not about capacity looks like. It has no end, because nothing
+    anybody does to a deployment sends shoppers away.
+
+    `capacity` is how large the deployment has been while this window was served.
+    Left unsaid, it is the size the repository asks for and has always been that -
+    which is true of every scenario nobody has scaled, and is what makes CPU a
+    series with a visible baseline rather than one that appears when it matters.
+
     `ships_the_statement` says which feature the flag is shipping this time.
     The shop has one feature flag and several scenarios behind it: most ship
     the monthly summary, one ships the typical purchase, and this one ships the
@@ -735,6 +891,8 @@ def generate(timeline: FlagTimeline | None,
             slow_rollout=slow_rollout,
             slow_deployment=slow_deployment,
             pricing_slowdown=pricing_slowdown,
+            demand_surge=demand_surge,
+            capacity=capacity,
             ships_the_statement=ships_the_statement,
         )
         for offset in range(span_minutes, 0, -1)
@@ -764,6 +922,8 @@ def generate(timeline: FlagTimeline | None,
                 slow_rollout=slow_rollout,
                 slow_deployment=slow_deployment,
                 pricing_slowdown=pricing_slowdown,
+                demand_surge=demand_surge,
+                capacity=capacity,
                 ships_the_statement=ships_the_statement,
             )
         )
@@ -795,6 +955,8 @@ def _a_whole_minute(
     slow_rollout: SlowRollout | None = None,
     slow_deployment: SlowDeployment | None = None,
     pricing_slowdown: PricingSlowdown | None = None,
+    demand_surge: DemandSurge | None = None,
+    capacity: Capacity | None = None,
     ships_the_statement: bool = False,
 ) -> GeneratedMinute:
     """One minute that has finished, generated once and then remembered.
@@ -837,6 +999,8 @@ def _a_whole_minute(
         slow_rollout=slow_rollout,
         slow_deployment=slow_deployment,
         pricing_slowdown=pricing_slowdown,
+        demand_surge=demand_surge,
+        capacity=capacity,
         ships_the_statement=ships_the_statement,
     )
 
@@ -857,6 +1021,8 @@ def _generate_minute(
     slow_rollout: SlowRollout | None = None,
     slow_deployment: SlowDeployment | None = None,
     pricing_slowdown: PricingSlowdown | None = None,
+    demand_surge: DemandSurge | None = None,
+    capacity: Capacity | None = None,
     ships_the_statement: bool = False,
 ) -> GeneratedMinute:
     minute_id = minute.strftime(TIMESTAMP_FORMAT)
@@ -898,6 +1064,35 @@ def _generate_minute(
         if slow_deployment is not None
         else 0.0
     )
+
+    # How much traffic this minute carried, and what serving it demanded of the
+    # replicas that were up. Three figures rather than one because they answer
+    # different questions: what the shop reports having served, what that asked of
+    # the CPU, and what the CPU it had was.
+    #
+    # None of them draws entropy, so they cannot shift a single figure drawn after
+    # them - which is what lets capacity be added to a bucket without moving a
+    # number in any scenario that has nothing to do with it.
+    reported_volume = round(
+        _REPORTED_VOLUME_PER_MINUTE
+        * (demand_surge.multiple_at(minute) if demand_surge is not None else 1.0)
+    )
+    # A window nobody has scaled is served at the size the deployment is
+    # configured for, which is read here rather than defaulted to a number: a
+    # default of one replica would put every scenario in this file at three
+    # quarters of its capacity, and every one of them would report the latency of a
+    # shop that is running out of CPU.
+    cores_available = the_cores_of(
+        capacity.replicas_during(minute)
+        if capacity is not None
+        else the_deployed_replica_count()
+    )
+    cores_demanded = the_cpu_demanded_by(reported_volume)
+    # Unclamped, and that is the point: demand routinely exceeds capacity, where
+    # the usage reported below cannot. This is what keeps latency climbing after
+    # the gauge has pinned.
+    utilisation = cores_demanded / cores_available
+    under_saturation = _how_much_slower_at(utilisation)
 
     # How much of this minute the pricing service spent answering slowly.
     share_of_minute_waiting_on_pricing = (
@@ -986,6 +1181,7 @@ def _generate_minute(
             ))
             * under_pressure
             * slower_for_the_deploy
+            * under_saturation
             + _waiting_on_the_provider(share_of_minute_refused)
             + _waiting_on_the_pricing_service(share_of_minute_waiting_on_pricing)
         ),
@@ -995,11 +1191,12 @@ def _generate_minute(
             ))
             * under_pressure
             * slower_for_the_deploy
+            * under_saturation
             + _waiting_on_the_provider(share_of_minute_refused)
             + _waiting_on_the_pricing_service(share_of_minute_waiting_on_pricing)
         ),
         cache_hit_ratio=_how_much_the_cache_carried(outcomes),
-        request_volume=_REPORTED_VOLUME_PER_MINUTE,
+        request_volume=reported_volume,
         # Drawn after the latencies, so that adding memory to the bucket left
         # every figure this generator already produced exactly where it was:
         # each minute seeds one generator, and a draw inserted earlier would
@@ -1023,9 +1220,35 @@ def _generate_minute(
             ))
             * under_pressure
             * slower_for_the_deploy
+            * under_saturation
             + _waiting_on_the_provider(share_of_minute_refused)
             + _waiting_on_the_pricing_service(share_of_minute_waiting_on_pricing)
         ),
+        # Last of the drawn figures, after the tail and the heap, for the reason
+        # both of those are where they are: each minute seeds one generator, so a
+        # draw inserted earlier would shift every draw after it and move a number
+        # in every scenario that has nothing to do with capacity.
+        #
+        # Clamped at what the shop has, because a service cannot use more CPU than
+        # it was given. A reader who wants to know *how far* past its capacity the
+        # demand went reads the volume and the latency beside this, which is what
+        # a real utilisation graph asks of them too.
+        # Drawn as a fraction rather than through `_wobble_around`, which is a
+        # whole-millisecond helper: its floor of one is one millisecond on a
+        # latency and a whole core here, so a quarter-loaded shop wobbled between
+        # nothing and twice its demand.
+        cpu_used_cores=round(
+            min(
+                cores_available,
+                cores_demanded * (
+                    1.0 + entropy.uniform(
+                        -_CPU_WOBBLE_AS_FRACTION_OF_USE, _CPU_WOBBLE_AS_FRACTION_OF_USE
+                    )
+                ),
+            ),
+            3,
+        ),
+        cpu_limit_cores=cores_available,
         log_lines=_log_lines_for(
             minute_id,
             failures,
@@ -1195,6 +1418,51 @@ def _how_much_slower_under(pressure: float) -> float:
     how_far_in = (pressure - _PRESSURE_BEGINS_AT) / (1.0 - _PRESSURE_BEGINS_AT)
 
     return 1.0 + how_far_in * (_SLOWEST_UNDER_PRESSURE - 1.0)
+
+
+def the_cores_of(replicas: int) -> float:
+    """What that many replicas have between them.
+
+    Public because the authored path reports capacity too, and the arithmetic is
+    one line over a constant that belongs to this module. A second spelling of it
+    somewhere else would be a second answer to how large this deployment is.
+    """
+    return replicas * CORES_PER_REPLICA
+
+
+def the_cpu_demanded_by(request_volume: int) -> float:
+    """What serving that much traffic in a minute asks of the CPU.
+
+    Unclamped, which is the caller's business rather than an oversight: demand
+    above capacity is what a saturated service has, and what each caller decides
+    is how much of it to *report* against what it had.
+    """
+    return request_volume / _REQUESTS_PER_CORE_MINUTE
+
+
+def _how_much_slower_at(utilisation: float) -> float:
+    """How much longer a request takes when demand is this much of capacity.
+
+    Nothing at all while there is headroom - a service using its cores is a
+    service doing its job, and reporting latency for every core in use would make
+    capacity undiagnosable by making everything look like capacity. Past the
+    threshold each request waits for a core that is already busy, and the curve is
+    linear in how far past it the demand is.
+
+    Unlike the heap's curve this one does not stop at the limit, and the two differ
+    for a reason rather than by oversight: a heap cannot exceed the limit it is
+    measured against, where demand exceeds capacity routinely. So the multiple goes
+    on rising after the reported gauge has pinned at the ceiling, which is what
+    makes two saturated minutes of different sizes distinguishable at all.
+    """
+    if utilisation <= _CPU_PRESSURE_BEGINS_AT:
+        return 1.0
+
+    how_far_in = (utilisation - _CPU_PRESSURE_BEGINS_AT) / (
+        1.0 - _CPU_PRESSURE_BEGINS_AT
+    )
+
+    return 1.0 + how_far_in * (_SLOWEST_AT_CAPACITY - 1.0)
 
 
 def _waiting_on_the_provider(share_of_minute_refused: float) -> float:

@@ -16,9 +16,12 @@ from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.generator import (
     SETTLED_UPTIME,
     CacheOutage,
+    Capacity,
+    DemandSurge,
     FlagTimeline,
     PricingSlowdown,
     ProviderOutage,
+    Scaling,
     SlowDeployment,
 )
 from target_app.history import forget_the_changes_to
@@ -33,6 +36,7 @@ from target_app.scenarios import (
 from target_app.settings import (
     get_scenario_settings,
     the_deployed_cache_endpoint,
+    the_deployed_replica_count,
     the_working_cache_endpoint,
 )
 
@@ -213,6 +217,16 @@ class ActiveScenario:
     # everywhere else, which is what keeps that service prompt - and silent - in
     # every other scenario.
     pricing_slowdown: PricingSlowdown | None = None
+    # When the traffic began climbing, for the one scenario whose condition is how
+    # much of it there is. `None` everywhere else, which leaves every other
+    # scenario serving the baseline volume it always served.
+    #
+    # It has no end, and that is the one thing about it worth reading twice.
+    # Every other condition here is a stretch something can bring to a close;
+    # nothing Argus does to a deployment makes shoppers stop arriving, which is
+    # why this mode is answered by adding capacity rather than by putting anything
+    # back.
+    demand_surge: DemandSurge | None = None
     # When the pricing service's own process came up. `None` until somebody
     # restarts it, and then the moment they did: the two services come up
     # together and diverge only when one of them is restarted, which is exactly
@@ -295,6 +309,10 @@ class ScenarioState:
         # A GitOps deployment reconciles itself unless somebody has stopped it,
         # so this starts on. See `syncs_itself`.
         self._syncs_itself = True
+        # Every resize the deployment has had, oldest first. A history rather
+        # than a count, for the reason the process's restarts are one: see
+        # `capacity`.
+        self._scalings: tuple[Scaling, ...] = ()
 
     def _flags_for(self, scenario: Scenario) -> FlagClient:
         return (
@@ -473,6 +491,31 @@ class ScenarioState:
             )
             return
 
+        if scenario.surges:
+            # No flag, no cache, no deploy, no neighbour and nothing wrong with
+            # this process either. What is staged is the traffic: shoppers arrive
+            # in numbers the deployment was not sized for, and the shop queues.
+            # Backdated further than the others because a surge ramps rather than
+            # steps - see `surge_backdate_minutes` - so that the plateau, the climb
+            # and the quiet minutes before it are all in the window at once.
+            #
+            # The capacity it meets is not recorded here. It is the deployment's
+            # size, which is process state and belongs to nobody's scenario, and a
+            # seed that captured it would stage an incident against a count that
+            # stopped being true the moment anybody scaled.
+            self._remember_where_the_flags_are_now()
+            self._active = ActiveScenario(
+                scenario=scenario,
+                seeded_at=now,
+                process_started_at=now - SETTLED_UPTIME,
+                demand_surge=DemandSurge(
+                    began_at=now - timedelta(
+                        minutes=get_scenario_settings().surge_backdate_minutes
+                    )
+                ),
+            )
+            return
+
         if scenario.leaks:
             # No flag is touched, because no flag is involved. The condition
             # this stages is the process's own accumulation, which has been
@@ -565,6 +608,62 @@ class ScenarioState:
         quietly not receiving anything anybody deploys to it.
         """
         self._syncs_itself = enabled
+
+    @property
+    def replicas(self) -> int:
+        """How many replicas are serving, right now.
+
+        Process state rather than per-scenario state, exactly as `syncs_itself`
+        is: it describes the deployment's size, not any incident, and a scenario
+        seeding would no more resize the deployment than it would reset the
+        cluster. With nothing ever scaled it is the values file's count, because
+        that is what the platform converged on before anybody interfered.
+        """
+        return self.capacity.replicas_during(utc_now())
+
+    @property
+    def capacity(self) -> Capacity:
+        """How large the deployment has been, over time.
+
+        A history and not a count, for exactly the reason the process's restarts
+        are a history: a minute that has already been served was served by the
+        capacity it had then. A single count that moved would flatten the
+        incident retrospectively - every saturated minute would be regenerated at
+        the size the deployment reached afterwards, and the stretch a mitigation
+        wants to be judged against would disappear the moment it was performed.
+
+        It is read on every generated minute, which is what makes a scale-out a
+        mitigation anybody can perform and the telemetry has to answer for.
+        """
+        return Capacity(
+            sized_for=the_deployed_replica_count(), scalings=self._scalings
+        )
+
+    def scale_the_deployment_to(self, replicas: int) -> datetime:
+        """Sets how many replicas are serving, and says when.
+
+        Recorded as a moment rather than assigned, so the minutes already served
+        keep the size they were served at - see `capacity`. The moment is
+        answered for the reason a restart's is: whoever asked is about to look at
+        the telemetry to see whether it worked, and what they will be reading is
+        dated against this.
+
+        Both directions, because the count is what an undo puts back. A
+        withdrawal that could only add capacity would leave the shop permanently
+        larger than the deployment it is meant to have returned to - and it is
+        recorded the same way, as one more moment, so the stretch the shop spent
+        large stays in the record too.
+
+        It says nothing about whether the platform will leave it alone. A
+        deployment still reconciling itself is one whose next sync sets this back
+        to the values file's count, and suspending that is the caller's business
+        - `set_automated_sync` above - for the same reason it is the caller's
+        business before a rollback.
+        """
+        at = utc_now()
+        self._scalings = (*self._scalings, Scaling(at=at, replicas=replicas))
+
+        return at
 
     def roll_the_deployment_back(self) -> datetime:
         """Puts the shop on what the previous revision was running, and says
@@ -844,6 +943,13 @@ class ScenarioState:
         # nothing, with its rollback accepted on the first try for reasons
         # belonging to the previous run.
         self._syncs_itself = True
+        # And its size, for the same reason. A scale-out raises the count and a
+        # withdrawal puts it back, but a run abandoned between the two leaves the
+        # shop larger than its configuration - and the next scenario would then be
+        # staged onto capacity the deployment never asked for, with a saturation
+        # nobody could reproduce. The whole history goes, not just the latest
+        # entry: what a reset produces is a deployment nobody has ever resized.
+        self._scalings = ()
 
         if active is None:
             self._put_the_flags_back_where_they_rest()
@@ -948,6 +1054,8 @@ class ScenarioState:
                 if active.pricing_slowdown is not None
                 else None
             )
+        elif active.scenario.surges:
+            ended_at = self._relieved_at()
         else:
             ended_at = timeline.turned_off_at if timeline is not None else None
 
@@ -958,6 +1066,35 @@ class ScenarioState:
             return RECOVERING
 
         return COMPLETE
+
+    def _relieved_at(self) -> datetime | None:
+        """When the deployment was last made larger than it is configured for, or
+        `None` while it is not.
+
+        What ends a surge's running phase, in the only terms a surge has: nothing
+        stops the traffic, so the incident is over when the shop is big enough for
+        it. Read from the count in force rather than from the fact that a resize
+        happened, which is what makes it reconcile in both directions - a
+        withdrawal that puts the count back returns this to `None`, and the phase
+        to running, because the shop is saturated again.
+
+        The *moment* is the resize that took it above the configured size, not the
+        latest resize of any kind. A settling period is counted from this, and
+        counting it from a resize that changed nothing about the saturation would
+        freeze the window before the recovery it is meant to show.
+        """
+        sized_for = the_deployed_replica_count()
+
+        if not self._scalings or self._scalings[-1].replicas <= sized_for:
+            return None
+
+        for scaling in reversed(self._scalings):
+            if scaling.replicas <= sized_for:
+                break
+
+            relieved_at = scaling.at
+
+        return relieved_at
 
     def generated_window(self) -> tuple[FlagTimeline | None, datetime] | None:
         """The active generated scenario's timeline, and the instant its
@@ -1028,6 +1165,21 @@ class ScenarioState:
                 return None, utc_now()
 
             return None, min(utc_now(), _settled_at(active.restarts[-1]))
+
+        if active is not None and active.scenario.surges:
+            # No flag, and nothing that ends the condition at all - the traffic
+            # goes on arriving. What ends the *incident* is the shop being large
+            # enough for it, so the settling period is counted from the resize that
+            # made it so, and for the reason the deployment scenario's is counted
+            # from its rollback: every quantile moved, so every quantile has to be
+            # seen coming back down before the mitigation can be said to have
+            # worked.
+            relieved_at = self._relieved_at()
+
+            if relieved_at is None:
+                return None, utc_now()
+
+            return None, min(utc_now(), _settled_at(relieved_at))
 
         timeline = self.timeline_now()
 

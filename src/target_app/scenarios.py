@@ -205,6 +205,34 @@ class Scenario:
     which is what makes the wrong answer refutable rather than accidentally
     right.
 
+    `surges` stages the eighth generated kind, and the only one where nothing
+    about the shop is wrong at all. Its code, its configuration, its flags, its
+    heap and its neighbours are all exactly as they were; what changed is how many
+    shoppers arrived. The traffic climbs to several times the volume three
+    replicas were sized for, every request begins queueing for a core that is
+    already busy, and the median and both tails climb together.
+
+    Its telemetry is `deploy_is_slow`'s in every judged series, which is the point:
+    a multiplied cost on every request looks the same whether the cost went up or
+    the number of requests did. Three things separate them, and all three are
+    retrievable. The deploy history is empty. The reported volume moved, and moved
+    first. And utilisation is pinned at capacity, which is what says the resource
+    ran out rather than the work getting more expensive.
+
+    It is the mirror of `leaks`, and that pair is the whole reason the mode exists.
+    Both are a finite resource being consumed faster than it is replenished; one
+    is consumption climbing while the traffic does not, answered by reclaiming what
+    accumulated, and this is consumption the traffic asked for, answered by adding
+    capacity. Restarting changes nothing here - demand and capacity are both where
+    they were - which is what makes the wrong answer refutable rather than
+    accidentally right.
+
+    It is also the only scenario in this file that nothing ends. A flag goes back,
+    a process comes up, a revision is returned and a neighbour recovers; shoppers
+    do not go away because somebody scaled a deployment. So this one is mitigated
+    by making the shop bigger and is never resolved - and a withdrawal that puts
+    the count back returns it to saturation.
+
     `ships_the_statement` stages the same incident as `feature-flag-toggle` in
     every respect a reader of the telemetry could name - the same flag, the same
     cohort, the same shoppers failing for the same reason, the same error rate -
@@ -251,6 +279,7 @@ class Scenario:
     rollout_is_slow: bool = False
     deploy_is_slow: bool = False
     dependency_is_slow: bool = False
+    surges: bool = False
     ships_the_statement: bool = False
     # The deploy a *generated* scenario stages, for the one whose cause is a
     # change rather than a state. An authored scenario carries its deploys on
@@ -284,6 +313,7 @@ class Scenario:
             or self.cache_is_misconfigured
             or self.deploy_is_slow
             or self.dependency_is_slow
+            or self.surges
         )
 
     @property
@@ -321,6 +351,11 @@ COMPETING_FLAG_CHANGES = "competing-flag-changes"
 SLOW_CANARY_ROLLOUT = "slow-canary-rollout"
 MONTHLY_STATEMENT_PANEL = "monthly-statement-panel"
 PRICING_SERVICE_DEGRADED = "pricing-service-degraded"
+# Named for the resource rather than for the response, unlike the failure mode it
+# reaches: this is one way of arriving at demand saturation, and the next one under
+# it - a spike answered by shedding load rather than by adding capacity - is
+# another. The same relation `cache-misconfigured` has to a config-induced failure.
+CPU_SATURATION = "cpu-saturation"
 
 SCENARIOS: dict[str, Scenario] = {
     FEATURE_FLAG_TOGGLE: Scenario(
@@ -545,6 +580,29 @@ SCENARIOS: dict[str, Scenario] = {
             "What ends it is restarting a service Argus was not paged about."
         ),
         dependency_is_slow=True,
+    ),
+    CPU_SATURATION: Scenario(
+        id=CPU_SATURATION,
+        title="More shoppers than the shop was sized for",
+        description=(
+            "Nothing about Io is wrong. Its code, its configuration, its flags "
+            "and its heap are all exactly where they were, and no deployment "
+            "went out. What changed is how many shoppers arrived: the traffic "
+            "climbs over ten minutes to four and a half times the volume Io's "
+            "three replicas were sized for, and then stays there. Every request "
+            "begins queueing for a core that is already busy, so the median, the "
+            "95th and the 99th all climb together, while nothing fails and the "
+            "error rate never moves. The shape says 'a deployment' and the "
+            "deploy history is empty. What names the cause is the metrics "
+            "themselves: the reported volume moved, and moved first, and CPU is "
+            "pinned at the capacity three replicas have. Restarting changes "
+            "nothing - demand and capacity are both where they were - and what "
+            "ends it is making the shop bigger. Nothing ends the traffic, so "
+            "this one is mitigated and never resolved: the values file still asks "
+            "for three, and putting the count back returns the shop to "
+            "saturation."
+        ),
+        surges=True,
     ),
 }
 

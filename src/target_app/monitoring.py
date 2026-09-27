@@ -27,6 +27,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from target_app.scenarios import (
     BAD_DEPLOYMENT,
     CACHE_MISCONFIGURED,
+    CPU_SATURATION,
     PRICING_SERVICE_DEGRADED,
     RESOURCE_LEAK,
     SLOW_CANARY_ROLLOUT,
@@ -88,6 +89,15 @@ _WHAT_FIRED: dict[str, tuple[str, str]] = {
     # alert names the shop, because the shop is what is being paged about - and
     # the shop is not what is wrong, which is the whole incident.
     PRICING_SERVICE_DEGRADED: (
+        _HIGH_LATENCY, "p95 latency above threshold for 5m"
+    ),
+    # A third scenario on the same rule and the same words, which by now is the
+    # point rather than a coincidence: a bad deployment, a slow neighbour and a
+    # shop with more traffic than it has cores are one alert, and separating them
+    # is the whole of the investigation. Nothing here pages on utilisation - a
+    # rule that fired whenever CPU rose would fire every evening, and the thing
+    # worth waking somebody for is the latency it caused.
+    CPU_SATURATION: (
         _HIGH_LATENCY, "p95 latency above threshold for 5m"
     ),
 }

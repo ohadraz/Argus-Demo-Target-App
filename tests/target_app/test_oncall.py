@@ -52,6 +52,7 @@ A_CALM_P99_MS = 380
 # What an incident is bounded by is the error rate and the two latencies. Memory
 # is required on a bucket and decides nothing here.
 DONT_CARE_MEMORY_BYTES = 400 * 1024**2
+DONT_CARE_CPU_CORES = 0.75
 DONT_CARE_STARTED_AT = SOME_MINUTE.timestamp()
 
 A_RESPONDER = next(iter(RESPONDERS))
@@ -280,6 +281,7 @@ def _minutes_from(began_at: datetime,
             p99_ms=p99_ms,
             request_volume=DONT_CARE_VOLUME,
             memory_used_bytes=DONT_CARE_MEMORY_BYTES,
+            cpu_used_cores=DONT_CARE_CPU_CORES,
             process_start_time_seconds=DONT_CARE_STARTED_AT
         )
         for minute in range(int(span // timedelta(minutes=1)) + 1)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -9,7 +10,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from target_app import console
 from target_app.flags import FlagClient, FlagProviderUnavailable
@@ -20,6 +21,8 @@ from target_app.generator import (
     GeneratedMinute,
     SlowRollout,
     generate,
+    the_cores_of,
+    the_cpu_demanded_by,
 )
 from target_app.history import FlagHistoryUnavailable
 from target_app.monitoring import AlertNotDelivered, fire_alert
@@ -40,7 +43,11 @@ from target_app.scenarios import (
     quiet_state_for,
     scenario_span_minutes,
 )
-from target_app.settings import get_scenario_settings, get_unleash_settings
+from target_app.settings import (
+    get_scenario_settings,
+    get_unleash_settings,
+    the_deployed_replica_count,
+)
 from target_app.state import ScenarioState
 
 # How much history the generated channels serve. Six hours, because that is
@@ -188,16 +195,39 @@ class ShopRestarted(BaseModel):
 # registered under. The vendor's own word, so it is named once here rather than
 # spelled at the comparison.
 RESTART_ACTION = "restart"
+# And the one that resizes it. Also the vendor's - Argo CD ships both as built-in
+# actions for `apps/Deployment`, which is why neither is an endpoint of its own.
+SCALE_ACTION = "scale"
+# The parameter that action reads, by the name its own script reads it under. A
+# string on the wire, because every resource-action parameter is: the value is
+# carried as text and the action's script is what makes a number of it.
+REPLICAS_PARAMETER = "replicas"
+
+
+class ArgoCdActionParameter(BaseModel):
+    """One argument to a resource action, in Argo CD's shape for it.
+
+    A name and a value, both strings, which is the whole of the vendor's message
+    - so a caller that sends a count sends it as text, and whoever runs the
+    action is what turns it into a number.
+    """
+
+    name: str
+    value: str
 
 
 class ArgoCdResourceAction(BaseModel):
     """The body Argo CD's resource-action endpoint takes.
 
-    Every field the real one carries, and all of them ignored but `action`.
-    This shop has one service and no namespaces, so the resource a caller
-    addressed can only be the one there is - but an adapter written against a
-    real server sends all five, and a stand-in that refused them would be one
-    nothing real could be pointed at.
+    Every field the real one carries, and all of them ignored but `action` and
+    the parameters. This shop has one service and no namespaces, so the resource
+    a caller addressed can only be the one there is - but an adapter written
+    against a real server sends all five, and a stand-in that refused them would
+    be one nothing real could be pointed at.
+
+    `resourceActionParameters` is what separates this endpoint from the v1 it
+    replaced, and it is why a scale can be asked for at all: a restart needs
+    nothing said about it, where a resize is a number somebody has to name.
     """
 
     action: str
@@ -205,6 +235,11 @@ class ArgoCdResourceAction(BaseModel):
     resourceName: str | None = None  # noqa: N815 - Argo CD's own spelling
     group: str | None = None
     kind: str | None = None
+    # Argo CD's own spelling, and its own shape - a list of named values rather
+    # than an object, because an action declares its parameters in order.
+    resourceActionParameters: list[ArgoCdActionParameter] = Field(  # noqa: N815
+        default_factory=list
+    )
 
 
 class AlertRaised(BaseModel):
@@ -312,6 +347,17 @@ class MetricBucket(BaseModel):
     memory_used_bytes: int
     memory_limit_bytes: int | None = None
     process_start_time_seconds: float
+    # What the shop's replicas were using, and what they had between them. A pair
+    # like memory's rather than a utilisation ratio, for the same reason: the ratio
+    # is derivable from the pair and the pair is not derivable from the ratio.
+    #
+    # Capacity is the deployment's total across its replicas, so scaling it moves
+    # the denominator and the recovery is visible in the series the incident was.
+    # The mean of the minute rather than its peak, which is where this gauge parts
+    # company with memory: a heap's peak is what breaches a limit, where a second
+    # at full CPU is what an ordinary busy minute contains.
+    cpu_used_cores: float
+    cpu_limit_cores: float | None = None
     # How much of the minute's work the summary cache carried. A rate over the
     # minute like the error rate, not a gauge - averaging ratios taken over
     # unequal numbers of lookups would weight a quiet instant as heavily as a
@@ -432,6 +478,18 @@ class ArgoCdResourceNode(BaseModel):
 
 class ArgoCdResourceTree(BaseModel):
     nodes: list[ArgoCdResourceNode]
+
+
+class ArgoCdManagedResource(BaseModel):
+    """One live object's manifest, as the platform is holding it.
+
+    A string and not an object, because that is Argo CD's own shape: the manifest
+    is passed through as text for the caller to parse. What a caller comes here
+    for is `spec.replicas` - how many replicas are actually running, which the
+    repository cannot answer once anybody has scaled the deployment.
+    """
+
+    manifest: str
 
 
 class ArgoCdRollback(BaseModel):
@@ -618,9 +676,12 @@ def argocd_run_resource_action(application: str,
     stand-in in this file uses the vendor's - the adapter pointed at this is the
     same adapter that would be pointed at a real Argo CD.
 
-    Anything other than the restart action is refused rather than quietly
-    accepted. A platform that answered 200 to an action it did not run would
-    have a caller believe production had changed when it had not.
+    Two actions are run here, and both are the vendor's built-ins for a
+    Deployment: `restart`, and `scale`, which reads a replica count from the
+    action's parameters. Anything else is refused rather than quietly accepted. A
+    platform that answered 200 to an action it did not run would have a caller
+    believe production had changed when it had not - which is also why a count
+    that is not a number is refused rather than rounded, ignored or defaulted.
 
     Which application was addressed is read here, and it is the one place in this
     file where that matters. Everything else answers from the staged scenario
@@ -635,6 +696,11 @@ def argocd_run_resource_action(application: str,
 
     Argo CD answers an empty body on success, and so does this.
     """
+    if body.action == SCALE_ACTION:
+        _scale(application, body)
+
+        return {}
+
     if body.action != RESTART_ACTION:
         raise HTTPException(
             status_code=400,
@@ -647,6 +713,61 @@ def argocd_run_resource_action(application: str,
         state.restart_the_shop()
 
     return {}
+
+
+def _scale(application: str, body: ArgoCdResourceAction) -> None:
+    """Resizes the addressed deployment, or says why it did not.
+
+    The count is the shop's alone, so the pricing service is refused rather than
+    silently resized: the fixture holds no size for it, and a 200 would have a
+    caller believe a neighbour grew. This is the one place this file is stricter
+    about the application than the restart above, and the reason is the reverse of
+    that one's - a restart the fixture can perform for either process is
+    permissive because both are real, where a size only one of them has cannot be
+    invented for the other.
+    """
+    if application == PRICING_APPLICATION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{PRICING_APPLICATION} has no replica count to set",
+        )
+
+    state.scale_the_deployment_to(_the_replica_count_in(body))
+
+
+def _the_replica_count_in(body: ArgoCdResourceAction) -> int:
+    """The count the action was asked for, or a refusal.
+
+    Refused three ways, all of them 400, because all three are the same mistake
+    said differently: the parameter absent, its value not a number, and a number
+    that is not a count. Argo CD's own script errors on the middle one and the
+    server reports that as a failed action, which is what a caller has to be able
+    to tell from a size it successfully set.
+    """
+    for parameter in body.resourceActionParameters:
+        if parameter.name != REPLICAS_PARAMETER:
+            continue
+
+        try:
+            replicas = int(parameter.value)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid number: {parameter.value}",
+            ) from None
+
+        if replicas < 1:
+            raise HTTPException(
+                status_code=400,
+                detail=f"replicas must be at least one, not {replicas}",
+            )
+
+        return replicas
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"the {SCALE_ACTION} action requires a {REPLICAS_PARAMETER} parameter",
+    )
 
 
 @app.get("/argocd/{application}/resource-tree", response_model=ArgoCdResourceTree)
@@ -687,6 +808,50 @@ def argocd_resource_tree(application: str) -> ArgoCdResourceTree:
                 createdAt=came_up.strftime(TIMESTAMP_FORMAT)
             )
         ]
+    )
+
+
+@app.get("/argocd/{application}/resource", response_model=ArgoCdManagedResource)
+def argocd_managed_resource(application: str,
+                            resourceName: str | None = None,  # noqa: N803
+                            namespace: str | None = None,
+                            group: str | None = None,
+                            version: str | None = None,
+                            kind: str | None = None) -> ArgoCdManagedResource:
+    """Stands in for Argo CD's `GET /api/v1/applications/{name}/resource`.
+
+    What is *running*, which is the only place a caller can learn it. The
+    repository says how many replicas the deployment is sized for and the
+    platform says how many it has, and after one scale-out those are different
+    numbers - so a caller deriving a new count, or recording the count it is about
+    to replace, has to ask here rather than read the values file.
+
+    A manifest carried as a string, because that is Argo CD's own shape for this
+    response: the resource is passed through as text and the caller parses it. A
+    stand-in answering a parsed object would be an easier endpoint to write
+    against and not the one the adapter will meet.
+
+    Every selector is accepted and ignored, as elsewhere in this file: there is
+    one shop and one Deployment, so the resource a caller addressed can only be
+    the one there is. The pricing service is the exception for the reason it is
+    the exception to a scale - the fixture holds no size for it, and answering
+    with the shop's would be reporting a neighbour's capacity as its own.
+    """
+    if application == PRICING_APPLICATION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{PRICING_APPLICATION} has no managed Deployment to report",
+        )
+
+    return ArgoCdManagedResource(
+        manifest=json.dumps(
+            {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": application, "namespace": "production"},
+                "spec": {"replicas": state.replicas},
+            }
+        )
     )
 
 
@@ -826,6 +991,8 @@ def metrics() -> list[MetricBucket]:
                 memory_used_bytes=minute.memory_used_bytes,
                 memory_limit_bytes=minute.memory_limit_bytes,
                 process_start_time_seconds=minute.process_start_time_seconds,
+                cpu_used_cores=minute.cpu_used_cores,
+                cpu_limit_cores=minute.cpu_limit_cores,
                 cache_hit_ratio=minute.cache_hit_ratio,
             )
             for minute in _generated_minutes()
@@ -1145,6 +1312,13 @@ def _generated_minutes() -> list[GeneratedMinute]:
         slow_rollout=_the_rollout_in(scenario, timeline),
         slow_deployment=active.deploy_slowdown if active else None,
         pricing_slowdown=active.pricing_slowdown if active else None,
+        demand_surge=active.demand_surge if active else None,
+        # Handed in whether or not anything is staged, unlike every condition
+        # above it. The others are a scenario's; this is the deployment's own size,
+        # which is a fact about the shop with nothing staged as much as with
+        # something - and it is what gives CPU a baseline in every window rather
+        # than only in the one window it is the subject of.
+        capacity=state.capacity,
         ships_the_statement=scenario.ships_the_statement,
     )
 
@@ -1222,6 +1396,16 @@ def _authored_metrics(scenario: Scenario,
             memory_used_bytes=BASELINE_MEMORY_BYTES,
             memory_limit_bytes=MEMORY_LIMIT_BYTES,
             process_start_time_seconds=process_started_at.timestamp(),
+            # An authored minute carries no capacity of its own, so it reports the
+            # deployment at rest: the size the values file asks for, at the
+            # utilisation the baseline volume puts it at. Nothing authored is about
+            # capacity, and a series absent from half the scenarios would be one
+            # read as a signal by its presence.
+            cpu_used_cores=min(
+                the_cores_of(the_deployed_replica_count()),
+                the_cpu_demanded_by(entry.request_volume),
+            ),
+            cpu_limit_cores=the_cores_of(the_deployed_replica_count()),
         )
         for entry in scenario.minutes
     ]
