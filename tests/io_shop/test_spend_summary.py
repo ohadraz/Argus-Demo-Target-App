@@ -12,6 +12,12 @@ from io_shop.spend_summary import (
 
 The monthly figure is newer and ships behind a rollout flag, so the cases below
 cover the shape the page has had for years plus the one the flag adds.
+
+One case here is about cost rather than correctness. The lifetime figure is the
+account page's fallback when the summary cache cannot be reached, so what it
+costs per render is what the shop's latency becomes when the cache moves - and
+a test that only checked the number would pass against a version that walks the
+whole history once per purchase.
 """
 
 
@@ -25,6 +31,26 @@ def an_account_with_no_purchases_this_month(*prices: int) -> Account:
         total_cents=sum(prices),
         total_this_month_cents=0,
     )
+
+
+class CountingPurchase:
+    """A purchase that remembers how often its price was read.
+
+    Stands in for `Purchase` so a test can count the work a figure does instead
+    of timing it - the count is the shape of the code, where a duration is the
+    machine the suite happened to run on.
+    """
+
+    in_current_month = False
+
+    def __init__(self, price_cents: int, reads: list[int]) -> None:
+        self._price_cents = price_cents
+        self._reads = reads
+
+    @property
+    def price_cents(self) -> int:
+        self._reads[0] += 1
+        return self._price_cents
 
 
 def test_the_lifetime_average_spreads_the_total_over_every_purchase() -> None:
@@ -47,6 +73,24 @@ def test_the_lifetime_average_follows_the_purchases_not_the_carried_total() -> N
     )
 
     assert average_spend_per_item(an_account_whose_total_drifted) == 2000
+
+
+def test_the_lifetime_average_reads_each_purchase_about_once() -> None:
+    # The cache is an optimisation, so this is what every request costs the
+    # moment the cache is unreachable. Re-summing every prefix reads a
+    # 200-purchase history 20,100 times for a number one pass produces, and
+    # that difference is a p50 of 190ms instead of 26ms.
+    reads = [0]
+    a_long_history = Account(
+        shopper_id="shopper-with-a-long-history",
+        purchases=tuple(CountingPurchase(100 + index, reads) for index in range(200)),
+        total_cents=0,
+        total_this_month_cents=0,
+    )
+
+    average_spend_per_item(a_long_history)  # type: ignore[arg-type]
+
+    assert reads[0] <= 2 * len(a_long_history.purchases)
 
 
 def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
