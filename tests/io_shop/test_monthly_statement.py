@@ -22,9 +22,10 @@ from io_shop.monthly_statement import (
 
 A safety net rather than a specification: the panel was written first and these
 cover what would be expensive to find out from a shopper. The one that matters
-most is the empty month, because that is the fault the
-`monthly-statement-panel` scenario stages, and a change that quietly made it
-stop raising would leave that scenario staging nothing at all.
+most is the empty month, because a shopper who bought nothing is an ordinary
+shopper and the panel is behind a rollout that reaches every one of them - a
+change that made an empty month raise again would fail the account page for
+everybody who had a quiet March.
 """
 
 MARCH = period_for(3, 2026)
@@ -70,12 +71,40 @@ def test_the_statement_takes_its_shape_from_this_month_alone() -> None:
     assert statement.smallest_cents == 1200
 
 
-def test_a_month_with_nothing_in_it_fails_rather_than_reporting_zero() -> None:
-    # The fault the `monthly-statement-panel` scenario stages. A statement
-    # reporting a made-up zero would be a panel nobody could trust on the
-    # months it can describe.
-    with pytest.raises(ValueError):
-        render_monthly_statement(a_shopper_who_bought_nothing_this_month(), MARCH)
+def test_a_month_with_nothing_in_it_renders_as_a_quiet_month() -> None:
+    # The incident: the month's largest, smallest and average were taken with
+    # max(), min() and a division by the count, none of which survive a month
+    # with nothing in it - and the whole account page failed with
+    # "max() iterable argument is empty" as the rollout ramped.
+    statement = render_monthly_statement(
+        a_shopper_who_bought_nothing_this_month(), MARCH
+    )
+
+    assert statement.purchase_count == 0
+    assert statement.headline_cents == 0
+    assert statement.is_a_quiet_month
+    assert [row.label for row in statement_rows(statement)] == [
+        "Spent this month",
+        "Purchases",
+        "A quiet month",
+    ]
+    assert problems_with(statement) == []
+
+
+def test_a_quiet_month_never_prints_the_figures_it_does_not_have() -> None:
+    # The zero those three fields carry is never shown to anybody: the shape
+    # rows are replaced by the quiet-month row, and the sentence says the same.
+    statement = render_monthly_statement(
+        a_shopper_who_bought_nothing_this_month(), MARCH
+    )
+    labels = [row.label for row in statement_rows(statement)]
+
+    assert "Largest purchase" not in labels
+    assert "Smallest purchase" not in labels
+    assert "Average purchase" not in labels
+    assert describe_month(statement) == "A quiet month: £0.00 across 0 purchases."
+    assert as_plain_text(statement).startswith("MARCH 2026")
+    assert as_html(statement)
 
 
 def test_the_breakdowns_add_up_to_the_headline() -> None:
@@ -96,6 +125,8 @@ def test_an_empty_column_apportions_nothing() -> None:
 
 
 def test_there_is_no_thirteenth_month() -> None:
+    # Input that cannot be believed still raises: a statement titled with a
+    # month that does not exist would carry real figures under a false heading.
     with pytest.raises(ValueError):
         period_for(13, 2026)
 

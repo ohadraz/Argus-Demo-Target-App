@@ -5,6 +5,7 @@ from pathlib import Path
 from io_shop import payment_provider, spend_summary
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
+from io_shop.monthly_statement import period_for
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
 from io_shop.pricing_service import AskThePricingService, PricingAnswer
 from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
@@ -288,3 +289,34 @@ def test_a_pricing_service_with_no_price_fails_the_page() -> None:
 
     assert page.failure is not None
     assert "pricing.io-internal.svc" in page.failure
+
+
+def test_the_statement_panel_survives_a_month_with_nothing_in_it() -> None:
+    # The incident, at the boundary it was measured from: with
+    # `monthly-spend-feature` on, a shopper who bought nothing this month took
+    # the whole page down with "max() iterable argument is empty". The panel is
+    # rendered for every shopper the rollout reaches, and a quiet month is one
+    # of the ordinary shapes it has to be able to draw.
+    page = serve_account_page(an_account_idle_this_month(1000, 3000),
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_prompt_pricing_service(),
+                              use_monthly_statement=True,
+                              statement_period=period_for(3, 2026))
+
+    assert page.failure is None
+    assert page.statement is not None
+    assert page.statement.purchase_count == 0
+    assert page.statement.is_a_quiet_month
+
+
+def test_a_page_outside_the_statement_rollout_has_no_panel() -> None:
+    # Both states of the flag have to be safe: off is the page the shop
+    # rendered last month, and it carries no statement at all.
+    page = serve_account_page(an_account_idle_this_month(1000, 3000),
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_prompt_pricing_service())
+
+    assert page.failure is None
+    assert page.statement is None
