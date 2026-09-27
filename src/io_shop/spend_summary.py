@@ -40,10 +40,22 @@ def average_spend_per_item_this_month(account: Account) -> int:
     Narrows the lifetime figure to the current month, so the account page can
     show what a shopper is spending now rather than what they averaged over
     three years.
+
+    A shopper who has bought nothing this month is the ordinary case, not a
+    broken one - it is every shopper on the first of the month - so there is no
+    divisor to divide by and nothing to average. The figure is zero: they have
+    spent nothing this month, which is exactly what the page should say. The
+    lifetime figure above cannot take the same way out, because an account with
+    no purchases at all is a record that should not exist and is worth an
+    error.
     """
     bought_this_month = [
         purchase for purchase in account.purchases if purchase.in_current_month
     ]
+
+    if not bought_this_month:
+        return 0
+
     return account.total_this_month_cents // len(bought_this_month)
 
 
