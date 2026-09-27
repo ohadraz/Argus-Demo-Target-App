@@ -101,6 +101,105 @@ def description_for(flag_role: str | None) -> str:
 
 
 @dataclass(frozen=True)
+class ScenarioFamily:
+    """What kind of incident a scenario stages, as a console groups them.
+
+    A flat list of scenarios stops being scannable at about six, and there are
+    more than that already. Grouping them is therefore presentation - but which
+    groups is not a presentation decision, so these are the families of the
+    published taxonomy Argus's own backlog is keyed to rather than whatever
+    reads tidily beside a radio button.
+
+    `taxonomy` names the published family and the share of real incidents it
+    accounts for. Three of the families below sit inside change-induced and all
+    three say so, which is the honest rendering: a reader who adds the three
+    percentages up and gets ninety-three has been misled by a number printed
+    once per group, so the group says whose number it is quoting.
+
+    `blurb` says what the family has in common and, where it has a mirror pair
+    in it, what separates them - which is the question an audience is actually
+    watching an agent answer.
+    """
+
+    id: str
+    name: str
+    taxonomy: str
+    blurb: str
+
+
+FLAG_CHANGES = ScenarioFamily(
+    id="flag-changes",
+    name="Flag changes",
+    taxonomy="Config-induced failure (FM-10), inside change-induced - 31% of incidents",
+    blurb=(
+        "Somebody moved a flag. What differs between these is whether it was "
+        "the cause, a coincidence, or one of two changes the evidence supports "
+        "equally well."
+    ),
+)
+RELEASES = ScenarioFamily(
+    id="releases",
+    name="Releases",
+    taxonomy="Deploy-induced regression (FM-09), inside change-induced - 31% of incidents",
+    blurb=(
+        "A revision went out. No log line mentions it, so the deploy history "
+        "is the only evidence naming a cause."
+    ),
+)
+CONFIGURATION = ScenarioFamily(
+    id="configuration",
+    name="Configuration",
+    taxonomy="Config-induced failure (FM-10), inside change-induced - 31% of incidents",
+    blurb=(
+        "A value, not a version. The change rode out with a deployment, and "
+        "the shop is now asking an address nothing answers on."
+    ),
+)
+NEIGHBOURS = ScenarioFamily(
+    id="neighbours",
+    name="Neighbours",
+    taxonomy="Propagation - 28% of incidents",
+    blurb=(
+        "Another service's fault, arriving here. What separates escalating "
+        "from mitigating is ownership, which the service registry answers and "
+        "no telemetry does."
+    ),
+)
+CAPACITY = ScenarioFamily(
+    id="capacity",
+    name="Capacity & resource",
+    taxonomy="Resource exhaustion (FM-13) - 13% of incidents",
+    blurb=(
+        "A finite resource is going faster than it is replenished. Whether "
+        "consumption moved with the traffic decides between reclaiming what "
+        "accumulated and adding capacity the deployment never had."
+    ),
+)
+THE_TAIL = ScenarioFamily(
+    id="the-tail",
+    name="Hidden in the tail",
+    taxonomy="Aggregate-masked tail degradation (FM-06) - 3% of incidents",
+    blurb=(
+        "Nothing fails and no aggregate a monitoring stack watches moves. The "
+        "incident exists in the 99th percentile and nowhere else."
+    ),
+)
+
+# The order a console draws them in: by the share of real incidents each family
+# accounts for, largest first. Not by how interesting the scenario is to watch -
+# the rail is the one place the shop says what kinds of incident exist at all,
+# and an order chosen for the demo would quietly re-rank the taxonomy.
+FAMILY_ORDER: tuple[ScenarioFamily, ...] = (
+    FLAG_CHANGES,
+    RELEASES,
+    CONFIGURATION,
+    NEIGHBOURS,
+    CAPACITY,
+    THE_TAIL,
+)
+
+
+@dataclass(frozen=True)
 class Scenario:
     """What a scenario is, from the outside.
 
@@ -260,6 +359,11 @@ class Scenario:
     branch - so it is mitigated and not resolved, and re-enabling the platform's
     own reconciliation brings it straight back.
 
+    `family` is what kind of incident this stages, and it has no default. A
+    default would put every scenario written from here on into whichever family
+    happened to be first, silently, and a grouping nobody chose is worse than no
+    grouping at all.
+
     `offered_in_console` is presentation only. A scenario kept for the capability
     it pins down is not automatically one worth showing an audience; hiding it
     leaves it seedable by id, which is how the e2e suite stages it.
@@ -268,6 +372,7 @@ class Scenario:
     id: str
     title: str
     description: str
+    family: ScenarioFamily
     minutes: tuple[ScenarioMinute, ...] = ()
     flag_role: str = FEATURE_FLAG
     breaks_when_flag_is_on: bool = True
@@ -372,6 +477,7 @@ SCENARIOS: dict[str, Scenario] = {
             "The error rate settles at roughly a third, while latency stays "
             "flat."
         ),
+        family=FLAG_CHANGES,
     ),
     FALLBACK_DISABLED: Scenario(
         id=FALLBACK_DISABLED,
@@ -386,6 +492,7 @@ SCENARIOS: dict[str, Scenario] = {
             "turned *off*, so an agent that can only turn flags off cannot end "
             "it: the fix is to switch this one back on."
         ),
+        family=FLAG_CHANGES,
         flag_role=FALLBACK_FLAG,
         breaks_when_flag_is_on=False,
         offered_in_console=False,
@@ -401,6 +508,7 @@ SCENARIOS: dict[str, Scenario] = {
             "nothing, so a mitigation taken on it is refuted rather than "
             "confirmed, and the flag has to be put back where it was found."
         ),
+        family=FLAG_CHANGES,
         recovers_when_flag_reverts=False,
     ),
     COMPETING_FLAG_CHANGES: Scenario(
@@ -417,6 +525,7 @@ SCENARIOS: dict[str, Scenario] = {
             "has to be undone, and only switching the fallback back on ends the "
             "incident."
         ),
+        family=FLAG_CHANGES,
         flag_role=FALLBACK_FLAG,
         breaks_when_flag_is_on=False,
         decoy_flag_role=FEATURE_FLAG,
@@ -436,6 +545,7 @@ SCENARIOS: dict[str, Scenario] = {
             "again, because the fault is still in the code: the incident is "
             "mitigated, never resolved, and what ends it is a fix."
         ),
+        family=CAPACITY,
         leaks=True,
     ),
     UPSTREAM_DEPENDENCY_FAILURE: Scenario(
@@ -453,6 +563,7 @@ SCENARIOS: dict[str, Scenario] = {
             "reach the provider. The correct outcome is that Argus says what "
             "happened and escalates it to somebody who can call them."
         ),
+        family=NEIGHBOURS,
         upstream_fails=True,
     ),
     CACHE_MISCONFIGURED: Scenario(
@@ -475,6 +586,7 @@ SCENARIOS: dict[str, Scenario] = {
             "back a shop reading the same configuration. What ends it is "
             "rolling the deployment back to the revision before the port moved."
         ),
+        family=CONFIGURATION,
         cache_is_misconfigured=True,
         deploy=ScenarioDeploy(
             revision=THE_COMMIT_THAT_MOVED_THE_CACHE_PORT,
@@ -508,6 +620,7 @@ SCENARIOS: dict[str, Scenario] = {
             "there is nothing left in a heap or in a file for anything to "
             "bring back."
         ),
+        family=THE_TAIL,
         rollout_is_slow=True,
     ),
     MONTHLY_STATEMENT_PANEL: Scenario(
@@ -528,6 +641,7 @@ SCENARIOS: dict[str, Scenario] = {
             "scenario is here to stage, and the reason it is not offered "
             "alongside the others."
         ),
+        family=RELEASES,
         ships_the_statement=True,
         offered_in_console=False,
     ),
@@ -549,6 +663,7 @@ SCENARIOS: dict[str, Scenario] = {
             "evidence naming a cause is the history, and what ends the "
             "incident is returning the deployment to the revision before it."
         ),
+        family=RELEASES,
         deploy_is_slow=True,
         deploy=ScenarioDeploy(
             revision=THE_COMMIT_THAT_SLOWED_THE_AVERAGE,
@@ -579,6 +694,7 @@ SCENARIOS: dict[str, Scenario] = {
             "the shop changes nothing, because nothing is wrong with the shop. "
             "What ends it is restarting a service Argus was not paged about."
         ),
+        family=NEIGHBOURS,
         dependency_is_slow=True,
     ),
     CPU_SATURATION: Scenario(
@@ -602,6 +718,7 @@ SCENARIOS: dict[str, Scenario] = {
             "for three, and putting the count back returns the shop to "
             "saturation."
         ),
+        family=CAPACITY,
         surges=True,
     ),
 }

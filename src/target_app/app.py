@@ -33,6 +33,7 @@ from target_app.rates import UnknownBase, rates_quoted_against
 from target_app.registry import dependencies_of
 from target_app.scenarios import (
     FALLBACK_FLAG,
+    FAMILY_ORDER,
     FEATURE_FLAG,
     FEATURE_FLAG_TOGGLE,
     SCENARIOS,
@@ -272,10 +273,31 @@ class ScenarioSummary(BaseModel):
     title: str
     description: str
     is_generated: bool
+    # Which group this belongs under, by id. The family's own name and text are
+    # sent once in `families` rather than repeated on every scenario that shares
+    # it - three scenarios carrying three copies of the same paragraph is three
+    # chances for a page to draw a heading that disagrees with itself.
+    family: str
     # Only the flags this scenario puts in play. The shop has two, and most
     # scenarios use one - a badge for a flag the selected scenario never touches
     # invites a reader to watch something that is not going to move.
     flags: list[ScenarioFlag]
+
+
+class ScenarioFamilySummary(BaseModel):
+    """One group of scenarios, as a console draws it.
+
+    Sent as a list rather than left for a page to derive from the scenarios,
+    because two of the three things a group needs are not derivable: the order
+    the groups go in, and what a group would say about itself. Deriving the
+    order from the scenarios would put the families in whichever sequence the
+    catalogue happens to be written in.
+    """
+
+    id: str
+    name: str
+    taxonomy: str
+    blurb: str
 
 
 class FlagState(BaseModel):
@@ -313,6 +335,13 @@ class ActionMoment(BaseModel):
 
 class ScenarioCatalog(BaseModel):
     scenarios: list[ScenarioSummary]
+    # The groups the scenarios above fall into, in the order to draw them, and
+    # only the ones something offered actually falls into. An empty group would
+    # be a claim the shop cannot stage that kind of incident at all - true, and
+    # not this page's news: the console is where somebody picks what to run, and
+    # a family with nothing under it is a dead end in the one control they came
+    # for. What Argus does and does not cover is argued in the backlog.
+    families: list[ScenarioFamilySummary]
     active_scenario: str | None
     # Every flag the shop has, not only the staged scenario's own. A scenario
     # can move two of them - one that matters and one that does not - and a
@@ -531,6 +560,10 @@ def scenario_catalog() -> ScenarioCatalog:
     flag, and reporting the feature flag regardless would show a reader the
     state of something no scenario was touching.
     """
+    offered = [
+        scenario for scenario in SCENARIOS.values() if scenario.offered_in_console
+    ]
+
     return ScenarioCatalog(
         scenarios=[
             ScenarioSummary(
@@ -538,16 +571,40 @@ def scenario_catalog() -> ScenarioCatalog:
                 title=scenario.title,
                 description=scenario.description,
                 is_generated=scenario.is_generated,
+                family=scenario.family.id,
                 flags=_the_flags_in_play_for(scenario),
             )
-            for scenario in SCENARIOS.values()
-            if scenario.offered_in_console
+            for scenario in offered
         ],
+        families=_the_families_offered(offered),
         active_scenario=state.active_scenario_id,
         flags=_the_shops_flags(),
         phase=state.phase(),
         actions=_the_actions_taken(),
     )
+
+
+def _the_families_offered(offered: list[Scenario]) -> list[ScenarioFamilySummary]:
+    """The groups these scenarios fall into, in the taxonomy's own order.
+
+    `FAMILY_ORDER` is what fixes the sequence, and iterating it rather than the
+    scenarios is the whole point: the order is a property of the families - the
+    share of real incidents each accounts for - and reading it off whichever
+    scenario came first in the catalogue would let adding a scenario silently
+    reorder the panel it appears in.
+    """
+    holds_something = {scenario.family.id for scenario in offered}
+
+    return [
+        ScenarioFamilySummary(
+            id=family.id,
+            name=family.name,
+            taxonomy=family.taxonomy,
+            blurb=family.blurb,
+        )
+        for family in FAMILY_ORDER
+        if family.id in holds_something
+    ]
 
 
 def _the_shops_flags() -> list[FlagState]:

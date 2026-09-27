@@ -34,6 +34,14 @@ PAGE = """<!doctype html>
        resolved it against a painted ancestor, and a sticky table heading that
        is transparent has rows scrolling straight through the words on it. */
     --ground: #0f0f11;
+    /* And the page's own text colour, written down for the same reason as the
+       ground. `color-scheme: dark` alone leaves it to the user agent: the text
+       is whatever `CanvasText` resolves to, which is white here and is not
+       white anywhere this page is embedded in another document that has set a
+       colour on `body` - where the declared ground below then lands under
+       somebody else's near-black text. A page that states its background owes
+       the reader the foreground that goes with it. */
+    --ink: #e6e8ea;
     --teal: #2a9d8f;
     --deep: #123a3d;
     --gold: #e9c46a;
@@ -43,7 +51,8 @@ PAGE = """<!doctype html>
     --line: rgba(42,157,143,.28);
   }
   body { font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; margin: 0;
-         padding: 0 24px 48px; max-width: 1100px; background: var(--ground); }
+         padding: 0 24px 48px; max-width: 1100px; background: var(--ground);
+         color: var(--ink); }
 
   header { display: flex; align-items: center; gap: 22px; padding: 18px 0 22px;
            border-bottom: 1px solid var(--line); margin-bottom: 24px; }
@@ -61,11 +70,72 @@ PAGE = """<!doctype html>
   legend { padding: 0 8px; opacity: .6; font-size: 12px;
            text-transform: uppercase; letter-spacing: .1em; }
 
-  label.scenario { display: block; padding: 10px 0;
-                   border-bottom: 1px solid rgba(128,128,128,.14); }
-  label.scenario:last-child { border-bottom: 0; }
-  label.scenario .desc { display: block; margin-left: 24px; opacity: .72;
-                         margin-top: 3px; }
+  /* The picker: kinds of incident down the left, the chosen kind's scenarios
+     beside them.
+
+     A flat list of every scenario was the tallest control on this page and grew
+     by one description every time the shop learned to stage something new -
+     twelve paragraphs of prose to pick one line out of. This is as tall as the
+     largest family and no taller, whatever the catalogue grows to.
+
+     `min-height` so that a family holding one scenario does not collapse the
+     panel to a couple of lines and walk the rail's own rows up the page. In `em`
+     rather than pixels because what it is reserving is room for text. */
+  #scenarios { display: grid; grid-template-columns: 210px 1fr;
+               border: 1px solid rgba(128,128,128,.22); border-radius: 9px;
+               overflow: hidden; min-height: 15em; }
+
+  .rail { display: flex; flex-direction: column;
+          background: rgba(255,255,255,.02);
+          border-right: 1px solid rgba(128,128,128,.22); }
+  /* `all: unset` because the page's own `button` rule dresses these as the two
+     teal controls below, which these are not - they navigate rather than act.
+     Everything the generic rule would have given them is then restated here,
+     the hover included: `button:hover` still matches, so a rail row left to it
+     lights up solid teal and reads as the thing to press. */
+  .rail button.family { all: unset; font: inherit; cursor: pointer;
+                        display: flex; align-items: center; gap: 8px;
+                        padding: 8px 11px;
+                        border-left: 3px solid transparent; }
+  .rail button.family:hover { background: rgba(42,157,143,.1); }
+  .rail button.family[aria-pressed=true] { background: var(--deep);
+                                           border-left-color: var(--teal); }
+  .rail .name { flex: 1; }
+  /* Where the current selection lives, for the one case the rail exists to
+     survive: a scenario is chosen, the reader goes looking through another
+     family, and the radio they picked is no longer on screen. Gold rather than
+     red or green - it is a bookmark, not a verdict. */
+  .rail .holds-selection { width: 6px; height: 6px; border-radius: 50%;
+                           background: var(--gold); flex: none; }
+  .rail .count { font-size: 11px; opacity: .5;
+                 font-variant-numeric: tabular-nums; }
+
+  .panel { padding: 0 16px 12px; min-width: 0; }
+  /* What the family has in common, and which published family and share the
+     grouping is quoting. The shop is entitled to say what kind of incident it
+     is staging; the percentage belongs to the taxonomy and is attributed. */
+  .panel .blurb { font-size: 12px; opacity: .7; padding: 11px 0 3px; }
+  .panel .taxonomy { display: block; margin-top: 4px; opacity: .8;
+                     font-size: 11px; letter-spacing: .04em; }
+
+  label.scenario { display: block; padding: 9px 0;
+                   border-top: 1px solid rgba(128,128,128,.14); }
+  label.scenario .title { margin-left: 7px; }
+  /* Only the selected scenario's brief, and only while it is selected. These
+     run to a paragraph each - showing all of a family's at once is the wall of
+     prose the rail was built to end. */
+  label.scenario .desc { display: block; margin: 5px 0 2px 24px; opacity: .72; }
+  label.scenario input:checked ~ .title { color: var(--gold); }
+
+  @media (max-width: 640px) {
+    #scenarios { grid-template-columns: 1fr; }
+    .rail { flex-direction: row; overflow-x: auto; border-right: 0;
+            border-bottom: 1px solid rgba(128,128,128,.22); }
+    .rail button.family { white-space: nowrap; border-left: 0;
+                          border-bottom: 3px solid transparent; }
+    .rail button.family[aria-pressed=true] { border-left-color: transparent;
+                                             border-bottom-color: var(--teal); }
+  }
 
   button { font: inherit; padding: 8px 16px; border-radius: 7px; cursor: pointer;
            border: 1px solid var(--teal); background: transparent; color: inherit; }
@@ -151,8 +221,15 @@ PAGE = """<!doctype html>
      The buttons are not named here at all - a button dims by being disabled,
      just above. Reset is not disabled while a scenario runs and must not look
      as though it were: stopping a run is what it is *for*, and the middle of
-     one is when somebody most needs it. */
-  fieldset.busy #scenarios { opacity: .45; }
+     one is when somebody most needs it.
+
+     The panel rather than the whole picker, for the same reason. The panel holds
+     the radios, and the radios are what is barred. The rail beside it holds the
+     names of the kinds of incident this shop can stage, which is a reading - and
+     one of the few on this page worth as much mid-run as before it. Walking it
+     while something is in progress changes nothing, and the dimmed panel and the
+     badge on the legend both say why nothing can be picked from it. */
+  fieldset.busy #panel { opacity: .45; }
   /* The receding is the announcement; this is the answer to a click on one of
      the things that receded. Without it a disabled radio still shows a pointer
      and reads as merely decorative. */
@@ -233,7 +310,10 @@ PAGE = """<!doctype html>
 
 <fieldset id="staging">
   <legend>Stage an incident</legend>
-  <div id="scenarios"></div>
+  <div id="scenarios">
+    <div class="rail" id="rail" aria-label="Kinds of incident"></div>
+    <div class="panel" id="panel"></div>
+  </div>
   <div class="row" style="margin-top:14px">
     <button id="apply">Apply scenario</button>
     <button id="reset" class="ghost">Reset</button>
@@ -275,6 +355,11 @@ const IN_PROGRESS = ['running', 'recovering'];
 const COMPLETE = 'complete';
 
 let chosen = null;
+// Which family's scenarios the panel is showing. Deliberately not the selection:
+// `chosen` is what Apply stages, and the two move independently, so looking
+// through another family does not unpick what was picked. Null until the first
+// catalog arrives, which is what says which family comes first.
+let openFamily = null;
 let actions = [];
 let windowIsFrozen = false;
 // The last catalog polled, kept so a click on a scenario can redraw its badges
@@ -297,11 +382,13 @@ async function json(url, options) {
 // scenario, which is the only way round that works: the same flag is the fault
 // in one scenario and a bystander in the next, so "what does ON mean here" is a
 // question no flag can answer about itself.
+// Read off `chosen` rather than off the radio that is checked, because the two
+// can differ by design: the panel shows one family at a time, so a reader who
+// picks a scenario and then goes looking through another family has a selection
+// with no radio on screen. Asking the DOM would clear the badges at that moment,
+// which is the moment they are being consulted.
 function renderScenarioFlags(catalog) {
-  const selected = document.querySelector('input[name="scenario"]:checked');
-  const scenario = selected
-    ? catalog.scenarios.find(entry => entry.id === selected.value)
-    : null;
+  const scenario = catalog.scenarios.find(entry => entry.id === chosen) || null;
   const position = {};
   catalog.flags.forEach(flag => { position[flag.name] = flag.is_on; });
 
@@ -348,42 +435,99 @@ function renderCatalog(catalog) {
     catalog.active_scenario ? catalog.active_scenario + ' - ' + phase : 'nothing staged'
   );
 
-  const host = document.getElementById('scenarios');
+  renderPicker(catalog, busy);
+}
 
-  if (!host.dataset.rendered) {
-    host.dataset.rendered = '1';
+// The kinds of incident on the left, the open kind's scenarios on the right.
+//
+// Both are written from state on every draw rather than built once and patched,
+// which is what makes a two-second poll safe: whatever is on screen is a
+// function of the catalog, `chosen` and `openFamily`, so there is no way for a
+// redraw to leave a stale row behind. `replaceIfChanged` is what keeps that from
+// costing a repaint every two seconds.
+//
+// Which families exist, and in what order, is the shop's answer and not this
+// page's: a console that grouped the scenarios itself would be a second opinion
+// on the taxonomy, kept in a stylesheet.
+function renderPicker(catalog, busy) {
+  const panel = document.getElementById('panel');
+  // Redrawing replaces the node the keyboard was on, so a reader arrowing down
+  // the radios would lose their place on the very change their keypress caused.
+  const hadFocus = panel.contains(document.activeElement);
+  const families = catalog.families;
+  const scenariosIn = id => catalog.scenarios.filter(entry => entry.family === id);
 
-    for (const scenario of catalog.scenarios) {
-      const label = document.createElement('label');
-      label.className = 'scenario';
-      label.innerHTML =
-        '<input type="radio" name="scenario" value="' + scenario.id + '">' +
-        '<strong>' + scenario.title + '</strong>' +
-        '<span class="desc">' + scenario.description + '</span>';
-      host.appendChild(label);
-    }
-    host.addEventListener('change', event => {
-      chosen = event.target.value;
-      showTheSelectedScenariosFlags();
-    });
+  if (!families.some(family => family.id === openFamily)) {
+    openFamily = families.length ? families[0].id : null;
   }
 
-  // The radios follow Apply rather than sitting live beside it. A control that
-  // answers a click and then changes nothing is worse than one that refuses:
-  // picking a different scenario mid-run looks like it staged something, and
-  // the next thing the watcher reads is telemetry from the scenario they think
-  // they just left. Re-applied on every refresh, not only at render, because
-  // the panel is built once and the phase changes underneath it.
-  for (const radio of host.querySelectorAll('input[name="scenario"]')) {
-    radio.disabled = busy;
+  replaceIfChanged(document.getElementById('rail'), families
+    .map(family => familyRow(family, scenariosIn(family.id)))
+    .join(''));
+
+  const open = families.find(family => family.id === openFamily);
+  const redrawn = replaceIfChanged(panel, !open ? '' :
+    '<p class="blurb">' + open.blurb +
+    '<span class="taxonomy">' + open.taxonomy + '</span></p>' +
+    scenariosIn(open.id).map(entry => scenarioRow(entry, busy)).join(''));
+
+  if (redrawn && hadFocus) {
+    const radio = panel.querySelector('input:checked') ||
+                  panel.querySelector('input');
+    if (radio) radio.focus();
   }
 }
 
-// Selecting a scenario redraws its badges at once rather than at the next poll.
-// Two seconds is short, but it is long enough for a click to feel unanswered,
-// and this is the one control whose whole job is to say what it is about to do.
-function showTheSelectedScenariosFlags() {
-  if (lastCatalog !== null) renderScenarioFlags(lastCatalog);
+// One kind of incident, with how many scenarios stage it and whether the current
+// selection is one of them. The dot is the answer to the one thing grouping
+// costs a reader: the scenario they picked may be in a family they have since
+// navigated away from, and without it the page would look as though nothing were
+// selected while Apply stood ready to stage something.
+function familyRow(family, scenarios) {
+  const holdsSelection = scenarios.some(entry => entry.id === chosen);
+
+  return '<button type="button" class="family" data-family="' + family.id +
+    '" aria-pressed="' + (family.id === openFamily) + '">' +
+    '<span class="name">' + family.name + '</span>' +
+    (holdsSelection
+      ? '<span class="holds-selection" title="the selected scenario is in here">' +
+        '</span>'
+      : '') +
+    '<span class="count">' + scenarios.length + '</span></button>';
+}
+
+// The title always, the brief only while this is the chosen one. A family's
+// briefs run to a paragraph each, and all of them at once is the wall of prose
+// the grouping was done to end.
+//
+// `checked` and `disabled` are written into the markup rather than set on the
+// element afterwards, because this panel is replaced wholesale whenever the
+// family or the selection changes - a property assigned to a node the next draw
+// discards is a property that quietly goes missing.
+//
+// Disabled follows Apply rather than sitting live beside it, which is the older
+// rule and unchanged: a control that answers a click and then changes nothing is
+// worse than one that refuses, because picking a different scenario mid-run
+// looks like it staged something, and the next thing the watcher reads is
+// telemetry from the scenario they think they just left.
+function scenarioRow(scenario, busy) {
+  const isChosen = scenario.id === chosen;
+
+  return '<label class="scenario">' +
+    '<input type="radio" name="scenario" value="' + scenario.id + '"' +
+    (isChosen ? ' checked' : '') + (busy ? ' disabled' : '') + '>' +
+    '<strong class="title">' + scenario.title + '</strong>' +
+    (isChosen ? '<span class="desc">' + scenario.description + '</span>' : '') +
+    '</label>';
+}
+
+// A click is answered now rather than at the next poll. Two seconds is short,
+// but it is long enough for a click to feel unanswered, and these are the
+// controls whose whole job is to say what they are about to do.
+function redrawTheSelection() {
+  if (lastCatalog === null) return;
+  renderScenarioFlags(lastCatalog);
+  renderPicker(lastCatalog, IN_PROGRESS.includes(lastCatalog.phase));
 }
 
 // The first whole minute after the action in which the shop looked well again.
@@ -475,9 +619,13 @@ function renderMetrics(buckets) {
 // back is identical - a finished scenario's window never changes again, and a
 // live one changes in its last row - so the page would otherwise flicker
 // steadily while standing still.
+// Reports whether it actually wrote, which the picker needs: putting the
+// keyboard back where it was only makes sense on a draw that replaced the node
+// the keyboard was on, and doing it unasked would move focus on every poll.
 function replaceIfChanged(element, markup) {
-  if (element.innerHTML === markup) return;
+  if (element.innerHTML === markup) return false;
   element.innerHTML = markup;
+  return true;
 }
 
 function setTextIfChanged(element, text) {
@@ -555,6 +703,23 @@ async function raiseAlert() {
     note.textContent = 'staged, but Argus is not reachable';
   }
 }
+
+// Bound once on the container rather than on the rows, which are rewritten on
+// every draw: a listener attached to a node a later draw replaces is a listener
+// that silently stops answering.
+const picker = document.getElementById('scenarios');
+
+picker.addEventListener('change', event => {
+  chosen = event.target.value;
+  redrawTheSelection();
+});
+
+picker.addEventListener('click', event => {
+  const family = event.target.closest('button.family');
+  if (!family) return;
+  openFamily = family.dataset.family;
+  redrawTheSelection();
+});
 
 document.getElementById('apply').onclick = async () => {
   if (!chosen) { alert('Pick a scenario first.'); return; }
