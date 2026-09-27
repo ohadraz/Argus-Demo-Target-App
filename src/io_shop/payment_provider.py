@@ -6,11 +6,16 @@ for it while it renders. That makes the provider part of every account page -
 another company's service on Io's request path, which is the ordinary shape of a
 shop and the reason an outage somewhere else becomes an outage here.
 
-Nothing in this module retries, falls back, or renders the page without the
-card. That is deliberate rather than unfinished: when the provider is down there
-is nothing the shop can do about it, and code that softened the failure would
-turn an incident about somebody else's outage into an incident about Io's
-resilience.
+Nothing in this module retries or invents a card. When the provider says
+anything other than "here is the card", that is a failure and it is raised,
+named and worded so that a reader can see whose failure it is.
+
+What it is not is the account page's failure. Deciding that is the caller's
+job - see `io_shop.account_page`, which draws the page without the card panel
+and reports these words beside it. The shop cannot fix another company's
+outage, but it can decline to turn one into an outage of its own, and a module
+that raised past a page with a perfectly good figure on it would be doing the
+opposite.
 
 How the provider is reached is the caller's to supply. The shop states what it
 asks for and what it does with the answer, and whoever is running it says where

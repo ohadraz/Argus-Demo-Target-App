@@ -20,7 +20,7 @@ from io_shop.monthly_statement import (
     StatementPeriod,
     render_monthly_statement,
 )
-from io_shop.payment_provider import AskTheProvider, card_on_file
+from io_shop.payment_provider import AskTheProvider, StoredCard, card_on_file
 from io_shop.pricing_service import AskThePricingService, basket_total
 from io_shop.spend_summary import render_spend_summary
 from io_shop.summary_cache import (
@@ -64,6 +64,14 @@ class RenderedPage:
     page was correct and the shopper was charged the right amount; what a reader
     gets from this line is where the request's time went, which is the one thing
     no amount of the shop's own telemetry can say.
+
+    `provider_failure` is the same shape again, for the card. When the payment
+    provider will not answer, `card_last_four` is absent and the provider's own
+    words - host, path, status, and the line they were raised on - are here. The
+    card panel is one of the things this page shows, not the page itself: a
+    shopper whose provider is down still gets their figure, their statement and
+    their basket, and another company's outage is a line in Io's logs rather
+    than a point on Io's error rate.
     """
 
     figure_cents: int | None
@@ -74,6 +82,7 @@ class RenderedPage:
     statement: MonthlyStatement | None = None
     basket_total_cents: int | None = None
     pricing_delay: str | None = None
+    provider_failure: str | None = None
 
 
 def serve_account_page(account: Account,
@@ -99,6 +108,12 @@ def serve_account_page(account: Account,
     tells them apart: one is another team's service and one is another company's,
     and which is which is published in the service catalogue rather than
     inferred from a host name.
+
+    What the page will not do is fail entirely because the card could not be
+    fetched. The figure, the statement and the basket are all in hand by then,
+    and throwing them away would turn a provider's outage into an outage of
+    every account page - which is what it did, once, for real. The provider's
+    words are kept and reported in `provider_failure`.
 
     `use_monthly_summary` and `use_typical_spend` are the rollout decisions
     already made - whether this request is one of the ones each new figure is
@@ -128,9 +143,11 @@ def serve_account_page(account: Account,
             account, use_monthly_statement, statement_period
         )
         basket = basket_total(account.shopper_id, ask_the_pricing_service)
-        card = card_on_file(account.shopper_id, ask_the_provider)
+        card, provider_failure = _the_card_for(
+            account.shopper_id, ask_the_provider
+        )
     except Exception as error:  # noqa: BLE001 - the boundary records anything
-        failure = f"{type(error).__name__}: {error} at {_where_it_was_raised(error)}"
+        failure = _its_own_words(error)
         record_visit(account.shopper_id, failure)
 
         return RenderedPage(figure_cents=None, card_last_four=None, failure=failure)
@@ -138,13 +155,41 @@ def serve_account_page(account: Account,
     record_visit(account.shopper_id, str(figure_cents))
 
     return RenderedPage(figure_cents=figure_cents,
-                        card_last_four=card.last_four,
+                        card_last_four=card.last_four if card is not None else None,
                         failure=None,
                         served_from_cache=from_cache,
                         cache_failure=cache_failure,
                         statement=statement,
                         basket_total_cents=basket.total_cents,
-                        pricing_delay=basket.slow_call)
+                        pricing_delay=basket.slow_call,
+                        provider_failure=provider_failure)
+
+
+def _the_card_for(shopper_id: str,
+                  ask: AskTheProvider) -> tuple[StoredCard | None, str | None]:
+    """The card the provider holds, or nothing and the words for why not.
+
+    The provider belongs to another company and sits on this page's request
+    path, so the ways it can fail are not the shop's to enumerate: a status the
+    shop will not accept, a refused connection, a socket that never answers.
+    All of them mean the same thing here - the card panel cannot be drawn - and
+    none of them means the account page is broken.
+
+    Nothing is swallowed. Whatever comes back is reported in full, type,
+    message and raising line, exactly as the boundary would have reported it;
+    the only change is that it arrives beside a page that rendered instead of
+    in place of one that did not. A reader still sees the provider's host and
+    status in the logs, and still sees that the fault is not in this repository.
+    """
+    try:
+        return card_on_file(shopper_id, ask), None
+    except Exception as error:  # noqa: BLE001 - another company's service
+        return None, _its_own_words(error)
+
+
+def _its_own_words(error: BaseException) -> str:
+    """A failure as the logs spell it: what it was, what it said, and where."""
+    return f"{type(error).__name__}: {error} at {_where_it_was_raised(error)}"
 
 
 def _the_statement_for(account: Account,
