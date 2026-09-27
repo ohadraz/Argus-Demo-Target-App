@@ -27,6 +27,27 @@ def an_account_with_no_purchases_this_month(*prices: int) -> Account:
     )
 
 
+class CountedPurchase:
+    """A purchase that records every read of its price.
+
+    Stands in for `Purchase` so a test can measure how much work the lifetime
+    average does, rather than only whether its answer is right.
+    """
+
+    def __init__(self, price_cents: int, reads: list[int]) -> None:
+        self._price_cents = price_cents
+        self._reads = reads
+
+    @property
+    def price_cents(self) -> int:
+        self._reads[0] += 1
+        return self._price_cents
+
+    @property
+    def in_current_month(self) -> bool:
+        return False
+
+
 def test_the_lifetime_average_spreads_the_total_over_every_purchase() -> None:
     account = an_account_with_no_purchases_this_month(1000, 2000, 3000)
 
@@ -47,6 +68,26 @@ def test_the_lifetime_average_follows_the_purchases_not_the_carried_total() -> N
     )
 
     assert average_spend_per_item(an_account_whose_total_drifted) == 2000
+
+
+def test_the_lifetime_average_reads_each_purchase_about_once() -> None:
+    # The figure is rendered on every account page, so it has to stay linear in
+    # the history. Re-summing the purchases seen so far on each iteration gives
+    # the same answer for n(n+1)/2 reads - 20,100 here - and that is what turned
+    # a 45ms page into a multi-second one.
+    how_many = 200
+    reads = [0]
+    a_long_history = Account(
+        shopper_id="shopper-who-buys-a-lot",
+        purchases=tuple(
+            CountedPurchase(100, reads) for _ in range(how_many)
+        ),
+        total_cents=100 * how_many,
+        total_this_month_cents=0,
+    )
+
+    assert average_spend_per_item(a_long_history) == 100
+    assert reads[0] <= 2 * how_many
 
 
 def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
