@@ -7,26 +7,35 @@ from io_shop.summary_cache import (
     CacheEndpoint,
     CacheUnreachable,
     LookUpSummary,
+    SummaryEntry,
     cached_summary,
+    summary_entry_in,
 )
 
 """The cache the account page reads before it computes.
 
-Two facts are worth pinning. A cache that answers with nothing and a cache that
-cannot be reached are different things, even though both end in the page
+Three facts are worth pinning. A cache that answers with nothing and a cache
+that cannot be reached are different things, even though both end in the page
 working the figure out for itself - and the second says which endpoint it
 failed at, because that endpoint set against the configured one is the whole
 diagnosis when a deployment moves the cache.
+
+The third is the shape. An entry holds a figure and the number of purchases it
+covers, written down together, and this revision reads that shape and no other
+- text carrying anything else is text it passes over, which the page answers
+the way it answers a shopper the cache has never seen.
 """
 
 SOME_SHOPPER = "shopper-1"
 SOME_ENDPOINT = CacheEndpoint(host="cache.io-shop.svc.cluster.local", port=6379)
 
 
-def a_cache_holding(summary_cents: int) -> LookUpSummary:
-    return lambda dont_care_shopper: CacheAnswer(
-        reached=True, summary_cents=summary_cents
-    )
+def an_entry(amount_cents: int = 1234, items_counted: int = 8) -> SummaryEntry:
+    return SummaryEntry(amount_cents=amount_cents, items_counted=items_counted)
+
+
+def a_cache_holding(written: str) -> LookUpSummary:
+    return lambda dont_care_shopper: CacheAnswer(reached=True, entry=written)
 
 
 def a_cache_holding_nothing() -> LookUpSummary:
@@ -38,9 +47,54 @@ def a_cache_that_cannot_be_reached() -> LookUpSummary:
 
 
 def test_a_cache_that_holds_the_figure_answers_with_it() -> None:
-    found = cached_summary(SOME_SHOPPER, a_cache_holding(1234), SOME_ENDPOINT)
+    found = cached_summary(
+        SOME_SHOPPER, a_cache_holding(str(an_entry())), SOME_ENDPOINT
+    )
 
-    assert found == 1234
+    assert found == an_entry()
+
+
+def test_an_entry_carries_what_the_figure_covers() -> None:
+    # Both fields, because the page shows both - what a shopper has spent and
+    # over how many purchases. An entry holding the first alone would send the
+    # page back to the history for the second, which is the walk the cache
+    # exists to save.
+    found = cached_summary(
+        SOME_SHOPPER,
+        a_cache_holding(str(an_entry(amount_cents=4500, items_counted=3))),
+        SOME_ENDPOINT
+    )
+
+    assert found is not None
+    assert found.amount_cents == 4500
+    assert found.items_counted == 3
+
+
+def test_an_entry_is_written_down_as_the_figure_and_its_count() -> None:
+    # The writer, and the one spelling of an entry there is. Whatever puts an
+    # entry in writes it this way, and whatever quotes an unreadable one quotes
+    # this text.
+    assert str(an_entry(amount_cents=4500, items_counted=3)) == "4500/3"
+
+
+def test_text_that_is_not_an_entry_holds_no_entry() -> None:
+    # This revision reads the shape above and no other. Text carrying a bare
+    # figure - the shape stored before an entry had a count - is not an entry
+    # here, and there is no read path that makes it one.
+    assert summary_entry_in("4500") is None
+
+
+def test_text_whose_fields_are_not_numbers_holds_no_entry() -> None:
+    assert summary_entry_in("four thousand/three") is None
+
+
+def test_a_cache_holding_something_unreadable_is_answered_as_a_miss() -> None:
+    # Not an exception. This module fails no page: an entry that cannot be read
+    # is, to the page in front of it, an entry that is not there, and the page
+    # works the figure out for itself exactly as it does on a first visit.
+    found = cached_summary(SOME_SHOPPER, a_cache_holding("4500"), SOME_ENDPOINT)
+
+    assert found is None
 
 
 def test_a_cache_that_holds_nothing_answers_with_nothing() -> None:

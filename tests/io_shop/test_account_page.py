@@ -7,7 +7,12 @@ from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
 from io_shop.pricing_service import AskThePricingService, PricingAnswer
-from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
+from io_shop.summary_cache import (
+    CacheAnswer,
+    CacheEndpoint,
+    LookUpSummary,
+    SummaryEntry,
+)
 
 """The shop's request boundary: what a caller sees when the page fails.
 
@@ -172,9 +177,9 @@ def test_a_provider_failure_names_the_provider_and_the_status() -> None:
 
 
 def a_cache_holding(summary_cents: int) -> LookUpSummary:
-    return lambda dont_care_shopper: CacheAnswer(
-        reached=True, summary_cents=summary_cents
-    )
+    written = str(SummaryEntry(amount_cents=summary_cents, items_counted=8))
+
+    return lambda dont_care_shopper: CacheAnswer(reached=True, entry=written)
 
 
 def a_cache_holding_nothing() -> LookUpSummary:

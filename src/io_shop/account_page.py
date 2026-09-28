@@ -201,7 +201,7 @@ def _the_figure_for(
         found, cache_failure = None, str(unreachable)
 
     if found is not None:
-        return found, True, cache_failure
+        return found.amount_cents, True, cache_failure
 
     return render_spend_summary(
         account,

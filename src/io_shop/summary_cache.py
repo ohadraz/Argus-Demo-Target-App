@@ -1,9 +1,14 @@
 """The spend figure Io has already worked out once, kept so it need not again.
 
 Working the figure out means walking a shopper's whole purchase history, and an
-account page is the most-visited page the shop has. So the figure is cached
-under the shopper it belongs to, and the page reads the cache before it
-computes - which is what makes the shop fast rather than merely correct.
+account page is the most-visited page the shop has. So what that walk produced
+is cached under the shopper it belongs to, and the page reads the cache before
+it computes - which is what makes the shop fast rather than merely correct.
+
+An entry carries the figure and the number of purchases it was worked out over,
+written down together as one piece of text. Both, because the page shows both,
+and a cache holding only the figure sends the page back to the purchase history
+for the count - which is the walk the cache exists to avoid.
 
 Nothing here fails a page. A cache that has nothing for this shopper, and a
 cache that cannot be reached at all, both end the same way: the page works the
@@ -31,6 +36,13 @@ from dataclasses import dataclass
 # comparison that diagnoses this.
 _ENDPOINT_FORMAT = "redis://{host}:{port}"
 
+# How an entry is written down, and what separates the two things it holds.
+# Spelled out so that the text a failure quotes is the text the shop wrote -
+# a reader setting one against the other is doing the one comparison that says
+# whether a writer and a reader agree about the shape.
+_ENTRY_FORMAT = "{amount_cents}/{items_counted}"
+_ENTRY_SEPARATOR = "/"
+
 
 @dataclass(frozen=True)
 class CacheEndpoint:
@@ -49,6 +61,56 @@ class CacheEndpoint:
 
 
 @dataclass(frozen=True)
+class SummaryEntry:
+    """What the cache holds for one shopper: the figure, and what it covers.
+
+    A value rather than a bare figure, because the two are only a summary
+    together. The account page shows what a shopper has spent *and* across how
+    many purchases, and an entry carrying the first alone leaves the page
+    walking the history for the second - which is the walk this cache exists to
+    save.
+
+    Written down as one piece of text, because that is what a cache stores: the
+    entry goes in under the shopper it belongs to and comes back as the same
+    characters. `__str__` is therefore the writer, exactly as it is for
+    `CacheEndpoint` above - one spelling of an entry, used to put it in and
+    quoted whenever something cannot read it back.
+    """
+
+    amount_cents: int
+    items_counted: int
+
+    def __str__(self) -> str:
+        return _ENTRY_FORMAT.format(
+            amount_cents=self.amount_cents, items_counted=self.items_counted
+        )
+
+
+def summary_entry_in(written: str) -> SummaryEntry | None:
+    """The entry this text holds, or `None` where it holds none.
+
+    The shape above and no other. Text that does not carry the two fields an
+    entry has is text this revision has nothing to do with, and passing over it
+    is what the shop's fallback is for: the page works the figure out for
+    itself, which is the same thing it does for a shopper the cache has never
+    seen.
+
+    `None` rather than an exception for the same reason a miss is `None`. This
+    module fails no page - see the docstring at the top - and an entry that
+    cannot be read is, to the page in front of it, an entry that is not there.
+    """
+    amount, separator, items = written.partition(_ENTRY_SEPARATOR)
+
+    if not separator:
+        return None
+
+    try:
+        return SummaryEntry(amount_cents=int(amount), items_counted=int(items))
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
 class CacheAnswer:
     """One reply from the cache: whether it was reached, and what it held.
 
@@ -62,10 +124,15 @@ class CacheAnswer:
     fetched it, for the reason the provider's status is: turning it into the
     shop's own words is this module's job, and a fetcher that composed them
     would put that in as many places as there are ways to reach a cache.
+
+    What it held is the text the cache had under this shopper, unread. Reading
+    it is this module's job too, and a fetcher that handed back a parsed entry
+    would be deciding, in as many places as there are ways to reach a cache,
+    what an entry is.
     """
 
     reached: bool
-    summary_cents: int | None = None
+    entry: str | None = None
 
 
 class CacheUnreachable(Exception):
@@ -88,8 +155,8 @@ type LookUpSummary = Callable[[str], CacheAnswer]
 
 def cached_summary(shopper_id: str,
                    look_up: LookUpSummary,
-                   endpoint: CacheEndpoint) -> int | None:
-    """The figure the cache holds for this shopper, or `None` where it holds
+                   endpoint: CacheEndpoint) -> SummaryEntry | None:
+    """The entry the cache holds for this shopper, or `None` where it holds
     none.
 
     Raises `CacheUnreachable` when the cache did not answer, and the message is
@@ -104,4 +171,7 @@ def cached_summary(shopper_id: str,
     if not answer.reached:
         raise CacheUnreachable(f"connection refused to {endpoint}")
 
-    return answer.summary_cents
+    if answer.entry is None:
+        return None
+
+    return summary_entry_in(answer.entry)

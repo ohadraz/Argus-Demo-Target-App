@@ -41,7 +41,12 @@ from io_shop.monthly_statement import StatementPeriod, period_for
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
 from io_shop.pricing_service import AskThePricingService, PricingAnswer
 from io_shop.rollout import CANARY_SHARE
-from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
+from io_shop.summary_cache import (
+    CacheAnswer,
+    CacheEndpoint,
+    LookUpSummary,
+    SummaryEntry,
+)
 from target_app.settings import (
     DeclaredAutoscaler,
     get_unleash_settings,
@@ -323,8 +328,21 @@ _DEPLOY_SLOWDOWN = 10.0
 # What the cache hands back when it holds a shopper's figure. Which figure it
 # is decides nothing - the page shows it and no metric reads it - and a cached
 # value disagreeing with a recomputed one would be a staleness bug this
-# scenario is not about.
+# scenario is not about. The count beside it decides nothing either, for the
+# same reason: an entry carries what a shopper spent and over how many
+# purchases, and no series here reads either number.
 _A_CACHED_FIGURE_CENTS = 2400
+_ITEMS_BEHIND_A_CACHED_FIGURE = 8
+# Written by the shop's own writer rather than spelled out here, so that a
+# fixture handing an entry to the shop hands it the same text the shop would
+# have put in. A second spelling of the entry format is a second answer to what
+# an entry looks like, and the whole of this scenario is two answers to that.
+_A_CACHED_ENTRY = str(
+    SummaryEntry(
+        amount_cents=_A_CACHED_FIGURE_CENTS,
+        items_counted=_ITEMS_BEHIND_A_CACHED_FIGURE
+    )
+)
 
 # How fast a leaking shop's heap grows. Fast enough that the climb is a climb
 # within a few minutes of anybody looking, and slow enough that the whole of it
@@ -2016,7 +2034,7 @@ def _the_cache_answering(cache_entropy: random.Random | None,
 
         return CacheAnswer(
             reached=True,
-            summary_cents=_A_CACHED_FIGURE_CENTS if held_it else None
+            entry=_A_CACHED_ENTRY if held_it else None
         )
 
     return look_up
