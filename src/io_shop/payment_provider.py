@@ -22,7 +22,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-
 # Who Io banks with. A host rather than a product name, because a host is what
 # appears in a failed request's own words - and those words are what somebody
 # reading the logs at three in the morning has to recognise as not-ours.

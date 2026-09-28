@@ -42,7 +42,6 @@ from dataclasses import dataclass
 
 from io_shop.accounts import Account, Purchase
 
-
 # The shop keeps money in pence and shows it in pounds, which is the ordinary
 # arrangement and the ordinary source of the ordinary bug: a figure formatted
 # from the wrong unit is out by a hundred and looks entirely plausible either

@@ -25,6 +25,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from target_app.scenarios import (
+    AUTOSCALER_FLAPPING,
     BAD_DEPLOYMENT,
     CACHE_MISCONFIGURED,
     CPU_SATURATION,
@@ -98,6 +99,15 @@ _WHAT_FIRED: dict[str, tuple[str, str]] = {
     # rule that fired whenever CPU rose would fire every evening, and the thing
     # worth waking somebody for is the latency it caused.
     CPU_SATURATION: (
+        _HIGH_LATENCY, "p95 latency above threshold for 5m"
+    ),
+    # A fourth, and the same words again. The temptation here is to page on the
+    # replica count moving, which is the one signal that would name this incident
+    # from the alert alone - and it would be a rule no real monitoring stack has,
+    # because a deployment resizing is what an autoscaler is *for*. What is worth
+    # waking somebody for is that the latency never settles; that the capacity is
+    # what will not settle is the investigation's to find, and it is retrievable.
+    AUTOSCALER_FLAPPING: (
         _HIGH_LATENCY, "p95 latency above threshold for 5m"
     ),
 }

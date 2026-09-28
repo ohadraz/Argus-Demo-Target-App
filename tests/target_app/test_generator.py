@@ -16,13 +16,17 @@ from target_app.generator import (
     DemandSurge,
     FlagTimeline,
     GeneratedMinute,
+    LiveAutoscaler,
+    Pin,
     PricingSlowdown,
     ProviderOutage,
     Scaling,
     SlowDeployment,
     SlowRollout,
     generate,
+    the_cores_of,
 )
+from target_app.settings import DeclaredAutoscaler
 
 """The generator, which is where this service earns its keep.
 
@@ -1509,3 +1513,244 @@ def test_capacity_reports_the_size_in_force_during_a_minute() -> None:
 
 def test_a_deployment_nobody_has_scaled_is_the_size_it_is_configured_for() -> None:
     assert Capacity(sized_for=3).replicas_during(SOME_NOW) == 3
+
+
+SOME_DECLARED_AUTOSCALER = DeclaredAutoscaler(
+    min_replicas=3,
+    max_replicas=6,
+    target_cpu_percent=70,
+    scale_down_stabilization_seconds=0,
+)
+
+
+def a_window_with_the_autoscaler_flapping(
+    began_minutes_ago: int = 18,
+    pins: tuple[Pin, ...] = (),
+    scaled_to: int | None = None,
+    scaled_minutes_ago: int | None = None,
+) -> list[GeneratedMinute]:
+    """A shop whose traffic surged and whose controller will not settle.
+
+    The surge is the saturation window's, with no figure of its own: what
+    separates the two scenarios is the controller, so the demand has to be the
+    same demand or a comparison between them says nothing.
+
+    Eighteen minutes back by default, which is far enough that the ramp has
+    finished and the last several minutes are the steady cycle rather than a
+    climb. The cycle is dated from the surge, so that is also what fixes which
+    minutes are served at the ceiling.
+    """
+    scalings = (
+        (Scaling(at=SOME_NOW - timedelta(minutes=scaled_minutes_ago), replicas=scaled_to),)
+        if scaled_to is not None and scaled_minutes_ago is not None
+        else ()
+    )
+
+    return generate(
+        None,
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="dont-care-flag",
+        demand_surge=DemandSurge(began_at=SOME_NOW - timedelta(minutes=began_minutes_ago)),
+        capacity=Capacity(sized_for=3, scalings=scalings),
+        autoscaler=LiveAutoscaler(declared=SOME_DECLARED_AUTOSCALER, pins=pins),
+    )
+
+
+def test_a_flapping_window_asked_for_twice_reads_the_same() -> None:
+    # The property a derived capacity had to be derived to keep. Recording a
+    # controller's resizes as each window was served would have the same window
+    # read differently the second time it was fetched, and nothing downstream
+    # could then tell a change from a re-fetch.
+    once = a_window_with_the_autoscaler_flapping()
+    again = a_window_with_the_autoscaler_flapping()
+
+    assert [(m.minute_id, m.cpu_limit_cores, m.p95_ms) for m in once] == \
+           [(m.minute_id, m.cpu_limit_cores, m.p95_ms) for m in again]
+
+
+def test_the_capacity_of_a_flapping_deployment_takes_more_than_one_value() -> None:
+    # The field that separates this incident from a shop that has outgrown a
+    # fixed size. At the bottom of every cycle the rest of the evidence is
+    # saturation's exactly, so this is the one series a reader can tell them
+    # apart by.
+    flapping = a_window_with_the_autoscaler_flapping()
+    outgrown = a_window_with_the_traffic_surging(began_minutes_ago=18)
+
+    assert {minute.cpu_limit_cores for minute in flapping} == {
+        the_cores_of(3), the_cores_of(6)
+    }
+    assert {minute.cpu_limit_cores for minute in outgrown} == {the_cores_of(3)}
+
+
+def test_two_minutes_at_the_floor_are_served_for_every_one_at_the_ceiling() -> None:
+    # The cycle's asymmetry, which is the readiness lag and not a taste: the
+    # minute after a scale-up is still served at the old capacity, so only the
+    # third minute of each three gets the replicas the controller asked for.
+    minutes = a_window_with_the_autoscaler_flapping()
+
+    served_at = [minute_at(ago, minutes).cpu_limit_cores for ago in (6, 5, 4, 3, 2, 1)]
+
+    assert served_at == [
+        the_cores_of(3), the_cores_of(3), the_cores_of(6),
+        the_cores_of(3), the_cores_of(3), the_cores_of(6)
+    ]
+
+
+def test_a_flapping_shop_pins_its_usage_in_some_minutes_and_not_others() -> None:
+    # What a flap does to the two CPU series together: at the floor the demand
+    # is past what the shop has and the gauge pins, and one minute in three it
+    # has room to spare. A window where every minute pinned would be saturation,
+    # and one where none did would be a shop that is coping.
+    minutes = a_window_with_the_autoscaler_flapping()
+    steady = [minute_at(ago, minutes) for ago in range(6, 0, -1)]
+
+    assert [m for m in steady if m.cpu_used_cores == m.cpu_limit_cores]
+    assert [m for m in steady if m.cpu_used_cores < m.cpu_limit_cores]
+
+
+def test_a_flap_moves_the_quantiles_in_both_directions() -> None:
+    # The signature: latency does not climb and stay climbed, it sawtooths. A
+    # detector that confirmed a recovery over any stretch of this would be
+    # confirming whatever was tried last.
+    minutes = a_window_with_the_autoscaler_flapping()
+
+    calm = minute_at(19, minutes)
+    at_the_floor = minute_at(2, minutes)
+    at_the_ceiling = minute_at(1, minutes)
+
+    assert at_the_floor.p95_ms > calm.p95_ms * 5
+    assert at_the_ceiling.p95_ms < at_the_floor.p95_ms / 5
+    assert at_the_ceiling.p95_ms < calm.p95_ms * 2
+
+
+def test_the_minutes_before_the_surge_are_served_at_the_floor_throughout() -> None:
+    # A capacity that oscillated through the quiet minutes would be a baseline
+    # that is already the signal - and a reader has to have seen this series hold
+    # still for its moving to mean anything.
+    minutes = a_window_with_the_autoscaler_flapping(began_minutes_ago=10)
+
+    before = [minute_at(ago, minutes) for ago in range(20, 10, -1)]
+
+    assert {minute.cpu_limit_cores for minute in before} == {the_cores_of(3)}
+
+
+def test_a_flap_fails_no_request_and_eats_no_memory() -> None:
+    # The same claim the surge makes, for the same reason: errors are the leak's
+    # late signal and a climbing heap is the leak's signal entirely. A capacity
+    # incident that moved either would be indistinguishable from one.
+    minutes = a_window_with_the_autoscaler_flapping()
+
+    assert all(minute.error_rate < CLEARLY_HEALTHY for minute in minutes)
+    assert all(
+        minute.memory_used_bytes < BASELINE_MEMORY_BYTES * 1.1 for minute in minutes
+    )
+
+
+def test_scaling_out_under_a_live_controller_lasts_one_minute() -> None:
+    # The scenario's second point, and the thing nothing in this fixture had ever
+    # done: a mitigation that sets a replica count under a live controller has a
+    # timer on it. Until now no controller put a count back, so the claim was
+    # reasoned about and never demonstrated.
+    minutes = a_window_with_the_autoscaler_flapping(scaled_to=6, scaled_minutes_ago=3)
+    untouched = a_window_with_the_autoscaler_flapping()
+
+    scaled = minute_at(3, minutes)
+    the_minute_after = minute_at(2, minutes)
+
+    assert minute_at(3, untouched).cpu_limit_cores == the_cores_of(3)
+    assert scaled.cpu_limit_cores == the_cores_of(6)
+    assert the_minute_after.cpu_limit_cores == the_cores_of(3)
+    assert the_minute_after.p95_ms > scaled.p95_ms * 5
+
+
+def test_pinning_the_floor_stops_the_cycle() -> None:
+    # What makes a pin the mitigation. The controller has nowhere left to scale
+    # down to, so the count holds without the controller being taken away.
+    minutes = a_window_with_the_autoscaler_flapping(
+        pins=(Pin(at=SOME_NOW - timedelta(minutes=6), floor=6),)
+    )
+
+    while_it_flapped = minute_at(8, minutes)
+    held = [minute_at(ago, minutes) for ago in range(6, 0, -1)]
+
+    assert while_it_flapped.cpu_limit_cores == the_cores_of(3)
+    assert {minute.cpu_limit_cores for minute in held} == {the_cores_of(6)}
+    assert all(minute.p95_ms < while_it_flapped.p95_ms / 5 for minute in held)
+
+
+def test_putting_the_floor_back_resumes_the_cycle() -> None:
+    # A withdrawal is one more pin rather than a value going back, so the minutes
+    # the shop spent held keep the capacity they were served at - and the cycle
+    # picks up at the position the minute itself says, because the position was
+    # never stored anywhere to be resumed from.
+    minutes = a_window_with_the_autoscaler_flapping(
+        pins=(
+            Pin(at=SOME_NOW - timedelta(minutes=8), floor=6),
+            Pin(at=SOME_NOW - timedelta(minutes=3), floor=3)
+        )
+    )
+
+    held = minute_at(5, minutes)
+    flapping_again = minute_at(2, minutes)
+    at_the_ceiling_again = minute_at(1, minutes)
+
+    assert held.cpu_limit_cores == the_cores_of(6)
+    assert flapping_again.cpu_limit_cores == the_cores_of(3)
+    assert at_the_ceiling_again.cpu_limit_cores == the_cores_of(6)
+    assert flapping_again.p95_ms > held.p95_ms * 5
+
+
+def test_a_shop_with_no_controller_staged_is_exactly_as_it_was() -> None:
+    # The derivation is reached only where an autoscaler is handed in, so every
+    # scenario that stages none reports the capacity it always did.
+    without = generate(
+        None,
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="dont-care-flag",
+        demand_surge=DemandSurge(began_at=SOME_NOW - timedelta(minutes=18)),
+        capacity=Capacity(sized_for=3),
+    )
+
+    assert [(m.minute_id, m.cpu_limit_cores, m.p95_ms) for m in without] == [
+        (m.minute_id, m.cpu_limit_cores, m.p95_ms)
+        for m in a_window_with_the_traffic_surging(began_minutes_ago=18)
+    ]
+
+
+def test_a_controller_with_no_surge_beside_it_holds_the_floor() -> None:
+    # A controller with nothing to react to does not flap. The cycle is dated
+    # from the moment demand began climbing, so a window with no surge staged has
+    # no position in it to read.
+    minutes = generate(
+        None,
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="dont-care-flag",
+        capacity=Capacity(sized_for=3),
+        autoscaler=LiveAutoscaler(declared=SOME_DECLARED_AUTOSCALER),
+    )
+
+    assert {minute.cpu_limit_cores for minute in minutes} == {the_cores_of(3)}
+
+
+def a_minute_ago(minutes: int, now: datetime = SOME_NOW) -> datetime:
+    """The minute that many minutes back, as the generator names a bucket.
+
+    Truncated, which is what separates a minute from a moment: `resized_during`
+    asks whether a resize landed in *this bucket*, so it is asked about buckets
+    and never about the second of one a test happened to pick.
+    """
+    return (now - timedelta(minutes=minutes)).replace(second=0, microsecond=0)
+
+
+def test_a_resize_is_reported_only_for_the_minute_it_landed_in() -> None:
+    capacity = Capacity(
+        sized_for=3,
+        scalings=(Scaling(at=SOME_NOW - timedelta(minutes=5, seconds=20), replicas=6),)
+    )
+
+    assert capacity.resized_during(a_minute_ago(5)) == 6
+    assert capacity.resized_during(a_minute_ago(4)) is None
+    assert capacity.resized_during(a_minute_ago(6)) is None

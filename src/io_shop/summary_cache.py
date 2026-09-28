@@ -25,7 +25,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-
 # How the cache is addressed, in the scheme its client speaks. Spelled out so
 # that the endpoint in a failure line is the endpoint the shop actually dialled
 # - a reader comparing it against what the configuration says is doing the one

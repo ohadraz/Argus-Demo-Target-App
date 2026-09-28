@@ -4,6 +4,7 @@ from unittest.mock import Mock
 
 import httpx
 import pytest
+
 from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.settings import UnleashSettings
 

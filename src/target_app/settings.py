@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,16 @@ _PORT = "port"
 # configuration knows which line decides it.
 _REPLICAS = "replicas"
 
+# Where the autoscaler's shape is written. The floor and the ceiling are the two
+# a mitigation reads and writes, so they are spelled out here beside the count
+# they bound; the target and the stabilisation window are read for the manifest
+# the platform reports, which is the only place a fault in them is visible.
+_AUTOSCALING = "autoscaling"
+_MIN_REPLICAS = "minReplicas"
+_MAX_REPLICAS = "maxReplicas"
+_TARGET_CPU_PERCENT = "targetCpuPercent"
+_SCALE_DOWN_STABILIZATION_SECONDS = "scaleDownStabilizationSeconds"
+
 # Where the cache actually listens, which is where the revision *before* the
 # current one pointed the shop. A constant rather than a second read, because
 # this service cannot read git: the previous revision's values live in the
@@ -35,6 +46,30 @@ _REPLICAS = "replicas"
 # It is what a rollback puts back, and it is the port the shop runs on until a
 # scenario applies the deployed configuration on top.
 LAST_KNOWN_GOOD_CACHE_PORT = 6379
+
+
+@dataclass(frozen=True)
+class DeclaredAutoscaler:
+    """The autoscaler as the repository declares it.
+
+    Four values, and they are read by two different readers for two different
+    reasons. The floor and the ceiling bound the count, so they are what a
+    scenario derives its cycle between and what a pin reads and writes. The target
+    and the stabilisation window decide nothing here - the cycle's shape comes
+    from the readiness lag rather than from arithmetic over them - and they are
+    carried so that the manifest the platform reports is the whole resource: a
+    window of zero is the fault in this deployment, and a reader who cannot see it
+    is being asked to take the diagnosis on trust.
+
+    Frozen, and distinct from the live autoscaler that `ScenarioState` holds. This
+    is what git asks for; that is what is in force, and a pin is exactly the
+    difference between them.
+    """
+
+    min_replicas: int
+    max_replicas: int
+    target_cpu_percent: int
+    scale_down_stabilization_seconds: int
 
 
 class UnleashSettings(BaseSettings):
@@ -98,16 +133,6 @@ class ScenarioSettings(BaseSettings):
 
     onset_backdate_minutes: int = Field(default=5, gt=0)
 
-    # How long the shop keeps generating after the flag goes off, before the
-    # scenario is done and its window stops advancing.
-    #
-    # It exists because recovery has to be *shown*, not just reached: a couple
-    # of clean minutes after the drop are what turn "the number went down" into
-    # "the number went down and stayed down". And it has to end, because a
-    # scenario that generates for ever is still running when the next one is
-    # being presented.
-    settle_minutes: int = Field(default=3, gt=0)
-
     # How long a leaking shop has been leaking by the time it is seeded, which
     # is the same trick `onset_backdate_minutes` plays and needs a bigger number
     # for a different reason. A flag fault steps: one minute of it is already a
@@ -169,6 +194,35 @@ def the_deployed_replica_count(values_file: Path = VALUES_FILE) -> int:
     values: dict[str, Any] = yaml.safe_load(values_file.read_text(encoding="utf-8"))
 
     return int(values[_REPLICAS])
+
+
+def the_declared_autoscaler(values_file: Path = VALUES_FILE) -> DeclaredAutoscaler:
+    """The autoscaler the deployment is configured with.
+
+    What the repository asks for, which is the shape the platform renders and the
+    floor a deployment nobody has pinned sits at. Not what is in force: a pin
+    raises the live floor and leaves this file alone, which is the whole reason
+    such a mitigation is mitigation rather than a fix. So this is where an
+    autoscaler *starts* and what a reset returns it to - `ScenarioState` holds
+    what is running.
+
+    Read on every call and raising where the stanza is absent, for the reasons the
+    cache's address and the replica count are read that way: configuration is the
+    part of a deployment that changes under a running service, and a shop that
+    invented an autoscaler when its configuration was missing would be a shop
+    whose configuration decides nothing.
+    """
+    values: dict[str, Any] = yaml.safe_load(values_file.read_text(encoding="utf-8"))
+    autoscaling = values[_AUTOSCALING]
+
+    return DeclaredAutoscaler(
+        min_replicas=int(autoscaling[_MIN_REPLICAS]),
+        max_replicas=int(autoscaling[_MAX_REPLICAS]),
+        target_cpu_percent=int(autoscaling[_TARGET_CPU_PERCENT]),
+        scale_down_stabilization_seconds=int(
+            autoscaling[_SCALE_DOWN_STABILIZATION_SECONDS]
+        )
+    )
 
 
 def the_working_cache_endpoint(values_file: Path = VALUES_FILE) -> CacheEndpoint:

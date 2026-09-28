@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -27,8 +27,8 @@ from target_app.generator import (
 from target_app.history import FlagHistoryUnavailable
 from target_app.monitoring import AlertNotDelivered, fire_alert
 from target_app.oncall import a_user, an_incident
-from target_app.people import pay_grades_and_bands
 from target_app.payments import charges_between
+from target_app.people import pay_grades_and_bands
 from target_app.rates import UnknownBase, rates_quoted_against
 from target_app.registry import dependencies_of
 from target_app.scenarios import (
@@ -204,6 +204,29 @@ SCALE_ACTION = "scale"
 # carried as text and the action's script is what makes a number of it.
 REPLICAS_PARAMETER = "replicas"
 
+# How the platform addresses the autoscaler, in Kubernetes' own vocabulary. The
+# resource endpoint dispatches on these, which is what lets one route answer for
+# two kinds - and `autoscaling/v2` is the version that carries `behavior`, so a
+# stand-in reporting `v1` would be reporting a resource in which this deployment's
+# fault cannot be expressed.
+AUTOSCALER_GROUP = "autoscaling"
+AUTOSCALER_VERSION = "v2"
+AUTOSCALER_KIND = "HorizontalPodAutoscaler"
+# What the autoscaler is called, as a suffix on the application's name. Deliberately
+# not the application's own name: Kubernetes does not require an autoscaler to share
+# its target's, so a fixture that made them equal would let a caller address the
+# application and pass, and the one that addressed the resource correctly would look
+# no different.
+_THE_AUTOSCALERS_SUFFIX = "-cpu"
+
+# What a caller may patch, and the type of patch that carries it. A merge patch is
+# Argo CD's own default and the only one accepted here: a JSON patch is a list of
+# operations rather than a document, and a stand-in that read one shape and
+# claimed the other would be teaching a caller a wire that does not exist.
+MERGE_PATCH_TYPE = "application/merge-patch+json"
+SPEC_FIELD = "spec"
+MIN_REPLICAS_FIELD = "minReplicas"
+
 
 class ArgoCdActionParameter(BaseModel):
     """One argument to a resource action, in Argo CD's shape for it.
@@ -233,12 +256,12 @@ class ArgoCdResourceAction(BaseModel):
 
     action: str
     namespace: str | None = None
-    resourceName: str | None = None  # noqa: N815 - Argo CD's own spelling
+    resourceName: str | None = None
     group: str | None = None
     kind: str | None = None
     # Argo CD's own spelling, and its own shape - a list of named values rather
     # than an object, because an action declares its parameters in order.
-    resourceActionParameters: list[ArgoCdActionParameter] = Field(  # noqa: N815
+    resourceActionParameters: list[ArgoCdActionParameter] = Field(
         default_factory=list
     )
 
@@ -404,9 +427,9 @@ class MetricBucket(BaseModel):
 # so anything renamed here would be a lie the adapter would have to be written
 # around.
 class ArgoCdSource(BaseModel):
-    repoURL: str  # noqa: N815
+    repoURL: str
     path: str
-    targetRevision: str  # noqa: N815
+    targetRevision: str
 
 
 class ArgoCdInitiator(BaseModel):
@@ -416,10 +439,10 @@ class ArgoCdInitiator(BaseModel):
 class ArgoCdRevisionHistory(BaseModel):
     id: int
     revision: str
-    deployedAt: str  # noqa: N815
-    deployStartedAt: str  # noqa: N815
+    deployedAt: str
+    deployStartedAt: str
     source: ArgoCdSource
-    initiatedBy: ArgoCdInitiator  # noqa: N815
+    initiatedBy: ArgoCdInitiator
 
 
 class ArgoCdApplicationMetadata(BaseModel):
@@ -441,7 +464,7 @@ class ArgoCdAutomatedSync(BaseModel):
     """
 
     prune: bool = False
-    selfHeal: bool = False  # noqa: N815
+    selfHeal: bool = False
 
 
 class ArgoCdSyncPolicy(BaseModel):
@@ -449,7 +472,7 @@ class ArgoCdSyncPolicy(BaseModel):
 
 
 class ArgoCdApplicationSpec(BaseModel):
-    syncPolicy: ArgoCdSyncPolicy = ArgoCdSyncPolicy()  # noqa: N815
+    syncPolicy: ArgoCdSyncPolicy = ArgoCdSyncPolicy()
 
 
 class ArgoCdApplication(BaseModel):
@@ -493,14 +516,23 @@ class ArgoCdResourceNode(BaseModel):
     both exist in real life - a platform is asked about pods and a monitor is
     asked about series.
 
-    Only the fields a caller confirming a restart reads. A real node carries its
-    health, its parents and its resource version too, and a stand-in that
-    invented values for those would be putting figures into the world for nobody
-    to read.
+    Only the fields a caller confirming a restart reads, plus the two a caller
+    *finding* a resource needs. A real node carries its health, its parents and
+    its resource version too, and a stand-in that invented values for those would
+    be putting figures into the world for nobody to read.
+
+    `group` and `version` are those two, and they are here because the tree is now
+    read for more than one kind: a pin looks through it for the autoscaler, and
+    what identifies a resource to Argo CD is the triple of group, version and
+    kind rather than the kind alone. Absent on a core resource, which is the
+    vendor's own shape - a Pod's group is the empty one, and reporting `""` for it
+    would be a spelling a caller has to know to compare against.
     """
 
     kind: str
     name: str
+    group: str | None = None
+    version: str | None = None
     namespace: str
     createdAt: str
 
@@ -532,7 +564,7 @@ class ArgoCdRollback(BaseModel):
     name: str | None = None
     id: int
     prune: bool = False
-    dryRun: bool = False  # noqa: N815
+    dryRun: bool = False
 
 
 @app.get("/health")
@@ -856,21 +888,50 @@ def argocd_resource_tree(application: str) -> ArgoCdResourceTree:
     if came_up is None:
         return ArgoCdResourceTree(nodes=[])
 
-    return ArgoCdResourceTree(
-        nodes=[
+    nodes = [
+        ArgoCdResourceNode(
+            kind="Pod",
+            name=f"{application}-{_A_POD_SUFFIX}",
+            namespace="production",
+            createdAt=came_up.strftime(TIMESTAMP_FORMAT)
+        )
+    ]
+    autoscaler = state.autoscaler
+
+    if autoscaler is not None:
+        # Listed only while one is staged, which is the same condition the
+        # manifest route answers a 404 on. A tree that always carried an
+        # autoscaler node would have a pin find a controller the platform cannot
+        # then describe.
+        #
+        # Named for the resource and not for the application, which is the one
+        # deliberate awkwardness here. Kubernetes does not require an autoscaler
+        # to share its target's name, and a fixture that made them equal would let
+        # a caller send the application's name as `resourceName` and pass - so this
+        # is the shape that catches it, and the name a pin sends has to be the one
+        # reported here.
+        nodes.append(
             ArgoCdResourceNode(
-                kind="Pod",
-                name=f"{application}-{_A_POD_SUFFIX}",
+                kind=AUTOSCALER_KIND,
+                name=f"{application}{_THE_AUTOSCALERS_SUFFIX}",
+                group=AUTOSCALER_GROUP,
+                version=AUTOSCALER_VERSION,
                 namespace="production",
+                # The same instant the process reports having started, because the
+                # autoscaler has been there as long as the deployment has and
+                # nothing reads this field for it. A creation time inside the
+                # window would read as a controller somebody added during the
+                # incident, which is a different incident entirely.
                 createdAt=came_up.strftime(TIMESTAMP_FORMAT)
             )
-        ]
-    )
+        )
+
+    return ArgoCdResourceTree(nodes=nodes)
 
 
 @app.get("/argocd/{application}/resource", response_model=ArgoCdManagedResource)
 def argocd_managed_resource(application: str,
-                            resourceName: str | None = None,  # noqa: N803
+                            resourceName: str | None = None,
                             namespace: str | None = None,
                             group: str | None = None,
                             version: str | None = None,
@@ -888,17 +949,25 @@ def argocd_managed_resource(application: str,
     stand-in answering a parsed object would be an easier endpoint to write
     against and not the one the adapter will meet.
 
-    Every selector is accepted and ignored, as elsewhere in this file: there is
-    one shop and one Deployment, so the resource a caller addressed can only be
-    the one there is. The pricing service is the exception for the reason it is
-    the exception to a scale - the fixture holds no size for it, and answering
-    with the shop's would be reporting a neighbour's capacity as its own.
+    `kind` is the one selector this reads, because it is the one that changes the
+    answer: a deployment whose size a controller decides has two live resources
+    worth asking about, and the count is on one of them while the bounds that
+    decide the count are on the other. Every other selector is accepted and
+    ignored, as elsewhere in this file - there is one shop, so the resource a
+    caller addressed can only be the one there is.
+
+    The pricing service is the exception for the reason it is the exception to a
+    scale: the fixture holds no size for it, and answering with the shop's would
+    be reporting a neighbour's capacity as its own.
     """
     if application == PRICING_APPLICATION:
         raise HTTPException(
             status_code=400,
             detail=f"{PRICING_APPLICATION} has no managed Deployment to report",
         )
+
+    if kind == AUTOSCALER_KIND:
+        return _the_autoscaler_of(application)
 
     return ArgoCdManagedResource(
         manifest=json.dumps(
@@ -907,6 +976,159 @@ def argocd_managed_resource(application: str,
                 "kind": "Deployment",
                 "metadata": {"name": application, "namespace": "production"},
                 "spec": {"replicas": state.replicas},
+            }
+        )
+    )
+
+
+@app.post("/argocd/{application}/resource")
+def argocd_patch_resource(application: str,
+                          body: str = Body(...),
+                          resourceName: str | None = None,
+                          namespace: str | None = None,
+                          group: str | None = None,
+                          version: str | None = None,
+                          kind: str | None = None,
+                          patchType: str | None = None) -> dict[str, str]:
+    """Stands in for Argo CD's `POST /api/v1/applications/{name}/resource`.
+
+    The same path the resource is read from, which is the vendor's own
+    arrangement: `GET` is `GetResource` and `POST` is `PatchResource`. So a caller
+    learns one endpoint and one more verb rather than a second route, and the
+    adapter pointed here is the adapter that would be pointed at a real Argo CD.
+
+    **The patch arrives as a JSON-encoded string, not as an object.** That is the
+    vendor's shape - the body is declared `string` in its own swagger - and it is
+    the mirror of the manifest coming back as text from the `GET`. A stand-in
+    taking a parsed object would be an easier endpoint to write against and not the
+    one the adapter will meet.
+
+    One kind and one field. A patch addressed at anything but the autoscaler, or
+    carrying anything but the floor, is refused rather than quietly accepted: a
+    platform answering 200 to a patch it did not apply would have a caller believe
+    production had changed when it had not, which is the same reason an unknown
+    resource action is refused above.
+
+    Argo CD answers an empty body on success, and so does this.
+    """
+    if kind != AUTOSCALER_KIND:
+        raise HTTPException(
+            status_code=400,
+            detail=f"only a {AUTOSCALER_KIND} may be patched here, not {kind}",
+        )
+
+    if patchType is not None and patchType != MERGE_PATCH_TYPE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported patch type: {patchType}",
+        )
+
+    if state.autoscaler is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{application} has no {AUTOSCALER_KIND} deployed",
+        )
+
+    state.pin_the_autoscaler_floor_to(_the_floor_in(body))
+
+    return {}
+
+
+def _the_floor_in(body: str) -> int:
+    """The floor the patch asks for, or a refusal.
+
+    Refused four ways, all of them 400, because all four are the same mistake said
+    differently: a body that is not a document, a document that does not reach the
+    field, a value that is not a number, and a number that is not a count. A real
+    server rejects a malformed merge patch the same way, and a caller has to be
+    able to tell that from a floor it successfully set.
+    """
+    try:
+        patch = json.loads(body)
+        floor = patch[SPEC_FIELD][MIN_REPLICAS_FIELD]
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"the patch must be a merge patch setting "
+                f"{SPEC_FIELD}.{MIN_REPLICAS_FIELD}"
+            ),
+        ) from None
+
+    try:
+        floor = int(floor)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid number: {floor}",
+        ) from None
+
+    if floor < 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{MIN_REPLICAS_FIELD} must be at least one, not {floor}",
+        )
+
+    return floor
+
+
+def _the_autoscaler_of(application: str) -> ArgoCdManagedResource:
+    """The live autoscaler's manifest, or a refusal where there is none.
+
+    A 404 and not an empty resource. A platform with no autoscaler deployed has
+    none to report, and a fixture that invented bounds would let a pin be
+    performed and confirmed against a controller that does not exist - which is
+    the one thing a caller reading this cannot check for itself.
+
+    The whole resource rather than the two fields a mitigation writes. The floor
+    and the ceiling are what a pin reads, and the target and the scaling behaviour
+    are what say *why* this controller misbehaves - so a reader sent to find out
+    whether an autoscaler is at fault can see the zero window that makes it one,
+    rather than being asked to take the diagnosis on trust.
+    """
+    autoscaler = state.autoscaler
+
+    if autoscaler is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{application} has no {AUTOSCALER_KIND} deployed",
+        )
+
+    return ArgoCdManagedResource(
+        manifest=json.dumps(
+            {
+                "apiVersion": f"{AUTOSCALER_GROUP}/{AUTOSCALER_VERSION}",
+                "kind": AUTOSCALER_KIND,
+                "metadata": {"name": application, "namespace": "production"},
+                "spec": {
+                    "scaleTargetRef": {
+                        "apiVersion": "apps/v1",
+                        "kind": "Deployment",
+                        "name": application,
+                    },
+                    MIN_REPLICAS_FIELD: autoscaler.floor,
+                    "maxReplicas": autoscaler.ceiling,
+                    "metrics": [
+                        {
+                            "type": "Resource",
+                            "resource": {
+                                "name": "cpu",
+                                "target": {
+                                    "type": "Utilization",
+                                    "averageUtilization":
+                                        autoscaler.declared.target_cpu_percent,
+                                },
+                            },
+                        }
+                    ],
+                    "behavior": {
+                        "scaleDown": {
+                            "stabilizationWindowSeconds":
+                                autoscaler.declared
+                                .scale_down_stabilization_seconds,
+                        }
+                    },
+                },
             }
         )
     )
@@ -1376,6 +1598,11 @@ def _generated_minutes() -> list[GeneratedMinute]:
         # something - and it is what gives CPU a baseline in every window rather
         # than only in the one window it is the subject of.
         capacity=state.capacity,
+        # And the controller deciding that size, where one is deciding it. `None`
+        # for every scenario but the flapping one, which is what keeps the count in
+        # every other window a thing only a person or Argus has moved - see
+        # `ScenarioState.autoscaler`.
+        autoscaler=state.autoscaler,
         ships_the_statement=scenario.ships_the_statement,
     )
 

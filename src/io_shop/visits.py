@@ -12,7 +12,6 @@ registered shoppers and this holds whichever of them have been by.
 
 from __future__ import annotations
 
-
 _LAST_SEEN: dict[str, str] = {}
 
 

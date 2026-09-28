@@ -29,7 +29,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final
 
-
 # Where the pricing service answers. A host rather than a team name, because a
 # host is what appears in a slow call's own words - and those words are what
 # somebody reading the logs has to recognise as not-this-process.

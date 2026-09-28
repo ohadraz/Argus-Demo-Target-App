@@ -17,15 +17,22 @@ from io_shop.visits import (
 )
 from target_app import app as app_module
 from target_app.app import (
+    AUTOSCALER_GROUP,
+    AUTOSCALER_KIND,
+    AUTOSCALER_VERSION,
     GENERATED_SPAN_MINUTES,
+    MERGE_PATCH_TYPE,
+    MIN_REPLICAS_FIELD,
     REPLICAS_PARAMETER,
     RESTART_ACTION,
     SCALE_ACTION,
+    SPEC_FIELD,
     app,
 )
 from target_app.flags import FlagClient
 from target_app.generator import BASELINE_MEMORY_BYTES, SETTLED_UPTIME
 from target_app.scenarios import (
+    AUTOSCALER_FLAPPING,
     CACHE_MISCONFIGURED,
     CPU_SATURATION,
     MONTHLY_STATEMENT_PANEL,
@@ -932,3 +939,247 @@ def test_putting_the_count_back_returns_the_shop_to_saturation(
 
     assert after["cpu_used_cores"] == after["cpu_limit_cores"] == 3.0
     assert after["p50_ms"] > relieved["p50_ms"] * 3
+
+
+AN_AUTOSCALER = {
+    "kind": AUTOSCALER_KIND,
+    "group": AUTOSCALER_GROUP,
+    "version": AUTOSCALER_VERSION,
+}
+
+
+def a_staged_flapping_autoscaler(client: TestClient) -> None:
+    seeded = client.post(
+        "/scenario/seed", json={"scenario_id": AUTOSCALER_FLAPPING}
+    )
+
+    assert seeded.status_code == 200
+
+
+def the_autoscaler_of(client: TestClient, application: str) -> dict:
+    """The autoscaler's spec, as the platform hands it over.
+
+    Through the manifest for the reason the Deployment's count is read through
+    one: a string the caller parses is Argo CD's own shape, and therefore the work
+    a real adapter has to do.
+    """
+    resource = client.get(f"/argocd/{application}/resource", params=AN_AUTOSCALER)
+
+    assert resource.status_code == 200
+
+    spec: dict = json.loads(resource.json()["manifest"])["spec"]
+
+    return spec
+
+
+def patched(client: TestClient,
+            application: str,
+            patch: str,
+            patch_type: str = MERGE_PATCH_TYPE,
+            kind: str = AUTOSCALER_KIND) -> Response:
+    return client.post(
+        f"/argocd/{application}/resource",
+        params={**AN_AUTOSCALER, "kind": kind, "patchType": patch_type},
+        content=patch,
+    )
+
+
+def a_floor_of(replicas: int) -> str:
+    return json.dumps({SPEC_FIELD: {MIN_REPLICAS_FIELD: replicas}})
+
+
+def test_no_autoscaler_is_reported_until_one_is_staged(client: TestClient) -> None:
+    # A platform with no autoscaler deployed has none to report, and a fixture
+    # inventing bounds would let a pin be confirmed against a controller that
+    # does not exist.
+    absent = client.get("/argocd/io-shop/resource", params=AN_AUTOSCALER)
+
+    assert absent.status_code == 404
+
+
+def test_a_staged_autoscaler_reports_the_bounds_it_is_declared_with(
+    client: TestClient
+) -> None:
+    a_staged_flapping_autoscaler(client)
+
+    spec = the_autoscaler_of(client, "io-shop")
+
+    assert spec[MIN_REPLICAS_FIELD] == 3
+    assert spec["maxReplicas"] == 6
+
+
+def test_the_manifest_carries_the_window_that_makes_it_flap(
+    client: TestClient
+) -> None:
+    # The whole resource rather than the two fields a mitigation writes: a reader
+    # sent to find out whether the autoscaler is at fault can see the zero window
+    # that makes it one, instead of taking the diagnosis on trust.
+    a_staged_flapping_autoscaler(client)
+
+    spec = the_autoscaler_of(client, "io-shop")
+
+    assert spec["behavior"]["scaleDown"]["stabilizationWindowSeconds"] == 0
+
+
+def test_the_deployment_still_answers_beside_the_autoscaler(
+    client: TestClient
+) -> None:
+    # One route, two kinds. The count is on one resource and the bounds that
+    # decide the count are on the other, and `kind` is what chooses.
+    a_staged_flapping_autoscaler(client)
+
+    assert the_replicas_of(client, "io-shop") == the_deployed_replica_count()
+
+
+def test_patching_the_floor_raises_it(client: TestClient) -> None:
+    a_staged_flapping_autoscaler(client)
+
+    assert patched(client, "io-shop", a_floor_of(6)).status_code == 200
+    assert the_autoscaler_of(client, "io-shop")[MIN_REPLICAS_FIELD] == 6
+
+
+def test_patching_the_floor_back_lowers_it_again(client: TestClient) -> None:
+    # Both directions, because the floor is what a withdrawal puts back.
+    a_staged_flapping_autoscaler(client)
+    patched(client, "io-shop", a_floor_of(6))
+
+    assert patched(client, "io-shop", a_floor_of(3)).status_code == 200
+    assert the_autoscaler_of(client, "io-shop")[MIN_REPLICAS_FIELD] == 3
+
+
+def test_a_patch_of_anything_but_the_autoscaler_is_refused(
+    client: TestClient
+) -> None:
+    # A platform answering 200 to a patch it did not apply would have a caller
+    # believe production had changed when it had not.
+    a_staged_flapping_autoscaler(client)
+
+    refused = patched(client, "io-shop", a_floor_of(6), kind="Deployment")
+
+    assert refused.status_code == 400
+    assert the_autoscaler_of(client, "io-shop")[MIN_REPLICAS_FIELD] == 3
+
+
+def test_a_patch_type_the_stand_in_does_not_apply_is_refused(
+    client: TestClient
+) -> None:
+    # A JSON patch is a list of operations rather than a document, so reading one
+    # shape and claiming the other would teach a caller a wire that does not
+    # exist.
+    a_staged_flapping_autoscaler(client)
+
+    refused = patched(
+        client, "io-shop", a_floor_of(6), patch_type="application/json-patch+json"
+    )
+
+    assert refused.status_code == 400
+
+
+def test_a_patch_that_does_not_reach_the_floor_is_refused(
+    client: TestClient
+) -> None:
+    a_staged_flapping_autoscaler(client)
+
+    assert patched(client, "io-shop", json.dumps({SPEC_FIELD: {}})).status_code == 400
+    assert patched(client, "io-shop", "not a document").status_code == 400
+
+
+def test_a_floor_below_one_is_refused(client: TestClient) -> None:
+    a_staged_flapping_autoscaler(client)
+
+    assert patched(client, "io-shop", a_floor_of(0)).status_code == 400
+    assert the_autoscaler_of(client, "io-shop")[MIN_REPLICAS_FIELD] == 3
+
+
+def test_patching_an_autoscaler_nothing_staged_is_refused(
+    client: TestClient
+) -> None:
+    assert patched(client, "io-shop", a_floor_of(6)).status_code == 404
+
+
+def test_a_reset_returns_the_autoscaler_to_the_floor_it_is_declared_with(
+    client: TestClient
+) -> None:
+    # A run abandoned between a pin and its withdrawal is how the next flapping
+    # scenario gets staged onto a controller that cannot scale down - an incident
+    # that never starts.
+    a_staged_flapping_autoscaler(client)
+    patched(client, "io-shop", a_floor_of(6))
+
+    client.post("/scenario/reset")
+    a_staged_flapping_autoscaler(client)
+
+    assert the_autoscaler_of(client, "io-shop")[MIN_REPLICAS_FIELD] == 3
+
+
+def the_tree_of(client: TestClient, application: str) -> list[dict]:
+    tree = client.get(f"/argocd/{application}/resource-tree")
+
+    assert tree.status_code == 200
+
+    nodes: list[dict] = tree.json()["nodes"]
+
+    return nodes
+
+
+def test_the_resource_tree_lists_the_autoscaler_when_one_is_staged(
+    client: TestClient
+) -> None:
+    # How a pin finds the resource it is about to patch. A tree that listed only
+    # the pod would have the mitigation refuse against a controller the platform
+    # can describe perfectly well through its own manifest route.
+    a_staged_flapping_autoscaler(client)
+
+    autoscalers = [
+        node for node in the_tree_of(client, "io-shop")
+        if node["kind"] == AUTOSCALER_KIND
+    ]
+
+    assert len(autoscalers) == 1
+    assert autoscalers[0]["group"] == AUTOSCALER_GROUP
+    assert autoscalers[0]["version"] == AUTOSCALER_VERSION
+    assert autoscalers[0]["namespace"] == "production"
+
+
+def test_the_autoscaler_is_not_named_after_the_application(
+    client: TestClient
+) -> None:
+    # Kubernetes does not require an autoscaler to share its target's name, so a
+    # fixture that made them equal would let a caller send the application's name
+    # as `resourceName` and pass - and the caller that addressed the resource
+    # correctly would look no different.
+    a_staged_flapping_autoscaler(client)
+
+    named = [
+        node["name"] for node in the_tree_of(client, "io-shop")
+        if node["kind"] == AUTOSCALER_KIND
+    ]
+
+    assert named == ["io-shop-cpu"]
+    assert "io-shop" not in named
+
+
+def test_no_autoscaler_is_listed_for_a_scenario_that_stages_none(
+    client: TestClient
+) -> None:
+    # The same condition the manifest route answers a 404 on, so the two channels
+    # cannot disagree about whether a controller exists.
+    seeded = client.post("/scenario/seed", json={"scenario_id": CPU_SATURATION})
+
+    assert seeded.status_code == 200
+    assert [
+        node for node in the_tree_of(client, "io-shop")
+        if node["kind"] == AUTOSCALER_KIND
+    ] == []
+
+
+def test_the_pod_is_still_listed_beside_the_autoscaler(
+    client: TestClient
+) -> None:
+    # The pod's creation time is what confirms a restart landed, and a pin
+    # arriving must not cost that.
+    a_staged_flapping_autoscaler(client)
+
+    kinds = [node["kind"] for node in the_tree_of(client, "io-shop")]
+
+    assert "Pod" in kinds

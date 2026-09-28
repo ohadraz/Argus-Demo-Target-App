@@ -19,7 +19,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
@@ -168,11 +167,16 @@ NEIGHBOURS = ScenarioFamily(
 CAPACITY = ScenarioFamily(
     id="capacity",
     name="Capacity & resource",
-    taxonomy="Resource exhaustion (FM-13) - 13% of incidents",
+    taxonomy=(
+        "Resource exhaustion (FM-13) and autoscaling pathology (FM-25) - 13% of "
+        "incidents"
+    ),
     blurb=(
         "A finite resource is going faster than it is replenished. Whether "
         "consumption moved with the traffic decides between reclaiming what "
-        "accumulated and adding capacity the deployment never had."
+        "accumulated and adding capacity the deployment never had - and if the "
+        "capacity is itself moving, neither: what needs stopping is whatever "
+        "keeps taking it away."
     ),
 )
 THE_TAIL = ScenarioFamily(
@@ -332,6 +336,30 @@ class Scenario:
     by making the shop bigger and is never resolved - and a withdrawal that puts
     the count back returns it to saturation.
 
+    `autoscaler_flaps` stages the ninth generated kind, and the only one whose
+    fault is a control loop rather than a change or a state. It is the surge's
+    traffic exactly, with one difference: this deployment has an autoscaler, and
+    the autoscaler's scale-down stabilisation window is zero. So the controller
+    scales up on a saturated minute, the minute after is still served at the old
+    capacity while the new replicas come ready, the third runs at the ceiling and
+    reports a fraction of its target, and the controller takes the replicas away
+    again. Three minutes, repeating, and the capacity a minute was served at is
+    the series that says so.
+
+    Two things make it the sharpest pair in the file. Its telemetry at the bottom
+    of every cycle *is* `surges`'s telemetry, so the near-miss diagnosis is
+    genuinely tempting rather than straw - what separates them is one series
+    moving. And it is the only scenario that undoes something Argus did: a
+    scale-out holds for a minute and is then re-derived away, which is what makes
+    adding capacity the wrong answer here and refutable rather than merely
+    unhelpful. Until this scenario existed, nothing in the fixture had ever put a
+    replica count back.
+
+    What ends it is raising the controller's floor to its ceiling, which leaves it
+    nowhere to scale down to without removing it. The values file still declares
+    the window that flaps, so this is mitigated and never resolved, and putting
+    the floor back returns the shop to flapping.
+
     `ships_the_statement` stages the same incident as `feature-flag-toggle` in
     every respect a reader of the telemetry could name - the same flag, the same
     cohort, the same shoppers failing for the same reason, the same error rate -
@@ -385,6 +413,7 @@ class Scenario:
     deploy_is_slow: bool = False
     dependency_is_slow: bool = False
     surges: bool = False
+    autoscaler_flaps: bool = False
     ships_the_statement: bool = False
     # The deploy a *generated* scenario stages, for the one whose cause is a
     # change rather than a state. An authored scenario carries its deploys on
@@ -419,6 +448,7 @@ class Scenario:
             or self.deploy_is_slow
             or self.dependency_is_slow
             or self.surges
+            or self.autoscaler_flaps
         )
 
     @property
@@ -461,6 +491,11 @@ PRICING_SERVICE_DEGRADED = "pricing-service-degraded"
 # it - a spike answered by shedding load rather than by adding capacity - is
 # another. The same relation `cache-misconfigured` has to a config-induced failure.
 CPU_SATURATION = "cpu-saturation"
+# Named for the controller rather than for the metric, unlike the scenario above
+# it: what is wrong here is not which resource ran short but that the thing
+# deciding how much of it there is will not settle. The same relation
+# `cpu-saturation` has to demand saturation, one level up.
+AUTOSCALER_FLAPPING = "autoscaler-flapping"
 
 SCENARIOS: dict[str, Scenario] = {
     FEATURE_FLAG_TOGGLE: Scenario(
@@ -720,6 +755,36 @@ SCENARIOS: dict[str, Scenario] = {
         ),
         family=CAPACITY,
         surges=True,
+    ),
+    AUTOSCALER_FLAPPING: Scenario(
+        id=AUTOSCALER_FLAPPING,
+        title="A shop that keeps changing size",
+        description=(
+            "The same shoppers as the scenario above, and one difference: this "
+            "deployment has an autoscaler. Nothing about Io is wrong - its code, "
+            "its configuration, its flags and its heap are all where they were, "
+            "and no deployment went out. What is wrong is the controller. It "
+            "scales up on a saturated minute, but the replicas it asked for are "
+            "serving nothing until the minute after that, so the next minute is "
+            "still saturated too; the one after it finally runs at six and "
+            "reports a fraction of its CPU target, and the controller answers "
+            "that by taking the replicas straight back. Its scale-down "
+            "stabilisation window is zero, which is the field Kubernetes "
+            "defaults to five minutes precisely so this cannot happen. So the "
+            "shop is a different size every few minutes, latency never settles, and "
+            "nothing fails - the error rate never moves. Both obvious answers "
+            "are undone in front of you. Restarting changes nothing, because "
+            "nothing is wrong with the process. Scaling out changes things for "
+            "one minute, and then the controller puts the count back - which is "
+            "what makes this the one incident where adding capacity is not the "
+            "answer. What ends it is taking away the controller's room to "
+            "shrink: raise its floor to its ceiling and the count stops moving. "
+            "The values file still declares the window that flaps, so this is "
+            "mitigated and never resolved, and putting the floor back returns "
+            "the shop to flapping."
+        ),
+        family=CAPACITY,
+        autoscaler_flaps=True,
     ),
 }
 

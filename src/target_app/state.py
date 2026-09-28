@@ -19,6 +19,8 @@ from target_app.generator import (
     Capacity,
     DemandSurge,
     FlagTimeline,
+    LiveAutoscaler,
+    Pin,
     PricingSlowdown,
     ProviderOutage,
     Scaling,
@@ -35,11 +37,11 @@ from target_app.scenarios import (
 )
 from target_app.settings import (
     get_scenario_settings,
+    the_declared_autoscaler,
     the_deployed_cache_endpoint,
     the_deployed_replica_count,
     the_working_cache_endpoint,
 )
-
 
 # The phases a scenario passes through, as anything watching them sees it.
 # `RUNNING` and `RECOVERING` are the ones during which something is happening
@@ -50,6 +52,17 @@ STAGED = "staged"
 RUNNING = "running"
 RECOVERING = "recovering"
 COMPLETE = "complete"
+
+# How many clean whole minutes a scenario keeps generating past its recovery
+# before the window stops advancing.
+#
+# Three because two is the answer with no margin. Argus confirms a mitigation from
+# a run of clear minutes reaching its own `anomaly_persistence_minutes` - two by
+# default, and in the other repo - and a window frozen with fewer than that
+# refutes every mitigation in every scenario, looking like a broken detector
+# rather than a fixture that is wrong. It was one once, and one bad minute then
+# refuted a mitigation that had worked.
+CLEAN_MINUTES_SHOWN_AFTER_RECOVERY = 3
 
 
 def _settled_at(turned_off_at: datetime) -> datetime:
@@ -68,9 +81,7 @@ def _settled_at(turned_off_at: datetime) -> datetime:
         turned_off_at.replace(second=0, microsecond=0) + timedelta(minutes=1)
     )
 
-    return first_clean_minute + timedelta(
-        minutes=get_scenario_settings().settle_minutes
-    )
+    return first_clean_minute + timedelta(minutes=CLEAN_MINUTES_SHOWN_AFTER_RECOVERY)
 
 
 def _has_fallen_behind(timeline: FlagTimeline, moved_now: bool) -> bool:
@@ -313,6 +324,11 @@ class ScenarioState:
         # than a count, for the reason the process's restarts are one: see
         # `capacity`.
         self._scalings: tuple[Scaling, ...] = ()
+        # Every raise of the autoscaler's floor, oldest first, for the reason the
+        # resizes are a history: see `autoscaler`. Process state rather than the
+        # active scenario's, exactly as the resizes are - it describes what has been
+        # done to the deployment, and a pin outlives the incident that prompted it.
+        self._pins: tuple[Pin, ...] = ()
 
     def _flags_for(self, scenario: Scenario) -> FlagClient:
         return (
@@ -516,6 +532,37 @@ class ScenarioState:
             )
             return
 
+        if scenario.autoscaler_flaps:
+            # The surge's traffic exactly, and a controller. Nothing else is
+            # staged: no flag, no cache, no deploy, no neighbour, and nothing
+            # wrong with this process - which is the point, because the shop is
+            # the right size for this load half the time and the wrong size the
+            # rest of it.
+            #
+            # The same `DemandSurge` and the same backdating the surge uses, so
+            # the ramp, the plateau and the quiet minutes before it are all in the
+            # window at once - and so the two scenarios differ in one thing rather
+            # than in a figure each.
+            #
+            # The autoscaler is not recorded here. It is derived from the scenario
+            # and the deployment's own declaration (`autoscaler`), for the reason
+            # the capacity a surge meets is not recorded: it is the platform's
+            # arrangement with the application rather than anybody's incident, and
+            # a seed that captured it would stage an incident against bounds that
+            # stopped being true the moment anybody pinned anything.
+            self._remember_where_the_flags_are_now()
+            self._active = ActiveScenario(
+                scenario=scenario,
+                seeded_at=now,
+                process_started_at=now - SETTLED_UPTIME,
+                demand_surge=DemandSurge(
+                    began_at=now - timedelta(
+                        minutes=get_scenario_settings().surge_backdate_minutes
+                    )
+                ),
+            )
+            return
+
         if scenario.leaks:
             # No flag is touched, because no flag is involved. The condition
             # this stages is the process's own accumulation, which has been
@@ -638,6 +685,56 @@ class ScenarioState:
         return Capacity(
             sized_for=the_deployed_replica_count(), scalings=self._scalings
         )
+
+    @property
+    def autoscaler(self) -> LiveAutoscaler | None:
+        """The controller deciding the deployment's size, or `None` where none is.
+
+        `None` for every scenario but the one that stages a flapping controller,
+        and that is the whole of why it is a property rather than a field. A live
+        autoscaler under every scenario would scale the saturated shop out on its
+        own, and the scenario built to prove that adding capacity is the answer to
+        saturation would answer itself before anybody was paged.
+
+        Its floor is process state - the pins - and its ceiling, target and window
+        come from the repository. So what a pin changes survives a mitigation being
+        judged, and what the deployment is *declared* with survives everything: the
+        estate's own bound is not a thing an incident moves.
+        """
+        active = self._active
+
+        if active is None or not active.scenario.autoscaler_flaps:
+            return None
+
+        return LiveAutoscaler(
+            declared=the_declared_autoscaler(), pins=self._pins
+        )
+
+    def pin_the_autoscaler_floor_to(self, floor: int) -> datetime:
+        """Raises the floor the controller may fall to, and says when.
+
+        Recorded as a moment rather than assigned, so the minutes already served
+        keep the floor they were served under - see `autoscaler`. The moment is
+        answered for the reason a resize's is: whoever asked is about to read the
+        telemetry to see whether it worked, and what they read is dated against
+        this.
+
+        Both directions, because the floor is what an undo puts back. A withdrawal
+        that could only raise it would leave the controller permanently unable to
+        scale down, which is not the deployment anybody is meant to have returned
+        to - and it is recorded the same way, as one more moment, so the stretch
+        the shop spent held stays in the record too.
+
+        It says nothing about whether the platform will leave it alone. A
+        deployment still reconciling itself is one whose next sync re-applies the
+        autoscaler the repository declares, floor included, and suspending that is
+        the caller's business - `set_automated_sync` above - for the same reason it
+        is the caller's business before a rollback or a scale-out.
+        """
+        at = utc_now()
+        self._pins = (*self._pins, Pin(at=at, floor=floor))
+
+        return at
 
     def scale_the_deployment_to(self, replicas: int) -> datetime:
         """Sets how many replicas are serving, and says when.
@@ -950,6 +1047,12 @@ class ScenarioState:
         # nobody could reproduce. The whole history goes, not just the latest
         # entry: what a reset produces is a deployment nobody has ever resized.
         self._scalings = ()
+        # And its autoscaler's floor, for the same reason and with the same
+        # consequence. A pin holds the count at the ceiling and a withdrawal puts
+        # the floor back; a run abandoned between the two leaves the controller with
+        # nowhere to scale down to, and the next flapping scenario would be staged
+        # onto a deployment whose count cannot move - an incident that never starts.
+        self._pins = ()
 
         if active is None:
             self._put_the_flags_back_where_they_rest()
@@ -1056,6 +1159,8 @@ class ScenarioState:
             )
         elif active.scenario.surges:
             ended_at = self._relieved_at()
+        elif active.scenario.autoscaler_flaps:
+            ended_at = self._held_still_at()
         else:
             ended_at = timeline.turned_off_at if timeline is not None else None
 
@@ -1095,6 +1200,41 @@ class ScenarioState:
             relieved_at = scaling.at
 
         return relieved_at
+
+    def _held_still_at(self) -> datetime | None:
+        """When the autoscaler was last left with no room to scale down, or `None`
+        while it still has some.
+
+        What ends a flapping scenario's running phase, in the only terms it has:
+        nothing stops the traffic and nothing removes the controller, so the
+        incident is over when the count stops moving. Read from the floor in force
+        against the ceiling rather than from the fact that a pin happened, which is
+        what makes it reconcile in both directions - a withdrawal that puts the
+        floor back returns this to `None`, and the phase to running, because the
+        shop is flapping again.
+
+        The *moment* is the pin that closed the gap, not the latest pin of any
+        kind. A settling period is counted from this, and counting it from a pin
+        that left the controller room to shrink would freeze the window before the
+        recovery it is meant to show.
+        """
+        autoscaler = self.autoscaler
+
+        if autoscaler is None or not autoscaler.pins:
+            return None
+
+        if autoscaler.pins[-1].floor < autoscaler.ceiling:
+            return None
+
+        held_still_at = None
+
+        for pin in reversed(autoscaler.pins):
+            if pin.floor < autoscaler.ceiling:
+                break
+
+            held_still_at = pin.at
+
+        return held_still_at
 
     def generated_window(self) -> tuple[FlagTimeline | None, datetime] | None:
         """The active generated scenario's timeline, and the instant its
@@ -1180,6 +1320,21 @@ class ScenarioState:
                 return None, utc_now()
 
             return None, min(utc_now(), _settled_at(relieved_at))
+
+        if active is not None and active.scenario.autoscaler_flaps:
+            # No flag, and nothing that ends the condition either: the traffic goes
+            # on arriving and the controller goes on deciding. What ends the
+            # *incident* is the count stopping, so the settling period is counted
+            # from the pin that stopped it - and counted at all for the reason the
+            # surge's is, that every quantile moved and every quantile has to be
+            # seen coming back down before the mitigation can be said to have
+            # worked.
+            held_still_at = self._held_still_at()
+
+            if held_still_at is None:
+                return None, utc_now()
+
+            return None, min(utc_now(), _settled_at(held_still_at))
 
         timeline = self.timeline_now()
 

@@ -22,7 +22,6 @@ import psycopg
 
 from target_app.settings import UnleashSettings, get_unleash_settings
 
-
 # Unleash's audit log, and the column naming the flag an entry is about. An
 # entry that is about no flag - a project or a token - has it null, and is left
 # alone: this clears the history of two flags, not the provider's whole memory.

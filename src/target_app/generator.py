@@ -42,8 +42,11 @@ from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
 from io_shop.pricing_service import AskThePricingService, PricingAnswer
 from io_shop.rollout import CANARY_SHARE
 from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
-from target_app.settings import get_unleash_settings, the_deployed_replica_count
-
+from target_app.settings import (
+    DeclaredAutoscaler,
+    get_unleash_settings,
+    the_deployed_replica_count,
+)
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -165,6 +168,28 @@ _SLOWEST_AT_CAPACITY = 6.0
 # that the whole ascent fits in a window beside the quiet minutes it departed from.
 _SURGE_PEAK_MULTIPLE = 4.5
 _SURGE_RAMPS_OVER = timedelta(minutes=10)
+
+# How long one flap takes, in minutes served: three, of which the last is served
+# at the autoscaler's ceiling and the other two at its floor.
+#
+# The length is the readiness lag and nothing else. A controller that has seen a
+# saturated minute asks for more replicas at the end of it, and the replicas it
+# asked for are serving nothing until the minute after that - so the minute
+# following a scale-up is still served at the old capacity, and only the one
+# after it is served at the new.
+#
+# That lag is why the cycle is not symmetric, and it is the real reason
+# autoscalers thrash. By the time the extra replicas are up, the reading the
+# controller has of its own work is a minute at a fraction of its target, which
+# it answers by taking them away again - immediately, because this deployment's
+# scale-down stabilisation window is zero.
+#
+# What the cycle moves between is the surge's arithmetic rather than a second
+# pair of figures: `_SURGE_PEAK_MULTIPLE` over a floor of three replicas is
+# already sized so that three are insufficient and six are comfortable, which is
+# exactly the pair a flap needs. A multiple of its own here would need its own
+# defence, and would be a second claim about how large this shop's traffic gets.
+_FLAP_CYCLE_MINUTES = 3
 
 # How long a shop nobody has restarted has been up. Further back than any
 # window served here reaches, on purpose: a start time *inside* the window
@@ -684,6 +709,82 @@ class Scaling:
 
 
 @dataclass(frozen=True)
+class Pin:
+    """One raise of the autoscaler's floor: when it happened, and to what.
+
+    A moment and a count, the shape `Scaling` has and for the same reason. What
+    it is not is a new value replacing the old one: a minute already served was
+    served under the floor in force then, and a value that moved would take the
+    flapping stretch out of the window at the instant it was mitigated.
+    """
+
+    at: datetime
+    floor: int
+
+
+@dataclass(frozen=True)
+class LiveAutoscaler:
+    """The autoscaler as it is running, which is the declared one plus the pins.
+
+    `declared` is what the repository asks for - the floor a deployment nobody
+    has pinned sits at, and the ceiling, target and stabilisation window that are
+    the same whoever has pinned it. `pins` are the raises since, oldest first, and
+    they include the ones that put a floor *back*: a withdrawal is one more
+    moment, because the minutes the shop spent held are also what happened.
+
+    Only the floor moves. That is what makes a pin one field and its undo one
+    field, and it is why this holds the declared shape rather than copying four
+    values out of it - a ceiling this carried separately would be a second place
+    for the estate's own bound to live.
+    """
+
+    declared: DeclaredAutoscaler
+    pins: tuple[Pin, ...] = ()
+
+    @property
+    def ceiling(self) -> int:
+        """The most replicas the controller may reach - the declaration's, always.
+
+        A pin raises the floor to meet this and never moves it. Lowering a ceiling
+        would reduce capacity, which is the thing nothing here does autonomously.
+        """
+        return self.declared.max_replicas
+
+    @property
+    def floor(self) -> int:
+        """The fewest replicas the controller may fall to, right now."""
+        return self.floor_during(utc_now())
+
+    @property
+    def is_pinned(self) -> bool:
+        """Whether the count is held rather than free to move.
+
+        Equal bounds are how a floor stops a controller: it has nowhere left to
+        scale down to, so the count stops changing without the controller being
+        removed. Asked by the phase machinery, which needs to know when this
+        incident is over, and by the derivation, which needs to know when to stop
+        cycling.
+        """
+        return self.floor >= self.ceiling
+
+    def floor_during(self, minute: datetime) -> int:
+        """The floor in force for this minute.
+
+        The latest pin at or before it, and the declaration's floor where none has
+        landed yet. Minute-truncated as `Capacity.replicas_during` is, and for the
+        same reason: a bucket carries one floor, and the one worth reporting is the
+        one still in force when anybody reads it.
+        """
+        in_force = [
+            pin.floor
+            for pin in self.pins
+            if pin.at.replace(second=0, microsecond=0) <= minute
+        ]
+
+        return in_force[-1] if in_force else self.declared.min_replicas
+
+
+@dataclass(frozen=True)
 class Capacity:
     """How many replicas have been serving, over time.
 
@@ -718,6 +819,27 @@ class Capacity:
         ]
 
         return in_force[-1] if in_force else self.sized_for
+
+    def resized_during(self, minute: datetime) -> int | None:
+        """The count a resize landed in this minute set, or `None` if none did.
+
+        Equality where `replicas_during` asks "at or before", and that is the
+        whole difference between the two questions: one asks what size the
+        deployment *is*, and this asks whether anybody set it during this
+        particular minute. Only one reader needs to tell them apart - a
+        deployment under a live controller, where a count somebody set holds for
+        the minute they set it in and is derived away by the next one.
+
+        The last of them where a minute holds two, for the reason the latest
+        resize wins above: a bucket carries one capacity.
+        """
+        landed = [
+            scaling.replicas
+            for scaling in self.scalings
+            if scaling.at.replace(second=0, microsecond=0) == minute
+        ]
+
+        return landed[-1] if landed else None
 
 
 @dataclass(frozen=True)
@@ -768,6 +890,7 @@ def generate(timeline: FlagTimeline | None,
              pricing_slowdown: PricingSlowdown | None = None,
              demand_surge: DemandSurge | None = None,
              capacity: Capacity | None = None,
+             autoscaler: LiveAutoscaler | None = None,
              ships_the_statement: bool = False) -> list[GeneratedMinute]:
     """Every minute from `span_minutes` ago up to and including the one in
     progress, once any of it has happened.
@@ -850,6 +973,20 @@ def generate(timeline: FlagTimeline | None,
     which is true of every scenario nobody has scaled, and is what makes CPU a
     series with a visible baseline rather than one that appears when it matters.
 
+    `autoscaler` is the controller deciding that size, where one is running.
+    Given one, each minute's count is derived from where the minute falls in the
+    controller's cycle instead of read out of `capacity`'s history, and the
+    deployment is a different size every few minutes - which is this scenario's
+    whole signature, and the only field separating it from a shop that has simply
+    outgrown a fixed size. Left unsaid, no controller is running: nothing
+    re-derives the count, and a resize stands until somebody else changes it,
+    which is what every other scenario here looks like.
+
+    Nothing about the error rate or the heap moves with it, for the reason the
+    surge leaves both where they are: errors are the leak's late signal and a
+    climbing heap is the leak's signal entirely. What a flap moves is latency, and
+    it moves it in both directions.
+
     `ships_the_statement` says which feature the flag is shipping this time.
     The shop has one feature flag and several scenarios behind it: most ship
     the monthly summary, one ships the typical purchase, and this one ships the
@@ -893,6 +1030,7 @@ def generate(timeline: FlagTimeline | None,
             pricing_slowdown=pricing_slowdown,
             demand_surge=demand_surge,
             capacity=capacity,
+            autoscaler=autoscaler,
             ships_the_statement=ships_the_statement,
         )
         for offset in range(span_minutes, 0, -1)
@@ -924,6 +1062,7 @@ def generate(timeline: FlagTimeline | None,
                 pricing_slowdown=pricing_slowdown,
                 demand_surge=demand_surge,
                 capacity=capacity,
+                autoscaler=autoscaler,
                 ships_the_statement=ships_the_statement,
             )
         )
@@ -957,6 +1096,7 @@ def _a_whole_minute(
     pricing_slowdown: PricingSlowdown | None = None,
     demand_surge: DemandSurge | None = None,
     capacity: Capacity | None = None,
+    autoscaler: LiveAutoscaler | None = None,
     ships_the_statement: bool = False,
 ) -> GeneratedMinute:
     """One minute that has finished, generated once and then remembered.
@@ -1001,6 +1141,7 @@ def _a_whole_minute(
         pricing_slowdown=pricing_slowdown,
         demand_surge=demand_surge,
         capacity=capacity,
+        autoscaler=autoscaler,
         ships_the_statement=ships_the_statement,
     )
 
@@ -1023,6 +1164,7 @@ def _generate_minute(
     pricing_slowdown: PricingSlowdown | None = None,
     demand_surge: DemandSurge | None = None,
     capacity: Capacity | None = None,
+    autoscaler: LiveAutoscaler | None = None,
     ships_the_statement: bool = False,
 ) -> GeneratedMinute:
     minute_id = minute.strftime(TIMESTAMP_FORMAT)
@@ -1077,15 +1219,8 @@ def _generate_minute(
         _REPORTED_VOLUME_PER_MINUTE
         * (demand_surge.multiple_at(minute) if demand_surge is not None else 1.0)
     )
-    # A window nobody has scaled is served at the size the deployment is
-    # configured for, which is read here rather than defaulted to a number: a
-    # default of one replica would put every scenario in this file at three
-    # quarters of its capacity, and every one of them would report the latency of a
-    # shop that is running out of CPU.
     cores_available = the_cores_of(
-        capacity.replicas_during(minute)
-        if capacity is not None
-        else the_deployed_replica_count()
+        _the_replicas_serving(minute, capacity, autoscaler, demand_surge)
     )
     cores_demanded = the_cpu_demanded_by(reported_volume)
     # Unclamped, and that is the point: demand routinely exceeds capacity, where
@@ -1418,6 +1553,91 @@ def _how_much_slower_under(pressure: float) -> float:
     how_far_in = (pressure - _PRESSURE_BEGINS_AT) / (1.0 - _PRESSURE_BEGINS_AT)
 
     return 1.0 + how_far_in * (_SLOWEST_UNDER_PRESSURE - 1.0)
+
+
+def _the_replicas_serving(minute: datetime,
+                          capacity: Capacity | None,
+                          autoscaler: LiveAutoscaler | None,
+                          demand_surge: DemandSurge | None) -> int:
+    """How many replicas served this minute, whoever decided the count.
+
+    Three deciders, asked in the order they override each other. A live
+    autoscaler decides the count minute by minute, so where one is staged it is
+    asked first - see `_the_count_a_flap_leaves`, the one place in this file where
+    a size is worked out rather than recorded. Where none is staged the resize
+    history decides, because a deployment nobody is scaling stays whatever size it
+    was last set to. And where nothing has been resized either the repository
+    decides, which is read rather than defaulted to a number: a default of one
+    replica would put every scenario in this file at three quarters of its
+    capacity, and every one of them would report the latency of a shop that is
+    running out of CPU.
+    """
+    if autoscaler is not None:
+        return _the_count_a_flap_leaves(minute, autoscaler, capacity, demand_surge)
+
+    if capacity is not None:
+        return capacity.replicas_during(minute)
+
+    return the_deployed_replica_count()
+
+
+def _the_count_a_flap_leaves(minute: datetime,
+                             autoscaler: LiveAutoscaler,
+                             capacity: Capacity | None,
+                             demand_surge: DemandSurge | None) -> int:
+    """How many replicas a controller that will not settle left this minute at.
+
+    Derived from where the minute falls in the cycle rather than read out of a
+    history, and that is the thing this scenario could not have been built out of
+    what was already here. A controller's resizes are not events anybody
+    performed: recording them as each window was served would make the same window
+    read differently the second time it was fetched, which is the one property
+    everything generated in this file rests on. Deriving is what leaves a flap
+    deterministic.
+
+    Three answers before the cycle's own, in the order they override it.
+
+    A floor that has reached the ceiling stops the cycle, and that is what makes a
+    pin the mitigation: the controller has nowhere left to scale down to, so the
+    count holds without the controller being taken away. Putting the floor back
+    resumes the cycle from wherever it had got to, because the position is the
+    minute's own and was never stored anywhere to be resumed from.
+
+    A count set during this minute is what this minute was served at, and only
+    this minute. That is the scenario's second point: a mitigation that sets a
+    replica count under a live controller has a timer on it, and the next minute
+    of the cycle is when it goes off.
+
+    And a window before the surge began, or one with no surge staged at all, is
+    served at the floor throughout - a controller with nothing to react to does
+    not flap, and a capacity that oscillated through the quiet minutes would be a
+    baseline that is already the signal.
+    """
+    floor = autoscaler.floor_during(minute)
+
+    if floor >= autoscaler.ceiling:
+        return floor
+
+    set_this_minute = capacity.resized_during(minute) if capacity is not None else None
+
+    if set_this_minute is not None:
+        return max(set_this_minute, floor)
+
+    if demand_surge is None:
+        return floor
+
+    # Minute-truncated as every other moment read here is, so that the cycle's
+    # position is a whole number of minutes from a minute rather than from
+    # whichever second of it a scenario happened to be seeded in.
+    began_at = demand_surge.began_at.replace(second=0, microsecond=0)
+
+    if minute < began_at:
+        return floor
+
+    minutes_in = int((minute - began_at).total_seconds()) // _SECONDS_PER_MINUTE
+    at_the_ceiling = minutes_in % _FLAP_CYCLE_MINUTES == _FLAP_CYCLE_MINUTES - 1
+
+    return autoscaler.ceiling if at_the_ceiling else floor
 
 
 def the_cores_of(replicas: int) -> float:

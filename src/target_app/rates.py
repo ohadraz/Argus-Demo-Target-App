@@ -51,7 +51,7 @@ _PER_EURO: Final[dict[str, Decimal]] = {
     "AUD": Decimal("1.6421"),
     "CAD": Decimal("1.4938"),
     "CHF": Decimal("0.9312"),
-    "EUR": Decimal("1"),
+    "EUR": Decimal(1),
     "GBP": Decimal("0.8374"),
     "ILS": Decimal("3.9126"),
     "JPY": Decimal("171.43"),

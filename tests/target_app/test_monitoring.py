@@ -5,6 +5,7 @@ from unittest.mock import create_autospec
 
 import httpx
 import pytest
+
 from target_app.monitoring import (
     AlertNotDelivered,
     MonitoringSettings,

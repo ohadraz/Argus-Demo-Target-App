@@ -6,17 +6,18 @@ from unittest.mock import Mock
 
 import pytest
 
-from target_app.flags import FlagClient, FlagProviderUnavailable
-from target_app.generator import TIMESTAMP_FORMAT, generate, utc_now
 from io_shop.visits import (
     forget_every_visit,
     how_many_shoppers_are_remembered,
     record_visit,
 )
+from target_app.flags import FlagClient, FlagProviderUnavailable
+from target_app.generator import TIMESTAMP_FORMAT, generate, utc_now
 from target_app.scenarios import (
     BAD_DEPLOYMENT,
     CACHE_MISCONFIGURED,
     COMPETING_FLAG_CHANGES,
+    CPU_SATURATION,
     FALLBACK_DISABLED,
     FEATURE_FLAG_TOGGLE,
     FLAG_TOGGLE_RED_HERRING,
@@ -25,9 +26,11 @@ from target_app.scenarios import (
     SCENARIOS,
     SLOW_CANARY_ROLLOUT,
     UPSTREAM_DEPENDENCY_FAILURE,
+    Scenario,
 )
 from target_app.settings import get_scenario_settings, the_working_cache_endpoint
 from target_app.state import (
+    CLEAN_MINUTES_SHOWN_AFTER_RECOVERY,
     COMPLETE,
     IDLE,
     RECOVERING,
@@ -383,7 +386,7 @@ def test_a_settled_incident_stops_advancing() -> None:
     flags.is_enabled.return_value = False
     state.timeline_now()
 
-    settle = timedelta(minutes=get_scenario_settings().settle_minutes)
+    settle = timedelta(minutes=CLEAN_MINUTES_SHOWN_AFTER_RECOVERY)
     long_ago = utc_now() - settle - timedelta(minutes=1)
     state._active = replace(
         state.active, timeline=replace(state.active.timeline, turned_off_at=long_ago)
@@ -411,7 +414,7 @@ def test_a_revert_on_a_minute_boundary_still_leaves_its_clean_minute_behind() ->
     # instead of a revert.
     flags.is_enabled.return_value = False
 
-    settle = timedelta(minutes=get_scenario_settings().settle_minutes)
+    settle = timedelta(minutes=CLEAN_MINUTES_SHOWN_AFTER_RECOVERY)
     on_the_boundary = (utc_now() - settle - timedelta(minutes=2)).replace(
         second=0, microsecond=0
     )
@@ -433,7 +436,7 @@ def test_a_revert_on_a_minute_boundary_still_leaves_its_clean_minute_behind() ->
         )
     }
 
-    settled_for = get_scenario_settings().settle_minutes
+    settled_for = CLEAN_MINUTES_SHOWN_AFTER_RECOVERY
     the_clean_minutes = [
         (the_first_whole_minute_after(on_the_boundary) + timedelta(minutes=offset))
         .strftime(TIMESTAMP_FORMAT)
@@ -453,6 +456,79 @@ def test_a_revert_on_a_minute_boundary_still_leaves_its_clean_minute_behind() ->
         minutes[the_clean_minutes[0]].error_rate
         < minutes[the_broken_minute].error_rate
     )
+
+
+def the_clean_whole_minutes_in(state: ScenarioState, after: datetime) -> list[str]:
+    """The minutes a frozen window carries that lie entirely past the revert.
+
+    Counted off the generated window rather than derived from the settling
+    period, because the settling period is the thing being checked - a count
+    computed from it would agree with it however wrong it was.
+    """
+    timeline, up_to = state.generated_window()
+    a_span_reaching_either_side_of_the_revert = 10
+    first_clean_minute = the_first_whole_minute_after(after).strftime(TIMESTAMP_FORMAT)
+
+    return sorted(
+        minute.minute_id
+        for minute in generate(
+            timeline, up_to, a_span_reaching_either_side_of_the_revert
+        )
+        if minute.minute_id >= first_clean_minute
+    )
+
+
+def test_a_frozen_window_holds_enough_clean_minutes_to_confirm_a_mitigation() -> None:
+    # The one thing the constant beside `_settled_at` cannot say about itself.
+    # Argus reads a mitigation's verdict off the minutes a frozen window leaves
+    # behind, and confirms one only from a run of clear minutes reaching its own
+    # `anomaly_persistence_minutes` - two by default, and in the other repo. A
+    # window that freezes holding fewer refutes every mitigation in every
+    # scenario, and reads as a broken detector rather than a fixture a minute
+    # short. Spelled out here rather than imported: the two repos deploy apart
+    # and neither reads the other's settings, so this is the contract between
+    # them and not a shared constant.
+    minutes_argus_needs_to_confirm_a_recovery = 2
+
+    # Every position in the minute, because a revert lands where it lands and the
+    # arithmetic counts from the first whole minute after it - so a period
+    # measured from the instant instead loses its last bucket for some of them
+    # and not others, which is how this was wrong once already.
+    for seconds_into_the_minute in (0, 30, 59):
+        flags = a_flag_client_reporting(True)
+        state = a_scenario_state(flags)
+        state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
+        flags.is_enabled.return_value = False
+
+        long_enough_ago_to_have_frozen = timedelta(
+            minutes=CLEAN_MINUTES_SHOWN_AFTER_RECOVERY + 2
+        )
+        reverted_at = (utc_now() - long_enough_ago_to_have_frozen).replace(
+            second=seconds_into_the_minute, microsecond=0
+        )
+        state._active = replace(
+            state.active,
+            timeline=replace(
+                state.active.timeline,
+                turned_on_at=reverted_at - timedelta(minutes=5),
+                turned_off_at=reverted_at
+            )
+        )
+
+        clean_minutes = the_clean_whole_minutes_in(state, after=reverted_at)
+
+        assert state.phase() == COMPLETE, (
+            f"A window reverted {seconds_into_the_minute}s into its minute and "
+            f"left alone for longer than the settling period is still advancing, "
+            f"so this case is not measuring a frozen window at all."
+        )
+        assert len(clean_minutes) >= minutes_argus_needs_to_confirm_a_recovery, (
+            f"A window reverted {seconds_into_the_minute}s into its minute froze "
+            f"holding {len(clean_minutes)} clean whole minutes, and Argus needs "
+            f"{minutes_argus_needs_to_confirm_a_recovery} in a row before it will "
+            f"confirm a mitigation. At this length every mitigation in every "
+            f"scenario is refuted."
+        )
 
 
 def test_an_authored_scenario_has_no_timeline_to_reconcile() -> None:
@@ -1080,3 +1156,141 @@ def test_restarting_the_pricing_service_with_nothing_staged_is_free() -> None:
     state = a_scenario_state(a_flag_client_reporting(False))
 
     assert state.restart_the_pricing_service() is not None
+
+
+def a_flapping_scenario() -> Scenario:
+    """The scenario whose live condition is a controller, built here.
+
+    Built rather than looked up in `SCENARIOS`, because what these cases are
+    about is the autoscaler being live state - which the flag on the scenario
+    selects, and the registry entry only names.
+    """
+    return Scenario(
+        id="autoscaler-flapping",
+        title="More sizes than the shop needs",
+        description="a controller that will not settle",
+        family=SCENARIOS[CPU_SATURATION].family,
+        autoscaler_flaps=True,
+    )
+
+
+def a_flapping_scenario_state() -> ScenarioState:
+    """A state object for the scenario that touches no flag at all.
+
+    Both clients are stubbed anyway, for the reason the leak's are: staging still
+    puts the shop back together first, and that step asks the provider about
+    flags whether or not the scenario has one.
+    """
+    return a_scenario_state(a_flag_client_reporting(False))
+
+
+def test_no_autoscaler_is_live_until_one_is_staged() -> None:
+    # A live autoscaler under every scenario would scale the saturated shop out
+    # on its own, and the scenario built to prove that capacity answers
+    # saturation would answer itself before anybody was paged.
+    state = a_flapping_scenario_state()
+
+    assert state.autoscaler is None
+
+    state.seed(SCENARIOS[CPU_SATURATION])
+
+    assert state.autoscaler is None
+
+
+def test_staging_a_flapping_controller_makes_one_live() -> None:
+    state = a_flapping_scenario_state()
+
+    state.seed(a_flapping_scenario())
+
+    autoscaler = state.autoscaler
+
+    assert autoscaler is not None
+    assert autoscaler.floor < autoscaler.ceiling
+    assert not autoscaler.is_pinned
+
+
+def test_staging_it_stages_the_surges_traffic_and_nothing_else() -> None:
+    # The surge's own condition, so the two scenarios differ in one thing rather
+    # than in a figure each. And nothing else: no flag, no cache, no deploy and
+    # no neighbour, because the shop is the right size for this load half the
+    # time and the wrong size the rest of it.
+    state = a_flapping_scenario_state()
+
+    state.seed(a_flapping_scenario())
+
+    active = state.active
+
+    assert active is not None
+    assert active.demand_surge is not None
+    assert active.cache_outage is None
+    assert active.deploy_slowdown is None
+    assert active.pricing_slowdown is None
+    assert active.timeline is None
+
+
+def test_pinning_the_floor_holds_the_count() -> None:
+    state = a_flapping_scenario_state()
+    state.seed(a_flapping_scenario())
+    autoscaler = state.autoscaler
+
+    assert autoscaler is not None
+
+    state.pin_the_autoscaler_floor_to(autoscaler.ceiling)
+
+    pinned = state.autoscaler
+
+    assert pinned is not None
+    assert pinned.floor == pinned.ceiling
+    assert pinned.is_pinned
+
+
+def test_a_pin_leaves_the_minutes_already_served_alone() -> None:
+    # Recorded as a moment rather than assigned, for the reason a resize is: a
+    # minute already served was served under the floor in force then, and a value
+    # that moved would take the flapping stretch out of the window at the instant
+    # it was mitigated.
+    state = a_flapping_scenario_state()
+    state.seed(a_flapping_scenario())
+    before = utc_now() - timedelta(minutes=5)
+
+    state.pin_the_autoscaler_floor_to(6)
+
+    autoscaler = state.autoscaler
+
+    assert autoscaler is not None
+    assert autoscaler.floor_during(before) == 3
+    assert autoscaler.floor_during(utc_now()) == 6
+
+
+def test_putting_the_floor_back_lets_the_count_move_again() -> None:
+    # Both directions, because the floor is what an undo puts back. A withdrawal
+    # that could only raise it would leave the controller permanently unable to
+    # scale down.
+    state = a_flapping_scenario_state()
+    state.seed(a_flapping_scenario())
+    state.pin_the_autoscaler_floor_to(6)
+
+    state.pin_the_autoscaler_floor_to(3)
+
+    autoscaler = state.autoscaler
+
+    assert autoscaler is not None
+    assert not autoscaler.is_pinned
+
+
+def test_resetting_forgets_every_pin() -> None:
+    # A run abandoned between a pin and its withdrawal would otherwise leave the
+    # controller with nowhere to scale down to, and the next flapping scenario
+    # would be staged onto a deployment whose count cannot move - an incident
+    # that never starts.
+    state = a_flapping_scenario_state()
+    state.seed(a_flapping_scenario())
+    state.pin_the_autoscaler_floor_to(6)
+
+    state.reset()
+    state.seed(a_flapping_scenario())
+
+    autoscaler = state.autoscaler
+
+    assert autoscaler is not None
+    assert not autoscaler.is_pinned

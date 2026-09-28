@@ -7,5 +7,4 @@ against one that is down.
 
 from __future__ import annotations
 
-
 CANARY_SHARE = 0.4

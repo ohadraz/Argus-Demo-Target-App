@@ -16,7 +16,6 @@ fixture.
 
 from __future__ import annotations
 
-
 PAGE = """<!doctype html>
 <html lang="en">
 <head>

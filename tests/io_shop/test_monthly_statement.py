@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+
 from io_shop.accounts import Account, Purchase
 from io_shop.monthly_statement import (
     STATEMENT_COLUMNS,

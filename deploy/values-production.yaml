@@ -14,6 +14,22 @@ replicas: 3
 resources:
   memoryLimitMiB: 2048
 
+# How the platform scales the shop.
+#
+# Rendered into a HorizontalPodAutoscaler, so `replicas` above is only where the
+# deployment starts: the controller decides the count from there, between the
+# floor and the ceiling here, aiming to keep each replica at the CPU target.
+#
+# `scaleDownStabilizationSeconds` is how far back the controller looks before it
+# believes a fall in load is real. Kubernetes defaults it to 300 - five minutes
+# of the highest recommendation it saw - because a controller acting on the
+# reading in front of it acts on a reading its own last action produced.
+autoscaling:
+  minReplicas: 3
+  maxReplicas: 6
+  targetCpuPercent: 70
+  scaleDownStabilizationSeconds: 0
+
 # Where the rendered-summary cache lives.
 #
 # The account page reads this cache before it works a shopper's spend figure
