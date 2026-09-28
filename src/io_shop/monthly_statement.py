@@ -30,10 +30,12 @@ is how a shopper comes to see a section in their email that is not on their
 page.
 
 What it shares with everything else under `io_shop`: it raises rather than
-guessing. A statement that quietly reported zero for a month it could not
-describe would be a statement nobody could trust for the months it *could*
-describe, and the account page's boundary is where a failure becomes a rate
-somebody can alert on - see `io_shop.account_page`.
+guessing. What it does not do is treat a month with nothing in it as a figure it
+could not work out - a shopper who bought nothing has a month, and it is a month
+of nothing. That is a fact the statement can state, and stating it is what keeps
+an ordinary quiet month out of the account page's error rate; see
+`io_shop.account_page`, which is where a real failure becomes a rate somebody
+can alert on.
 """
 
 from __future__ import annotations
@@ -482,7 +484,8 @@ class MonthlyStatement:
 
         One purchase does not have a shape, and a band breakdown of a single
         purchase is a bar chart with one bar - which reads as a mistake rather
-        than as a month.
+        than as a month. Nothing at all has less shape still, and it is the same
+        row that says so.
         """
         return self.purchase_count <= 1
 
@@ -622,8 +625,16 @@ def the_biggest_purchase_this_month(account: Account) -> int:
     The statement leads on this after the headline, because it is the figure a
     shopper checks first: a month that surprised them usually surprised them
     once, and this is the purchase that did it.
+
+    A month with nothing in it is zero rather than a failure. It is not a figure
+    this function could not work out - it is a shopper who bought nothing, which
+    every shop has plenty of, and whose headline is zero for the same reason.
+    The row is suppressed anyway on a quiet month; see `_the_shape_of_the_month`.
     """
-    return max(purchase.price_cents for purchase in purchases_this_month(account))
+    return max(
+        (purchase.price_cents for purchase in purchases_this_month(account)),
+        default=0
+    )
 
 
 def the_smallest_purchase_this_month(account: Account) -> int:
@@ -633,8 +644,14 @@ def the_smallest_purchase_this_month(account: Account) -> int:
     its own: the distance between them is what says whether this was a month of
     one big thing or a month of many similar things, before the band breakdown
     says it in detail.
+
+    Zero on a month with nothing in it, for the reason given on its opposite
+    number above.
     """
-    return min(purchase.price_cents for purchase in purchases_this_month(account))
+    return min(
+        (purchase.price_cents for purchase in purchases_this_month(account)),
+        default=0
+    )
 
 
 def the_mean_purchase_this_month(account: Account) -> int:
@@ -644,8 +661,15 @@ def the_mean_purchase_this_month(account: Account) -> int:
     statement never shows a fraction of a penny. Rounding up would occasionally
     produce a mean above the largest purchase on a month of identical prices,
     which is the kind of figure that costs a support conversation.
+
+    Nothing bought averages to zero rather than dividing by nothing: there is no
+    average of no purchases, and on that month the statement prints the quiet
+    month row instead of this figure.
     """
     bought = purchases_this_month(account)
+
+    if not bought:
+        return 0
 
     return account.total_this_month_cents // len(bought)
 
@@ -907,12 +931,18 @@ def render_monthly_statement(account: Account,
     which is how two parts of a shop come to disagree about what a shopper
     spent.
 
-    Raises rather than returning an empty statement. A month with nothing in it
-    has no largest purchase, no smallest, no mean and no shape, and every one of
-    those is a row this panel promises. The page above catches it, records the
-    shopper it failed for and the line it failed on, and serves a failed
-    response - see `io_shop.account_page`, which is the only place in the shop
-    that catches broadly and the only place that should.
+    A month with nothing in it is a month, and it renders. It has no largest
+    purchase, no smallest and no mean, so it does not print them: the shape rows
+    are suppressed and the quiet month row says what happened instead. Failing
+    on it would make an ordinary shopper - anybody who has not bought anything
+    yet this month - into a failed request, which is how this panel took a third
+    of the account page's traffic down the first time it was switched on.
+
+    What still raises is a statement that cannot be titled: see `period_for`.
+    The page above catches anything that does, records the shopper it failed for
+    and the line it failed on, and serves a failed response - see
+    `io_shop.account_page`, which is the only place in the shop that catches
+    broadly and the only place that should.
     """
     bought = purchases_this_month(account)
     month_total_cents = account.total_this_month_cents
@@ -1006,7 +1036,8 @@ def _the_shape_of_the_month(statement: MonthlyStatement) -> list[StatementRow]:
     Suppressed entirely on a quiet month rather than shown with three equal
     figures. A month of one purchase would print that purchase three times under
     three different labels, which reads as a rendering fault rather than as a
-    quiet month - and the row that follows says the true thing instead.
+    quiet month - and the row that follows says the true thing instead. A month
+    of no purchases is the same row saying the same true thing.
     """
     if statement.is_a_quiet_month:
         return [
@@ -1246,6 +1277,9 @@ def describe_month(statement: MonthlyStatement) -> str:
     """
     spent = format_money(statement.headline_cents)
     purchases = format_count(statement.purchase_count, "purchase", "purchases")
+
+    if statement.purchase_count == 0:
+        return "Nothing bought this month."
 
     if statement.is_a_quiet_month:
         return f"A quiet month: {spent} across {purchases}."

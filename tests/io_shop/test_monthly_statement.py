@@ -23,9 +23,10 @@ from io_shop.monthly_statement import (
 
 A safety net rather than a specification: the panel was written first and these
 cover what would be expensive to find out from a shopper. The one that matters
-most is the empty month, because that is the fault the
-`monthly-statement-panel` scenario stages, and a change that quietly made it
-stop raising would leave that scenario staging nothing at all.
+most is the empty month, because that is the month every shopper has at some
+point - a statement that failed on it turned an ordinary quiet month into a
+failed account page for a third of the shop's traffic the first time the
+`monthly-spend-feature` rollout was switched on.
 """
 
 MARCH = period_for(3, 2026)
@@ -71,12 +72,31 @@ def test_the_statement_takes_its_shape_from_this_month_alone() -> None:
     assert statement.smallest_cents == 1200
 
 
-def test_a_month_with_nothing_in_it_fails_rather_than_reporting_zero() -> None:
-    # The fault the `monthly-statement-panel` scenario stages. A statement
-    # reporting a made-up zero would be a panel nobody could trust on the
-    # months it can describe.
-    with pytest.raises(ValueError):
-        render_monthly_statement(a_shopper_who_bought_nothing_this_month(), MARCH)
+def test_a_month_with_nothing_in_it_renders_rather_than_failing() -> None:
+    # The incident: with the rollout on, a shopper who had not bought anything
+    # this month took `max()` on an empty month and failed the whole account
+    # page. A quiet month is an ordinary month and has to render.
+    statement = render_monthly_statement(
+        a_shopper_who_bought_nothing_this_month(), MARCH
+    )
+
+    assert statement.headline_cents == 0
+    assert statement.purchase_count == 0
+    assert statement.is_a_quiet_month
+    assert reconciles(statement)
+    assert problems_with(statement) == []
+
+
+def test_an_empty_month_can_be_rendered_every_way_the_panel_is_read() -> None:
+    statement = render_monthly_statement(
+        a_shopper_who_bought_nothing_this_month(), MARCH
+    )
+
+    assert describe_month(statement).endswith(".")
+    assert statement_rows(statement)
+    assert as_plain_text(statement).startswith("MARCH 2026")
+    assert as_csv_rows(statement)[0] == STATEMENT_COLUMNS
+    assert as_html(statement)
 
 
 def test_the_breakdowns_add_up_to_the_headline() -> None:
