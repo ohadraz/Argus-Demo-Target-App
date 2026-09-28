@@ -13,6 +13,11 @@ from io_shop.spend_summary import (
 
 The monthly figure is newer and ships behind a rollout flag, so the cases below
 cover the shape the page has had for years plus the one the flag adds.
+
+One case here is about cost rather than correctness. These figures are what the
+page computes when the summary cache is missing or unreachable, so a figure that
+re-walks the history once per purchase turns a lost cache into a latency
+incident while every page it renders stays perfectly right.
 """
 
 
@@ -26,6 +31,38 @@ def an_account_with_no_purchases_this_month(*prices: int) -> Account:
         total_cents=sum(prices),
         total_this_month_cents=0,
     )
+
+
+class CountingPurchases:
+    """A shopper's purchases that remember how much of themselves was read.
+
+    Stands in for the tuple an account carries, and counts every purchase handed
+    out - one by one, by the slice, or by iteration. What it measures is how many
+    times a figure walks the history, which is the difference between a fallback
+    the shop can serve traffic on and one it cannot.
+    """
+
+    def __init__(self, purchases: tuple[Purchase, ...]) -> None:
+        self._purchases = purchases
+        self.purchases_read = 0
+
+    def __len__(self) -> int:
+        return len(self._purchases)
+
+    def __iter__(self):
+        for purchase in self._purchases:
+            self.purchases_read += 1
+            yield purchase
+
+    def __getitem__(self, index):
+        taken = self._purchases[index]
+
+        if isinstance(index, slice):
+            self.purchases_read += len(taken)
+        else:
+            self.purchases_read += 1
+
+        return taken
 
 
 def test_the_lifetime_average_spreads_the_total_over_every_purchase() -> None:
@@ -48,6 +85,27 @@ def test_the_lifetime_average_follows_the_purchases_not_the_carried_total() -> N
     )
 
     assert average_spend_per_item(an_account_whose_total_drifted) == 2000
+
+
+def test_the_lifetime_average_reads_the_history_a_bounded_number_of_times() -> None:
+    # The cost of the cache being gone. Summing the prices needs one pass over
+    # the history; re-summing every purchase up to each one in turn needs the
+    # square of it, for an answer only the last pass is used for.
+    a_long_history = tuple(
+        Purchase(price_cents=100 + index, in_current_month=False)
+        for index in range(200)
+    )
+    counted = CountingPurchases(a_long_history)
+    account = Account(
+        shopper_id="shopper-with-a-long-history",
+        purchases=counted,  # type: ignore[arg-type]
+        total_cents=0,
+        total_this_month_cents=0,
+    )
+
+    average_spend_per_item(account)
+
+    assert counted.purchases_read <= 4 * len(a_long_history)
 
 
 def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:

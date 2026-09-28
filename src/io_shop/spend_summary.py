@@ -5,6 +5,15 @@ page for years; the monthly one narrows it to the current month; the typical
 purchase abandons the average altogether for the middle of the history. The
 last two are the ones still behind a rollout, and which of them a request gets
 is decided before it reaches here.
+
+Every figure here is also what the account page falls back to when the summary
+cache has nothing for this shopper - or cannot be reached at all. That fallback
+is the reason a lost cache is a slowdown rather than an outage, and it only
+holds while the cost of computing a figure stays proportional to the history it
+reads. A figure that re-walked the history once per purchase would make the
+cache load-bearing for latency without making it load-bearing for correctness,
+which is the worst of both: every page still right, every page suddenly slow,
+and nothing in the error rate to say so.
 """
 
 from __future__ import annotations
@@ -20,18 +29,15 @@ def average_spend_per_item(account: Account) -> int:
     bought anything at all, which no real shopper is.
 
     Derives the total from the purchases rather than reading the one the account
-    carries, taking each purchase in and recomputing what has been spent by
-    then, so that the figure agrees with the list the shopper is looking at even
-    where the totals the query returned have drifted from it.
+    carries, so that the figure agrees with the list the shopper is looking at
+    even where the totals the query returned have drifted from it. One pass over
+    the purchases: the running total after each purchase is not something this
+    figure shows, and computing it for every purchase in turn costs the square
+    of the history for an answer only the last one is used for.
     """
-    spent_by_then = 0
+    spent_in_total = sum(purchase.price_cents for purchase in account.purchases)
 
-    for index, _ in enumerate(account.purchases):
-        spent_by_then = sum(
-            earlier.price_cents for earlier in account.purchases[:index + 1]
-        )
-
-    return spent_by_then // len(account.purchases)
+    return spent_in_total // len(account.purchases)
 
 
 def average_spend_per_item_this_month(account: Account) -> int:
