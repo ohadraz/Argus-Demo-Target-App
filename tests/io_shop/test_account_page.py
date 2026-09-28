@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from io_shop import payment_provider, spend_summary
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
-from io_shop.pricing_service import AskThePricingService, PricingAnswer
+from io_shop.pricing_service import PRICING_BUDGET_MS, AskThePricingService, PricingAnswer
 from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
 
 """The shop's request boundary: what a caller sees when the page fails.
@@ -42,6 +43,18 @@ def a_slow_pricing_service(took_ms: int = 1500) -> AskThePricingService:
     return lambda dont_care_shopper: PricingAnswer(
         total_cents=8400, took_ms=took_ms
     )
+
+
+def a_pricing_service_that_takes_forever() -> AskThePricingService:
+    """The 07:52 dependency: a call that does not come back on any timescale
+    the page can afford.
+    """
+    def hang(dont_care_shopper: str) -> PricingAnswer:
+        time.sleep(5)
+
+        return PricingAnswer(total_cents=8400, took_ms=5000)
+
+    return hang
 
 
 def a_pricing_service_with_no_price() -> AskThePricingService:
@@ -278,6 +291,31 @@ def test_a_slow_pricing_service_delays_the_page_without_failing_it() -> None:
     assert page.basket_total_cents == 8400
     assert page.pricing_delay is not None
     assert payment_provider.PROVIDER_HOST not in page.pricing_delay
+
+
+def test_a_pricing_service_that_will_not_answer_does_not_hold_the_page() -> None:
+    # The 07:52 incident at the boundary. The page still renders - figure, card,
+    # no failure - and it renders inside the shop's own budget rather than
+    # whenever the pricing service gets round to answering. The bound on the
+    # clock is the assertion: without it this passes against a page that waited
+    # the full five seconds.
+    started = time.monotonic()
+
+    page = serve_account_page(
+        an_account_idle_this_month(1000, 3000),
+        use_monthly_summary=False,
+        ask_the_provider=a_provider_holding_a_card(),
+        ask_the_pricing_service=a_pricing_service_that_takes_forever()
+    )
+
+    took_ms = (time.monotonic() - started) * 1000
+
+    assert took_ms < PRICING_BUDGET_MS + 1000
+    assert page.failure is None
+    assert page.figure_cents == 2000
+    assert page.card_last_four == "4242"
+    assert page.basket_total_cents is None
+    assert page.pricing_delay is not None
 
 
 def test_a_pricing_service_with_no_price_fails_the_page() -> None:
