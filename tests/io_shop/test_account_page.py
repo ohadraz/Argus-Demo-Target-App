@@ -14,7 +14,8 @@ from io_shop.summary_cache import CacheAnswer, CacheEndpoint, LookUpSummary
 Three things worth pinning: a failure is reported rather than raised - a handler
 that let it escape would take the worker down - the report keeps the error's own
 words, which are what a reader diagnoses from, and a payment provider that will
-not answer fails the page in words that name the provider rather than the shop.
+not answer costs the page its card panel in words that name the provider,
+without costing the page everything else it shows.
 """
 
 
@@ -80,6 +81,7 @@ def test_a_page_that_renders_carries_the_figure_and_no_failure() -> None:
     assert page.figure_cents == 2000
     assert page.card_last_four == "4242"
     assert page.failure is None
+    assert page.provider_failure is None
 
 
 def test_a_page_that_breaks_is_reported_rather_than_raised() -> None:
@@ -142,19 +144,33 @@ def test_the_line_a_failure_names_is_the_one_that_raised_it() -> None:
     assert "//" in source[named - 1]
 
 
-def test_a_provider_that_will_not_answer_fails_the_page() -> None:
-    # Nothing is retried and nothing is rendered without the card: when the
-    # provider is down there is nothing the shop can do about it, and code that
-    # softened this would turn somebody else's outage into a question about Io's
-    # resilience.
+def test_a_provider_that_is_down_does_not_fail_the_page() -> None:
+    # The incident, as a test. io-pay answering 503 for every request used to
+    # take every account page with it - figure, basket total and all - which is
+    # how a third party's outage became a 100% error rate on Io's own endpoint.
+    # The card panel is what is lost; nothing else is.
     page = serve_account_page(an_account_idle_this_month(1000, 3000),
                               use_monthly_summary=False,
                               ask_the_provider=a_provider_that_is_down(),
                               ask_the_pricing_service=a_prompt_pricing_service())
 
-    assert page.figure_cents is None
+    assert page.failure is None
+    assert page.figure_cents == 2000
+    assert page.basket_total_cents == 8400
     assert page.card_last_four is None
-    assert page.failure is not None
+
+
+def test_a_provider_that_is_down_is_reported_beside_the_failure_not_in_it() -> None:
+    # Nothing is retried and nothing is invented in place of the card, and the
+    # provider's outage is not silenced either: a reader sees it in the logs
+    # without Io's error rate claiming the fault is in this repository.
+    page = serve_account_page(an_account_idle_this_month(1000, 3000),
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_that_is_down(),
+                              ask_the_pricing_service=a_prompt_pricing_service())
+
+    assert page.failure is None
+    assert page.provider_failure is not None
 
 
 def test_a_provider_failure_names_the_provider_and_the_status() -> None:
@@ -165,10 +181,11 @@ def test_a_provider_failure_names_the_provider_and_the_status() -> None:
                               ask_the_provider=a_provider_that_is_down(),
                               ask_the_pricing_service=a_prompt_pricing_service())
 
-    assert page.failure is not None
-    assert page.failure.startswith("PaymentProviderFailed: ")
-    assert payment_provider.PROVIDER_HOST in page.failure
-    assert "503" in page.failure
+    assert page.provider_failure is not None
+    assert page.provider_failure.startswith("PaymentProviderFailed: ")
+    assert payment_provider.PROVIDER_HOST in page.provider_failure
+    assert "503" in page.provider_failure
+    assert "at src/io_shop/payment_provider.py:" in page.provider_failure
 
 
 def a_cache_holding(summary_cents: int) -> LookUpSummary:

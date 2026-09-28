@@ -4,13 +4,16 @@ The account page shows the card a shopper will be charged with, and the shop has
 never held that number: it lives with the payment provider, and the page asks
 for it while it renders. That makes the provider part of every account page -
 another company's service on Io's request path, which is the ordinary shape of a
-shop and the reason an outage somewhere else becomes an outage here.
+shop and the reason an outage somewhere else becomes a missing panel here.
 
-Nothing in this module retries, falls back, or renders the page without the
-card. That is deliberate rather than unfinished: when the provider is down there
-is nothing the shop can do about it, and code that softened the failure would
-turn an incident about somebody else's outage into an incident about Io's
-resilience.
+Nothing in this module retries or invents a card. A provider that will not
+answer raises, in words that name the provider, and what to do about that is the
+request boundary's decision rather than this module's: see
+`io_shop.account_page._the_card_for`, which renders the rest of the page without
+the card panel. The card is one of three things the page shows, and a third
+party's outage costing Io the whole page - every account page failing because
+somebody else's service is down - is an outage of Io's making, not a statement
+about whose fault the 503 was.
 
 How the provider is reached is the caller's to supply. The shop states what it
 asks for and what it does with the answer, and whoever is running it says where
@@ -71,6 +74,11 @@ class PaymentProviderFailed(Exception):
     down from one that is refusing this particular shopper, and inventing the
     distinction in an exception type would be the shop claiming knowledge of
     another company's internals.
+
+    It is also the one failure on the account page's path that the page can
+    carry on without, which is why it has a type of its own rather than being
+    raised as something wider: the boundary catches exactly this and renders the
+    page without its card panel.
     """
 
 
