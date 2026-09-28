@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from io_shop import payment_provider, spend_summary
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
@@ -12,6 +14,7 @@ from io_shop.summary_cache import (
     CacheEndpoint,
     LookUpSummary,
     SummaryEntry,
+    forget_cache_failures,
 )
 
 """The shop's request boundary: what a caller sees when the page fails.
@@ -21,6 +24,17 @@ that let it escape would take the worker down - the report keeps the error's own
 words, which are what a reader diagnoses from, and a payment provider that will
 not answer fails the page in words that name the provider rather than the shop.
 """
+
+
+@pytest.fixture(autouse=True)
+def a_shop_that_has_just_started() -> None:
+    """Every case begins with the cache module knowing nothing.
+
+    It remembers which endpoints have been refusing, so that a cache nobody can
+    reach is not dialled once per request. That memory is per process, and a
+    test inheriting the previous one's refusals would be testing the leftovers.
+    """
+    forget_cache_failures()
 
 
 def a_provider_holding_a_card() -> AskTheProvider:
@@ -257,6 +271,29 @@ def test_an_unreachable_cache_is_reported_beside_the_failure_not_in_it() -> None
     assert page.failure is None
     assert page.cache_failure is not None
     assert "6379" in page.cache_failure
+
+
+def test_a_page_served_while_the_cache_is_paused_still_reports_it() -> None:
+    # Once the shop has stopped dialling a refusing endpoint, the pages it
+    # serves are still pages served without a cache, and they still say so and
+    # still name the endpoint. Silence here would look like recovery.
+    account = an_account_idle_this_month(1000, 3000)
+    cache = a_cache_that_cannot_be_reached()
+
+    for _ in range(10):
+        page = serve_account_page(
+            account,
+            use_monthly_summary=False,
+            ask_the_provider=a_provider_holding_a_card(),
+            ask_the_pricing_service=a_prompt_pricing_service(),
+            look_up_summary=cache,
+            cache_endpoint=SOME_CACHE_ENDPOINT
+        )
+
+        assert page.failure is None
+        assert page.figure_cents is not None
+        assert page.cache_failure is not None
+        assert "6379" in page.cache_failure
 
 
 def test_a_page_carries_what_the_basket_comes_to() -> None:

@@ -3,18 +3,21 @@ from __future__ import annotations
 import pytest
 
 from io_shop.summary_cache import (
+    FAILURES_BEFORE_PAUSING,
+    PAUSE_SECONDS,
     CacheAnswer,
     CacheEndpoint,
     CacheUnreachable,
     LookUpSummary,
     SummaryEntry,
     cached_summary,
+    forget_cache_failures,
     summary_entry_in,
 )
 
 """The cache the account page reads before it computes.
 
-Three facts are worth pinning. A cache that answers with nothing and a cache
+Four facts are worth pinning. A cache that answers with nothing and a cache
 that cannot be reached are different things, even though both end in the page
 working the figure out for itself - and the second says which endpoint it
 failed at, because that endpoint set against the configured one is the whole
@@ -24,10 +27,28 @@ The third is the shape. An entry holds a figure and the number of purchases it
 covers, written down together, and this revision reads that shape and no other
 - text carrying anything else is text it passes over, which the page answers
 the way it answers a shopper the cache has never seen.
+
+The fourth is what losing it costs. The fallback keeps every page correct, so
+an unreachable cache is a slowdown and not an outage - but only if not reaching
+it is cheap. A shop that re-dialled a refusing endpoint on each of 1200
+requests a minute would pay the connect-and-fail 1200 times a minute, and the
+correctness of every page would hide that in the latency rather than the error
+rate. So the shop stops dialling, keeps saying so, and tries again shortly.
 """
 
 SOME_SHOPPER = "shopper-1"
 SOME_ENDPOINT = CacheEndpoint(host="cache.io-shop.svc.cluster.local", port=6379)
+
+
+@pytest.fixture(autouse=True)
+def a_shop_that_has_just_started() -> None:
+    """Every case begins knowing nothing about any endpoint.
+
+    What a new process starts with. Without this each test would inherit the
+    refusals of the last - module state leaking into the tests about module
+    state, which is a poor thing to have in this file of all files.
+    """
+    forget_cache_failures()
 
 
 def an_entry(amount_cents: int = 1234, items_counted: int = 8) -> SummaryEntry:
@@ -44,6 +65,40 @@ def a_cache_holding_nothing() -> LookUpSummary:
 
 def a_cache_that_cannot_be_reached() -> LookUpSummary:
     return lambda dont_care_shopper: CacheAnswer(reached=False)
+
+
+class CountingDials:
+    """A cache that records how often the shop actually dialled it.
+
+    The count is what the last few cases in this file are about: what went
+    wrong in production was not the answers the shop got but the number of
+    times it went and asked for them.
+    """
+
+    def __init__(self, reachable: bool = False) -> None:
+        self.reachable = reachable
+        self.dials = 0
+
+    def __call__(self, dont_care_shopper: str) -> CacheAnswer:
+        self.dials += 1
+
+        if not self.reachable:
+            return CacheAnswer(reached=False)
+
+        return CacheAnswer(reached=True, entry=str(an_entry()))
+
+
+class AFrozenClock:
+    """A clock that moves only when a test moves it."""
+
+    def __init__(self) -> None:
+        self.seconds = 1000.0
+
+    def __call__(self) -> float:
+        return self.seconds
+
+    def move_on(self, seconds: float) -> None:
+        self.seconds += seconds
 
 
 def test_a_cache_that_holds_the_figure_answers_with_it() -> None:
@@ -126,3 +181,102 @@ def test_an_unreachable_cache_names_the_endpoint_it_failed_at() -> None:
 
 def test_an_endpoint_reads_as_the_address_its_client_would_dial() -> None:
     assert str(SOME_ENDPOINT) == "redis://cache.io-shop.svc.cluster.local:6379"
+
+
+def test_one_refusal_does_not_stop_the_shop_dialling() -> None:
+    # A single refused connection is the sort of thing a busy cache does. A
+    # shop that gave up on the first would lose its fast path to noise.
+    cache = CountingDials()
+    clock = AFrozenClock()
+
+    for _ in range(2):
+        with pytest.raises(CacheUnreachable):
+            cached_summary(SOME_SHOPPER, cache, SOME_ENDPOINT, now=clock)
+
+    assert cache.dials == 2
+
+
+def test_a_cache_that_keeps_refusing_is_not_dialled_on_every_request() -> None:
+    # The incident, in one assertion. Every one of these requests is correct
+    # either way - the page falls back and renders - so what went wrong was
+    # never the answer, it was that the shop paid a connect-and-fail for each
+    # of them. Once an endpoint has refused enough times in a row, the shop
+    # stops asking for a while.
+    cache = CountingDials()
+    clock = AFrozenClock()
+
+    for _ in range(200):
+        with pytest.raises(CacheUnreachable):
+            cached_summary(SOME_SHOPPER, cache, SOME_ENDPOINT, now=clock)
+
+    assert cache.dials == FAILURES_BEFORE_PAUSING
+
+
+def test_a_paused_cache_still_reports_the_endpoint_it_cannot_reach() -> None:
+    # Not dialling must not cost the diagnosis. Every request still hears that
+    # it had no cache, and still hears which endpoint the shop would have
+    # dialled - a module that went quiet once it stopped checking would make
+    # the fast path look as though it had come back.
+    cache = CountingDials()
+    clock = AFrozenClock()
+
+    for _ in range(FAILURES_BEFORE_PAUSING):
+        with pytest.raises(CacheUnreachable):
+            cached_summary(SOME_SHOPPER, cache, SOME_ENDPOINT, now=clock)
+
+    with pytest.raises(CacheUnreachable) as unreachable:
+        cached_summary(SOME_SHOPPER, cache, SOME_ENDPOINT, now=clock)
+
+    assert "cache.io-shop.svc.cluster.local" in str(unreachable.value)
+    assert "6379" in str(unreachable.value)
+
+
+def test_the_shop_tries_again_once_the_pause_is_over() -> None:
+    # A pause, not a decision. One request per window goes and finds out.
+    cache = CountingDials()
+    clock = AFrozenClock()
+
+    for _ in range(FAILURES_BEFORE_PAUSING + 10):
+        with pytest.raises(CacheUnreachable):
+            cached_summary(SOME_SHOPPER, cache, SOME_ENDPOINT, now=clock)
+
+    clock.move_on(PAUSE_SECONDS + 1)
+
+    with pytest.raises(CacheUnreachable):
+        cached_summary(SOME_SHOPPER, cache, SOME_ENDPOINT, now=clock)
+
+    assert cache.dials == FAILURES_BEFORE_PAUSING + 1
+
+
+def test_a_cache_that_comes_back_is_used_again() -> None:
+    # Recovery without a deploy and without a restart: the port goes back to
+    # what it was, the next probe gets an answer, and the fast path returns.
+    cache = CountingDials()
+    clock = AFrozenClock()
+
+    for _ in range(FAILURES_BEFORE_PAUSING + 10):
+        with pytest.raises(CacheUnreachable):
+            cached_summary(SOME_SHOPPER, cache, SOME_ENDPOINT, now=clock)
+
+    cache.reachable = True
+    clock.move_on(PAUSE_SECONDS + 1)
+
+    assert cached_summary(SOME_SHOPPER, cache, SOME_ENDPOINT, now=clock) == an_entry()
+
+    # And is dialled normally from then on, rather than staying half-trusted.
+    assert cached_summary(SOME_SHOPPER, cache, SOME_ENDPOINT, now=clock) == an_entry()
+    assert cache.dials == FAILURES_BEFORE_PAUSING + 2
+
+
+def test_one_endpoint_refusing_does_not_pause_another() -> None:
+    # What the shop learned is about an address, not about caching in general.
+    broken = CountingDials()
+    working = CountingDials(reachable=True)
+    another_endpoint = CacheEndpoint(host="cache.io-shop.svc.cluster.local", port=6380)
+    clock = AFrozenClock()
+
+    for _ in range(FAILURES_BEFORE_PAUSING + 5):
+        with pytest.raises(CacheUnreachable):
+            cached_summary(SOME_SHOPPER, broken, another_endpoint, now=clock)
+
+    assert cached_summary(SOME_SHOPPER, working, SOME_ENDPOINT, now=clock) == an_entry()
