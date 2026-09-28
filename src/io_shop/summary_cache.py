@@ -22,7 +22,9 @@ The only thing that changes is how long each one takes.
 
 Where the cache lives is not this module's to know. The endpoint is deployment
 configuration, handed in by whoever is running the shop, and how it is reached
-is a seam the caller supplies.
+is a seam the caller supplies. What an entry is spelled like, and where an entry
+of that spelling is kept, are this module's - and they are one decision, because
+a cache is shared by every replica of the shop at once.
 """
 
 from __future__ import annotations
@@ -42,6 +44,36 @@ _ENDPOINT_FORMAT = "redis://{host}:{port}"
 # whether a writer and a reader agree about the shape.
 _ENTRY_FORMAT = "{amount_cents}/{items_counted}"
 _ENTRY_SEPARATOR = "/"
+
+# Which spelling of an entry this revision reads and writes, and where entries
+# in that spelling are kept.
+#
+# The version is in the key because a cache outlives a deployment and is shared
+# by every replica at once. A rolling update - or a paused one - has two
+# revisions live against the same cache, and a revision reading an entry written
+# in a shape it does not know has no good answer: the shape before this one read
+# an entry as a bare figure and failed on anything else. Keeping each shape
+# under its own keys means neither revision ever meets the other's entries, so
+# the most a mixed deployment costs either side is a miss - which the page
+# answers by working the figure out for itself, exactly as it does for a shopper
+# the cache has never seen.
+#
+# Changing `_ENTRY_FORMAT` therefore means changing this too. That is the whole
+# discipline: a new shape is a new place, and the two revisions pass each other
+# without reading each other's writing.
+_ENTRY_VERSION = "v2"
+_KEY_FORMAT = "summary:{version}:{shopper_id}"
+
+
+def cache_key_for(shopper_id: str) -> str:
+    """Where this shopper's entry is kept, for the shape this revision speaks.
+
+    Used to read an entry and to write one, so that the two cannot drift: a
+    writer that composed its own key would be free to put an entry of this shape
+    where a revision expecting another shape will look for one, which is the
+    break this version exists to prevent.
+    """
+    return _KEY_FORMAT.format(version=_ENTRY_VERSION, shopper_id=shopper_id)
 
 
 @dataclass(frozen=True)
@@ -146,10 +178,11 @@ class CacheUnreachable(Exception):
     """
 
 
-# How the cache is reached, given a shopper. A seam rather than a client, for
-# the reason the payment provider's is one: the shop is rendered many times over
-# to produce a minute of telemetry, and a connection per render would be
-# thousands of them per read.
+# How the cache is reached, given a key. A seam rather than a client, for the
+# reason the payment provider's is one: the shop is rendered many times over to
+# produce a minute of telemetry, and a connection per render would be thousands
+# of them per read. The key is composed here rather than by the seam, so that
+# where an entry lives is decided in the same place its spelling is.
 type LookUpSummary = Callable[[str], CacheAnswer]
 
 
@@ -159,6 +192,12 @@ def cached_summary(shopper_id: str,
     """The entry the cache holds for this shopper, or `None` where it holds
     none.
 
+    Looked for under the key for the shape this revision speaks, so that a
+    deployment running two revisions at once - a rolling update, or one paused
+    part way - has each of them reading only what it can read. Neither meets the
+    other's entries, and a shape it has never seen costs it a miss rather than a
+    failed page.
+
     Raises `CacheUnreachable` when the cache did not answer, and the message is
     the point of the function: it names the endpoint the shop dialled, port
     included. A failure that said only "cache unavailable" would leave a reader
@@ -166,7 +205,7 @@ def cached_summary(shopper_id: str,
     set against the endpoint the configuration was supposed to carry, is the
     whole diagnosis.
     """
-    answer = look_up(shopper_id)
+    answer = look_up(cache_key_for(shopper_id))
 
     if not answer.reached:
         raise CacheUnreachable(f"connection refused to {endpoint}")
