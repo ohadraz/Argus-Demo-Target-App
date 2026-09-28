@@ -17,6 +17,7 @@ from target_app.generator import (
     FlagTimeline,
     GeneratedMinute,
     LiveAutoscaler,
+    PausedRollout,
     Pin,
     PricingSlowdown,
     ProviderOutage,
@@ -1754,3 +1755,159 @@ def test_a_resize_is_reported_only_for_the_minute_it_landed_in() -> None:
     assert capacity.resized_during(a_minute_ago(5)) == 6
     assert capacity.resized_during(a_minute_ago(4)) is None
     assert capacity.resized_during(a_minute_ago(6)) is None
+
+
+def a_window_with_the_rollout_paused(
+    paused_minutes_ago: int, rolled_back_minutes_ago: int | None = None
+) -> list[GeneratedMinute]:
+    """A shop whose fleet has been split across two revisions since then.
+
+    A cache endpoint beside it, always, and the whole scenario is why: what the
+    two revisions disagree about is the shape of what that cache stores, and a
+    shop with none configured has nothing for them to disagree in.
+    """
+    return generate(
+        None,
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="dont-care-flag",
+        cache_endpoint=SOME_CACHE_ENDPOINT,
+        paused_rollout=PausedRollout(
+            began_at=SOME_NOW - timedelta(minutes=paused_minutes_ago),
+            ended_at=(
+                None
+                if rolled_back_minutes_ago is None
+                else SOME_NOW - timedelta(minutes=rolled_back_minutes_ago)
+            ),
+        ),
+    )
+
+
+def test_a_split_fleet_fails_the_requests_that_cross_between_the_revisions(
+) -> None:
+    # A product of two shares, scaled by how much of the traffic the cache
+    # answers at all: half the reads taken by the older side, half the entries
+    # written by the newer one, nine lookups in ten answered. About one request
+    # in five, and the bounds are wide enough that a minute's draw cannot
+    # wander outside them.
+    minutes = a_window_with_the_rollout_paused(paused_minutes_ago=10)
+
+    assert 0.12 < minute_at(5, minutes).error_rate < 0.35
+
+
+def test_a_minute_before_the_rollout_was_paused_reads_as_healthy() -> None:
+    # Zero at both ends of a rollout is the property the whole scenario is for,
+    # and this is the first of the two ends: no replica is on the newer side
+    # yet, so nothing has written a shape anything cannot read.
+    minutes = a_window_with_the_rollout_paused(paused_minutes_ago=10)
+
+    assert minute_at(15, minutes).error_rate < CLEARLY_HEALTHY
+
+
+def test_a_split_fleet_leaves_every_quantile_where_it_was() -> None:
+    # The collision with the flag scenario, which is this incident's difficulty.
+    # A page fails on the entry it drew, having done no more work than a page
+    # served from cache does, so nothing waits and no percentile moves.
+    minutes = a_window_with_the_rollout_paused(paused_minutes_ago=10)
+    split = minute_at(5, minutes)
+    quiet = minute_at(15, minutes)
+
+    assert split.p50_ms < quiet.p50_ms * 1.5
+    assert split.p95_ms < quiet.p95_ms * 1.5
+    assert split.p99_ms < quiet.p99_ms * 1.5
+
+
+def test_the_cache_goes_on_carrying_what_it_always_carried() -> None:
+    # The series that separates this from the shop losing its cache. The cache
+    # is up, it is reached, and it answers at the ratio it always did - what is
+    # wrong is what two versions of the shop put in it, and a hit ratio that
+    # dipped here would point at the neighbouring scenario's fault.
+    minutes = a_window_with_the_rollout_paused(paused_minutes_ago=10)
+    split = minute_at(5, minutes)
+    quiet = minute_at(15, minutes)
+
+    assert split.cache_hit_ratio is not None
+    assert quiet.cache_hit_ratio is not None
+    assert abs(split.cache_hit_ratio - quiet.cache_hit_ratio) < 0.1
+
+
+def test_a_split_fleet_accumulates_nothing_and_saturates_nothing() -> None:
+    minutes = a_window_with_the_rollout_paused(paused_minutes_ago=10)
+
+    assert minute_at(5, minutes).memory_used_bytes < BASELINE_MEMORY_BYTES * 1.5
+    assert {minute.cpu_limit_cores for minute in minutes} == {the_cores_of(3)}
+
+
+def test_the_failures_name_an_entry_and_neither_a_flag_nor_a_release() -> None:
+    # What the shop said, which is all a reader has from this channel. It found
+    # something in its cache it could not make sense of; why two things disagree
+    # about what an entry is belongs to the deployment, not to the log.
+    said = " ".join(minute_at(5, a_window_with_the_rollout_paused(10)).log_lines)
+
+    assert "summary cache entry could not be read" in said
+    assert "release" not in said
+    assert "revision" not in said
+
+
+def test_the_same_window_read_twice_is_the_same_window() -> None:
+    # The property everything generated here rests on, and the rollout draws
+    # from a sequence of its own precisely so that it keeps holding.
+    once = a_window_with_the_rollout_paused(paused_minutes_ago=10)
+    again = a_window_with_the_rollout_paused(paused_minutes_ago=10)
+
+    assert [minute.error_rate for minute in once] == [
+        minute.error_rate for minute in again
+    ]
+
+
+def test_a_rollback_converges_the_fleet_and_keeps_the_minutes_before_it() -> None:
+    # Both halves, as the slower revision's rollback asserts both: the minutes
+    # after are how the mitigation is judged, and the minutes before are what it
+    # is judged against.
+    minutes = a_window_with_the_rollout_paused(
+        paused_minutes_ago=15, rolled_back_minutes_ago=5
+    )
+
+    assert minute_at(2, minutes).error_rate < CLEARLY_HEALTHY
+    assert minute_at(8, minutes).error_rate > 0.12
+
+
+def test_a_window_with_no_rollout_staged_is_untouched_by_it() -> None:
+    # No draw is taken where no rollout is staged, which is what leaves every
+    # other scenario's figures exactly where they were.
+    with_nothing_staged = generate(
+        None,
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="dont-care-flag",
+        cache_endpoint=SOME_CACHE_ENDPOINT,
+    )
+    with_a_rollback_long_finished = a_window_with_the_rollout_paused(
+        paused_minutes_ago=SOME_SPAN_MINUTES * 3,
+        rolled_back_minutes_ago=SOME_SPAN_MINUTES * 2,
+    )
+
+    assert [minute.error_rate for minute in with_a_rollback_long_finished] == [
+        minute.error_rate for minute in with_nothing_staged
+    ]
+
+
+def test_a_restart_changes_nothing_but_the_start_time() -> None:
+    # The wrong answer, refuted by the fixture rather than by a rule. The
+    # process comes back, the fleet is still half and half, and nothing about
+    # the mixture was the process's doing.
+    restarted_at = SOME_NOW - timedelta(minutes=5)
+    minutes = generate(
+        None,
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="dont-care-flag",
+        cache_endpoint=SOME_CACHE_ENDPOINT,
+        restarts=(restarted_at,),
+        paused_rollout=PausedRollout(began_at=SOME_NOW - timedelta(minutes=10)),
+    )
+    after = minute_at(2, minutes)
+    came_up = restarted_at.replace(second=0, microsecond=0)
+
+    assert after.process_start_time_seconds == came_up.timestamp()
+    assert after.error_rate > 0.12

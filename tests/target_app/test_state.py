@@ -21,6 +21,7 @@ from target_app.scenarios import (
     FALLBACK_DISABLED,
     FEATURE_FLAG_TOGGLE,
     FLAG_TOGGLE_RED_HERRING,
+    HALF_FINISHED_ROLLOUT,
     PRICING_SERVICE_DEGRADED,
     RESOURCE_LEAK,
     SCENARIOS,
@@ -1294,3 +1295,119 @@ def test_resetting_forgets_every_pin() -> None:
 
     assert autoscaler is not None
     assert not autoscaler.is_pinned
+
+
+def a_staged_paused_rollout(state: ScenarioState) -> None:
+    state.seed(SCENARIOS[HALF_FINISHED_ROLLOUT])
+
+
+def test_a_paused_rollout_splits_the_fleet_the_instant_it_is_staged() -> None:
+    # Backdated like every other onset, so a diagnosable incident exists the
+    # moment seeding returns rather than five minutes later.
+    state = a_scenario_state(a_flag_client_reporting(False))
+
+    a_staged_paused_rollout(state)
+
+    assert state.active is not None
+    assert state.active.paused_rollout is not None
+    assert state.active.paused_rollout.ended_at is None
+    assert state.active.paused_rollout.began_at < utc_now()
+
+
+def test_a_paused_rollout_configures_a_cache_that_works() -> None:
+    # The two revisions disagree about what an entry in that cache is, so there
+    # has to be a cache for them to disagree in - and nothing is wrong with it.
+    state = a_scenario_state(a_flag_client_reporting(False))
+
+    a_staged_paused_rollout(state)
+
+    assert state.active is not None
+    assert state.active.cache_endpoint == the_working_cache_endpoint()
+    assert state.active.cache_outage is None
+
+
+def test_a_paused_rollout_is_running_until_the_deployment_is_returned() -> None:
+    state = a_scenario_state(a_flag_client_reporting(False))
+
+    a_staged_paused_rollout(state)
+
+    assert state.phase() == RUNNING
+
+
+def test_rolling_the_deployment_back_converges_the_fleet() -> None:
+    # The third scenario this action ends, and the only one it ends without
+    # removing anything: what a rollback buys here is every replica on one
+    # version, which is a shop that works whichever version it is.
+    state = a_scenario_state(a_flag_client_reporting(False))
+    a_staged_paused_rollout(state)
+
+    state.roll_the_deployment_back()
+
+    assert state.active is not None
+    assert state.active.paused_rollout is not None
+    assert state.active.paused_rollout.ended_at is not None
+    assert state.phase() == RECOVERING
+
+
+def test_a_restart_leaves_the_fleet_split() -> None:
+    # The wrong answer, refuted by the fixture rather than by a rule. Nothing
+    # about the mixture is the process's doing, so bringing the process back
+    # changes nothing about it.
+    state = a_scenario_state(a_flag_client_reporting(False))
+    a_staged_paused_rollout(state)
+
+    state.restart_the_shop()
+
+    assert state.active is not None
+    assert state.active.paused_rollout is not None
+    assert state.active.paused_rollout.ended_at is None
+    assert state.phase() == RUNNING
+
+
+def test_a_paused_rollout_stages_no_flag() -> None:
+    # A page offering a flag to watch would be offering a control that changes
+    # nothing, and naming one as the thing that breaks the shop would point at a
+    # suspect the fixture invented.
+    assert not SCENARIOS[HALF_FINISHED_ROLLOUT].stages_a_flag
+
+
+def test_withdrawing_the_rollback_splits_the_fleet_again() -> None:
+    # Mitigated, never resolved. The repository still declares the revision that
+    # was going out, so putting the deployment back on it returns the shop to a
+    # rollout stopped half-way.
+    state = a_scenario_state(a_flag_client_reporting(False))
+    a_staged_paused_rollout(state)
+    state.roll_the_deployment_back()
+
+    state.withdraw_the_rollback()
+
+    assert state.active is not None
+    assert state.active.paused_rollout is not None
+    assert state.active.paused_rollout.ended_at is None
+    assert state.phase() == RUNNING
+
+
+def test_a_withdrawal_starts_a_fresh_stretch_rather_than_reopening_the_old_one(
+) -> None:
+    # The minutes between the rollback and the withdrawal are what says the
+    # rollback worked, and claiming the fleet was split throughout would erase
+    # the one thing those minutes are read for.
+    state = a_scenario_state(a_flag_client_reporting(False))
+    a_staged_paused_rollout(state)
+    began = state.active.paused_rollout.began_at
+    state.roll_the_deployment_back()
+
+    state.withdraw_the_rollback()
+
+    assert state.active.paused_rollout.began_at > began
+
+
+def test_withdrawing_a_rollback_nobody_took_changes_nothing() -> None:
+    state = a_scenario_state(a_flag_client_reporting(False))
+    a_staged_paused_rollout(state)
+    began = state.active.paused_rollout.began_at
+
+    state.withdraw_the_rollback()
+
+    assert state.active.paused_rollout.began_at == began
+    assert state.active.paused_rollout.ended_at is None

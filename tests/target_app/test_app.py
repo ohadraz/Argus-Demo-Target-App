@@ -28,13 +28,16 @@ from target_app.app import (
     SCALE_ACTION,
     SPEC_FIELD,
     app,
+    to_bucket_id,
 )
 from target_app.flags import FlagClient
 from target_app.generator import BASELINE_MEMORY_BYTES, SETTLED_UPTIME
+from target_app.monitoring import an_alert_for
 from target_app.scenarios import (
     AUTOSCALER_FLAPPING,
     CACHE_MISCONFIGURED,
     CPU_SATURATION,
+    HALF_FINISHED_ROLLOUT,
     MONTHLY_STATEMENT_PANEL,
     PRICING_SERVICE_DEGRADED,
     RESOURCE_LEAK,
@@ -1183,3 +1186,183 @@ def test_the_pod_is_still_listed_beside_the_autoscaler(
     kinds = [node["kind"] for node in the_tree_of(client, "io-shop")]
 
     assert "Pod" in kinds
+
+
+def a_staged_paused_rollout(client: TestClient) -> None:
+    seeded = client.post(
+        "/scenario/seed", json={"scenario_id": HALF_FINISHED_ROLLOUT}
+    )
+
+    assert seeded.status_code == 200
+
+
+def the_deployment_of(client: TestClient, application: str) -> dict:
+    return json.loads(
+        client.get(f"/argocd/{application}/resource").json()["manifest"]
+    )
+
+
+def test_a_converged_deployment_says_so_plainly(client: TestClient) -> None:
+    # Twelve scenarios in thirteen, and the answer is evidence. A channel that
+    # said nothing about a finished deployment is one a reader consults only
+    # when they already suspect what it will say.
+    a_staged_cache_misconfiguration(client)
+
+    deployment = the_deployment_of(client, "io-shop")
+
+    assert deployment["spec"]["paused"] is False
+    assert deployment["status"]["replicas"] == the_deployed_replica_count()
+    assert deployment["status"]["updatedReplicas"] == the_deployed_replica_count()
+
+
+def test_a_paused_rollout_reports_replicas_on_two_revisions(
+    client: TestClient
+) -> None:
+    # The fact the deploy history cannot hold: it says a sync happened and says
+    # nothing about whether the pods finished turning over.
+    a_staged_paused_rollout(client)
+
+    deployment = the_deployment_of(client, "io-shop")
+
+    assert deployment["spec"]["paused"] is True
+    assert deployment["status"]["replicas"] == 6
+    assert deployment["status"]["updatedReplicas"] == 3
+
+
+def test_a_paused_rollout_leaves_the_size_the_repository_asks_for(
+    client: TestClient
+) -> None:
+    # A surge is the platform's business for a few minutes, not a capacity
+    # anybody deployed - so `spec.replicas` is still what a caller deriving a
+    # new count reads, and the shop still reports three replicas' worth of CPU.
+    a_staged_paused_rollout(client)
+
+    deployment = the_deployment_of(client, "io-shop")
+
+    assert deployment["spec"]["replicas"] == the_deployed_replica_count()
+    assert the_newest_minute(client)["cpu_limit_cores"] == float(
+        the_deployed_replica_count()
+    )
+
+
+def test_a_paused_rollout_says_since_when_it_has_been_holding(
+    client: TestClient
+) -> None:
+    a_staged_paused_rollout(client)
+
+    condition = the_deployment_of(client, "io-shop")["status"]["conditions"][0]
+
+    assert condition["reason"] == "DeploymentPaused"
+    assert condition["status"] == "Unknown"
+    assert condition["lastTransitionTime"] < to_bucket_id(datetime.now(UTC))
+
+
+def test_rolling_the_deployment_back_converges_the_manifest(
+    client: TestClient
+) -> None:
+    a_staged_paused_rollout(client)
+    suspend_automated_sync(client)
+
+    rolled_back = client.post("/argocd/io-shop/rollback", json={"id": 1})
+
+    assert rolled_back.status_code == 200
+
+    deployment = the_deployment_of(client, "io-shop")
+
+    assert deployment["spec"]["paused"] is False
+    assert deployment["status"]["replicas"] == the_deployed_replica_count()
+    assert deployment["status"]["conditions"][0]["reason"] == (
+        "NewReplicaSetAvailable"
+    )
+
+
+def test_the_paused_rollout_reports_one_deploy_at_the_onset(
+    client: TestClient
+) -> None:
+    # Two entries, as every generated scenario staging a change has: the one
+    # being rolled out, and the revision before it that a rollback is addressed
+    # to. Only one of them is at the onset.
+    a_staged_paused_rollout(client)
+
+    history = client.get("/argocd/io-shop").json()["status"]["history"]
+
+    assert len(history) == 2
+    assert history[-1]["revision"] != history[0]["revision"]
+
+
+def test_the_paused_rollout_moves_the_error_rate_and_not_the_quantiles(
+    client: TestClient
+) -> None:
+    a_staged_paused_rollout(client)
+
+    buckets = client.get("/metrics").json()
+    split = buckets[-2]
+    quiet = buckets[0]
+
+    assert split["error_rate"] > 0.12
+    assert split["p50_ms"] < quiet["p50_ms"] * 1.5
+    assert split["p95_ms"] < quiet["p95_ms"] * 1.5
+    assert split["p99_ms"] < quiet["p99_ms"] * 1.5
+
+
+def test_the_paused_rollout_keeps_the_cache_answering(client: TestClient) -> None:
+    # What tells this apart from the shop losing its cache altogether.
+    a_staged_paused_rollout(client)
+
+    assert the_newest_minute(client)["cache_hit_ratio"] > 0.8
+
+
+def test_the_paused_rollout_pages_about_an_error_rate(client: TestClient) -> None:
+    # The only judged series this incident moves. Without a rule nothing pages
+    # and no walk starts.
+    a_staged_paused_rollout(client)
+
+    fired = an_alert_for(HALF_FINISHED_ROLLOUT, datetime.now(UTC))
+
+    assert fired["alerts"][0]["labels"]["alertname"] == "HighErrorRate"
+
+
+def test_the_paused_rollout_is_offered_in_the_console(client: TestClient) -> None:
+    # The split fleet on the page is the story, so unlike the statement panel
+    # this one is not hidden.
+    catalog = client.get("/scenario/catalog").json()
+
+    offered = {scenario["id"] for scenario in catalog["scenarios"]}
+    families = {family["id"] for family in catalog["families"]}
+
+    assert HALF_FINISHED_ROLLOUT in offered
+    assert "half-rolled-out" in families
+
+
+def test_withdrawing_the_rollback_returns_the_shop_to_the_mixture(
+    client: TestClient
+) -> None:
+    # The newest history entry is the revision the application was already on,
+    # so asking for it is the withdrawal rather than a second rollback - and the
+    # platform reports a fleet split again.
+    a_staged_paused_rollout(client)
+    suspend_automated_sync(client)
+    client.post("/argocd/io-shop/rollback", json={"id": 1})
+
+    withdrawn = client.post("/argocd/io-shop/rollback", json={"id": 2})
+
+    assert withdrawn.status_code == 200
+
+    deployment = the_deployment_of(client, "io-shop")
+
+    assert deployment["spec"]["paused"] is True
+    assert deployment["status"]["replicas"] == 6
+    assert deployment["status"]["updatedReplicas"] == 3
+
+
+def test_a_converged_fleet_says_when_it_converged(client: TestClient) -> None:
+    # The instant a reader wants: how long the fleet has been on one revision.
+    # Dating it from the process's start would put a convergence that happened a
+    # minute ago twelve hours back.
+    a_staged_paused_rollout(client)
+    suspend_automated_sync(client)
+    client.post("/argocd/io-shop/rollback", json={"id": 1})
+
+    condition = the_deployment_of(client, "io-shop")["status"]["conditions"][0]
+
+    assert condition["lastTransitionTime"] == to_bucket_id(datetime.now(UTC))

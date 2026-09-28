@@ -344,6 +344,48 @@ _A_CACHED_ENTRY = str(
     )
 )
 
+# How many replicas this deployment's rolling update has up while it is running,
+# and how many of them have reached the revision being rolled out.
+#
+# Six rather than the three the repository asks for, because a rolling update
+# surges: the new ReplicaSet comes up before the old one is retired, which is how
+# a service that must not lose capacity mid-rollout is configured. So a pause
+# half-way through leaves the fleet exactly even - three replicas writing the new
+# shape, three that cannot read it - and that evenness is not decoration. The
+# failing share is a product of two shares, so it is largest when both are a half,
+# and a rollout paused anywhere else would stage a milder version of the same
+# incident.
+#
+# Reported on the Deployment and nowhere else. The shop is still sized for three
+# and still reports three replicas' worth of CPU, because a surge is the
+# platform's business for a few minutes and not a capacity anybody deployed.
+REPLICAS_DURING_A_ROLLOUT = 6
+REPLICAS_ON_THE_NEWER_SIDE = 3
+
+# Which side of a paused fleet a request lands on, and which side wrote the entry
+# it finds. One number for both, because the replicas serving reads and the
+# replicas that wrote what is in the cache are the same replicas.
+SHARE_ON_THE_NEWER_SIDE = REPLICAS_ON_THE_NEWER_SIDE / REPLICAS_DURING_A_ROLLOUT
+
+# What a replica on the older side said about an entry a replica on the newer
+# side wrote.
+#
+# Composed here rather than raised by the shop, for the reason the allocation
+# failures below are composed: the code that raises this is the revision *before*
+# the one this process is running, and that revision is not in this tree to raise
+# anything. What it quotes is real - the entry is written by the shop's own
+# writer, so the text in the line is the text the newer side actually put in.
+#
+# It names the module and the entry and nothing else. No flag and no release
+# appear in it, because neither is what went wrong: a reader who has this line
+# knows the shop found something in its cache it could not make sense of, and
+# has to go to the deployment to find out why two things disagree about what an
+# entry is.
+_UNREADABLE_ENTRY_FAILURE = (
+    f"ValueError: summary cache entry '{_A_CACHED_ENTRY}' is not a figure in "
+    f"cents at src/io_shop/summary_cache.py"
+)
+
 # How fast a leaking shop's heap grows. Fast enough that the climb is a climb
 # within a few minutes of anybody looking, and slow enough that the whole of it
 # fits in the window: from the baseline this reaches the limit in a little under
@@ -588,6 +630,53 @@ class SlowDeployment:
         seconds_live = max(0.0, (live_until - live_from).total_seconds())
 
         return min(1.0, seconds_live / elapsed_seconds)
+
+
+@dataclass(frozen=True)
+class PausedRollout:
+    """When a rolling update stopped half-way, and when the fleet converged.
+
+    The same shape as the two conditions above and a different kind of fact
+    about a deployment. `SlowDeployment` records over which minutes a revision
+    that had finished arriving cost anything; this records over which minutes a
+    revision had *not* finished arriving, so that two of them were serving at
+    once. A deploy history cannot express either, and it cannot express this one
+    at all: what it holds is a list of instants, and a rollout is a stretch.
+
+    The split it leaves is even and does not move, which is what separates this
+    from a scenario about a controller. Nothing is converging: the rolling
+    update was paused, so the platform is not moving towards one revision or
+    away from it, and the minute an incident like this is read is the same
+    minute however long it has been going on.
+
+    `ended_at` being `None` means the fleet is still split.
+    """
+
+    began_at: datetime
+    ended_at: datetime | None = None
+
+    def share_of(self, minute: datetime, elapsed_seconds: int) -> float:
+        """How much of this minute's first `elapsed_seconds` the fleet spent
+        split.
+
+        A share rather than a flag, as every other condition here reports
+        itself: the minute a rollout is paused in is served partly by one
+        revision and partly by two, so the onset ramps across it instead of
+        stepping. The minute a rollback lands in is the same thing in reverse -
+        the fleet converges part way through it, and the bucket has to say so
+        or a mitigation reads its own verdict off a minute that is half wrong.
+        """
+        if elapsed_seconds <= 0:
+            return 0.0
+
+        window_end = minute + timedelta(seconds=elapsed_seconds)
+        split_from = max(minute, self.began_at)
+        split_until = window_end if self.ended_at is None else min(
+            window_end, self.ended_at
+        )
+        seconds_split = max(0.0, (split_until - split_from).total_seconds())
+
+        return min(1.0, seconds_split / elapsed_seconds)
 
 
 @dataclass(frozen=True)
@@ -906,6 +995,7 @@ def generate(timeline: FlagTimeline | None,
              slow_rollout: SlowRollout | None = None,
              slow_deployment: SlowDeployment | None = None,
              pricing_slowdown: PricingSlowdown | None = None,
+             paused_rollout: PausedRollout | None = None,
              demand_surge: DemandSurge | None = None,
              capacity: Capacity | None = None,
              autoscaler: LiveAutoscaler | None = None,
@@ -981,6 +1071,14 @@ def generate(timeline: FlagTimeline | None,
     basket total, so the wait lands on every request and the baseline quantile
     model carries it.
 
+    `paused_rollout` is the stretch the fleet spent split across two revisions.
+    Left unsaid, every replica is on one revision, which is what every scenario
+    but one looks like and is what leaves their pages serving whatever the cache
+    holds. It needs a cache endpoint beside it, because the thing the two
+    revisions disagree about is what an entry in that cache is - a shop with no
+    cache configured has nothing for them to disagree in, and would stage the
+    incident with no way for it to happen.
+
     `demand_surge` is the traffic climbing past what the deployment was sized
     for. Left unsaid, the shop serves its baseline volume, which is what every
     scenario that is not about capacity looks like. It has no end, because nothing
@@ -1046,6 +1144,7 @@ def generate(timeline: FlagTimeline | None,
             slow_rollout=slow_rollout,
             slow_deployment=slow_deployment,
             pricing_slowdown=pricing_slowdown,
+            paused_rollout=paused_rollout,
             demand_surge=demand_surge,
             capacity=capacity,
             autoscaler=autoscaler,
@@ -1078,6 +1177,7 @@ def generate(timeline: FlagTimeline | None,
                 slow_rollout=slow_rollout,
                 slow_deployment=slow_deployment,
                 pricing_slowdown=pricing_slowdown,
+                paused_rollout=paused_rollout,
                 demand_surge=demand_surge,
                 capacity=capacity,
                 autoscaler=autoscaler,
@@ -1112,6 +1212,7 @@ def _a_whole_minute(
     slow_rollout: SlowRollout | None = None,
     slow_deployment: SlowDeployment | None = None,
     pricing_slowdown: PricingSlowdown | None = None,
+    paused_rollout: PausedRollout | None = None,
     demand_surge: DemandSurge | None = None,
     capacity: Capacity | None = None,
     autoscaler: LiveAutoscaler | None = None,
@@ -1157,6 +1258,7 @@ def _a_whole_minute(
         slow_rollout=slow_rollout,
         slow_deployment=slow_deployment,
         pricing_slowdown=pricing_slowdown,
+        paused_rollout=paused_rollout,
         demand_surge=demand_surge,
         capacity=capacity,
         autoscaler=autoscaler,
@@ -1180,6 +1282,7 @@ def _generate_minute(
     slow_rollout: SlowRollout | None = None,
     slow_deployment: SlowDeployment | None = None,
     pricing_slowdown: PricingSlowdown | None = None,
+    paused_rollout: PausedRollout | None = None,
     demand_surge: DemandSurge | None = None,
     capacity: Capacity | None = None,
     autoscaler: LiveAutoscaler | None = None,
@@ -1192,6 +1295,15 @@ def _generate_minute(
     # minute, so this minute reads the same however often it is fetched.
     cache_entropy = (
         random.Random(f"{minute_id}-cache") if cache_endpoint is not None else None
+    )
+    # A third sequence, seeded from the same minute and kept apart from both, for
+    # the reason the cache has one of its own: which side of a split fleet served
+    # a request is a draw per request, and taking it from either sequence above
+    # would move a figure in every scenario that has no rollout in it. Made only
+    # where one is staged, so a shop whose fleet is on one revision takes no draw
+    # at all.
+    rollout_entropy = (
+        random.Random(f"{minute_id}-rollout") if paused_rollout is not None else None
     )
 
     seconds_on = (
@@ -1211,6 +1323,17 @@ def _generate_minute(
     share_of_minute_without_the_cache = (
         cache_outage.share_of(minute, elapsed_seconds)
         if cache_outage is not None
+        else 0.0
+    )
+
+    # How much of this minute the fleet spent split across two revisions. The
+    # minute a rollout is paused in is partly served by one version and partly by
+    # two, and the minute a rollback lands in is the same in reverse - so the
+    # onset and the recovery are slopes across a bucket rather than steps at a
+    # boundary, exactly as every other condition here reports itself.
+    share_of_minute_half_rolled_out = (
+        paused_rollout.share_of(minute, elapsed_seconds)
+        if paused_rollout is not None
         else 0.0
     )
 
@@ -1291,6 +1414,8 @@ def _generate_minute(
             # seeded from the minute's own id.
             statement_period=period_for(minute.month, minute.year),
             the_pricing_call_was_slow=index < calls_that_waited,
+            rollout_entropy=rollout_entropy,
+            share_of_minute_half_rolled_out=share_of_minute_half_rolled_out,
         )
         for index in range(_SAMPLE_SIZE)
     ]
@@ -1453,25 +1578,51 @@ def _how_much_the_cache_carried(outcomes: list[_ServedPage]) -> float | None:
 def _cache_lines_for(minute_id: str, outcomes: list[_ServedPage]) -> tuple[str, ...]:
     """What the shop said about its cache this minute.
 
-    Quiet while it is answering, for the reason the heap lines are quiet while
-    the heap is ordinary: a service that reported a working cache every minute
-    would bury the minute it stopped working.
+    Quiet while it is answering with things the shop can read, for the reason
+    the heap lines are quiet while the heap is ordinary: a service that reported
+    a working cache every minute would bury the minute it stopped working.
 
     One line rather than one per failed lookup. Every request failed the same
     way at the same address, and a minute of identical lines is a minute whose
     two informative words nobody reaches.
+
+    Two things can be said, and they are opposite failures of the same
+    dependency. A cache that cannot be reached leaves every page correct and
+    slow; a cache that answers with an entry the replica asking cannot read
+    fails the page outright. A reader who has both lines has two different
+    incidents, and one who has the second alone has the one this scenario
+    stages.
     """
     unreachable = [
         served.cache_failure for served in outcomes if served.cache_failure is not None
     ]
+    said: list[str] = []
 
-    if not unreachable:
-        return ()
+    if unreachable:
+        said.append(
+            f"{minute_id} ERROR io-shop: summary cache lookup failed - "
+            f"{unreachable[0]} ({len(unreachable)} of {len(outcomes)} requests)"
+        )
 
-    return (
-        f"{minute_id} ERROR io-shop: summary cache lookup failed - "
-        f"{unreachable[0]} ({len(unreachable)} of {len(outcomes)} requests)",
-    )
+    # A second thing that can be wrong with a cache, and the opposite of the
+    # first. There the cache could not be reached and every page recomputed and
+    # rendered; here it is reached, it answers, and what it answers with is
+    # something the replica that asked cannot make sense of - so the page fails.
+    # One line rather than one per failure, as above: every one of them found
+    # the same shape and could not read it the same way, and the count is what
+    # says how much of the minute crossed between the two versions serving.
+    unreadable = [
+        served.failure for served in outcomes
+        if served.failure == _UNREADABLE_ENTRY_FAILURE
+    ]
+
+    if unreadable:
+        said.append(
+            f"{minute_id} ERROR io-shop: summary cache entry could not be read - "
+            f"{unreadable[0]} ({len(unreadable)} of {len(outcomes)} requests)"
+        )
+
+    return tuple(said)
 
 
 def _pricing_lines_for(minute_id: str, outcomes: list[_ServedPage]) -> tuple[str, ...]:
@@ -1869,6 +2020,8 @@ def _serve_one_account_page(
     the_flag_ships_the_statement: bool = False,
     statement_period: StatementPeriod | None = None,
     the_pricing_call_was_slow: bool = False,
+    rollout_entropy: random.Random | None = None,
+    share_of_minute_half_rolled_out: float = 0.0,
 ) -> _ServedPage:
     """Puts one request through the shop and records how it went.
 
@@ -1924,6 +2077,22 @@ def _serve_one_account_page(
     Parameters rather than inferences from `the_rollout_reached_it`, because
     that one is true only for the cohort and these have to hold for every
     request of the minute.
+
+    `rollout_entropy` is a sequence of its own, and it decides two things about
+    a request served while a deployment is half-finished: which side of the
+    fleet answered it, and which side wrote what it found in the cache. Both
+    are draws rather than counts, because a fleet does not route by request
+    index - a load balancer sends each request to whichever replica it sends
+    it to, and what the incident turns on is how often those two answers
+    disagree.
+
+    That is the whole of the arithmetic, and it is why this scenario's failing
+    share is a product rather than a figure somebody chose: a page fails only
+    where an older replica served it *and* a newer replica wrote the entry it
+    drew *and* the cache had an entry at all. Zero before a rollout starts,
+    because no replica is on the newer side; zero once it finishes, because
+    none is on the older one; largest exactly half-way, where both shares are a
+    half.
     """
     flag_is_on = entropy.random() < share_of_minute_flagged
     in_the_canary = flag_is_on and entropy.random() < CANARY_SHARE
@@ -1971,6 +2140,26 @@ def _serve_one_account_page(
         items_bought=len(an_account_of_theirs.purchases)
     )
 
+    if page.served_from_cache and _the_two_revisions_crossed(
+        rollout_entropy, share_of_minute_half_rolled_out
+    ):
+        # The one thing this incident breaks, and the only thing. An older
+        # replica drew an entry a newer one wrote, and the shape it found is
+        # not a shape it was ever taught - so the page fails where it stands,
+        # having done no more work than a page served from cache does. That is
+        # why nothing waits and why every quantile stays where it was: a
+        # failure on an entry is the cheapest outcome the shop has, not the
+        # dearest.
+        #
+        # Reported as served from cache, because it was: the cache was up, it
+        # was reached, and it answered with an entry. What is wrong is what two
+        # versions of the shop put in it, which is exactly the distinction a
+        # hit ratio that dipped here would destroy.
+        return _ServedPage(
+            flag_is_on, _UNREADABLE_ENTRY_FAILURE, cost, page.served_from_cache,
+            page.cache_failure, page.pricing_delay
+        )
+
     if page.failure is not None:
         return _ServedPage(flag_is_on, page.failure, cost, page.served_from_cache,
                            page.cache_failure)
@@ -1994,6 +2183,36 @@ def _serve_one_account_page(
 
     return _ServedPage(flag_is_on, None, cost, page.served_from_cache,
                        page.cache_failure, page.pricing_delay)
+
+
+def _the_two_revisions_crossed(rollout_entropy: random.Random | None,
+                               share_of_minute_half_rolled_out: float) -> bool:
+    """Whether this request crossed between the two versions now serving.
+
+    Three things have to be true of it, and the three are what make the failing
+    share a product of shares rather than a constant. The fleet has to have been
+    split when it arrived; an older replica has to have been the one that
+    answered it; and the entry it drew has to have been written by a newer one.
+
+    One direction only. A newer replica reading an older replica's entry serves
+    the page perfectly well - the shape it finds is one it can still read - and
+    a fixture that failed both ways would double the rate and lose the asymmetry
+    that makes the diff legible. What a reader of that diff sees is a writer
+    that changed with no version shipped before it that could read what it
+    writes, and the replicas that cannot read it are exactly the ones deployed
+    before it existed.
+
+    `False` with no rollout staged, taking no draw at all - which is what leaves
+    every other scenario's figures precisely where they were.
+    """
+    if rollout_entropy is None:
+        return False
+
+    the_fleet_was_split = rollout_entropy.random() < share_of_minute_half_rolled_out
+    an_older_replica_answered = rollout_entropy.random() >= SHARE_ON_THE_NEWER_SIDE
+    a_newer_replica_wrote_it = rollout_entropy.random() < SHARE_ON_THE_NEWER_SIDE
+
+    return the_fleet_was_split and an_older_replica_answered and a_newer_replica_wrote_it
 
 
 def _the_cache_answering(cache_entropy: random.Random | None,

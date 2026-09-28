@@ -182,10 +182,28 @@ CAPACITY = ScenarioFamily(
 THE_TAIL = ScenarioFamily(
     id="the-tail",
     name="Hidden in the tail",
-    taxonomy="Aggregate-masked tail degradation (FM-06) - 3% of incidents",
+    taxonomy=(
+        "Aggregate-masked tail degradation (FM-06), inside tail/outlier - 3% of "
+        "incidents"
+    ),
     blurb=(
         "Nothing fails and no aggregate a monitoring stack watches moves. The "
         "incident exists in the 99th percentile and nowhere else."
+    ),
+)
+HALF_ROLLED_OUT = ScenarioFamily(
+    id="half-rolled-out",
+    name="Half rolled out",
+    taxonomy=(
+        "In-flight compatibility break (FM-35), inside tail/outlier - 3% of "
+        "incidents"
+    ),
+    blurb=(
+        "A fault that exists for part of the traffic and no more of it, for "
+        "reasons that are arithmetic rather than accidental. What fails is "
+        "whatever crosses between two versions of the shop, so the failing "
+        "share is a product of two shares - nothing at either end of a rollout, "
+        "and most of it in the middle."
     ),
 )
 
@@ -200,6 +218,7 @@ FAMILY_ORDER: tuple[ScenarioFamily, ...] = (
     NEIGHBOURS,
     CAPACITY,
     THE_TAIL,
+    HALF_ROLLED_OUT,
 )
 
 
@@ -360,6 +379,38 @@ class Scenario:
     the window that flaps, so this is mitigated and never resolved, and putting
     the floor back returns the shop to flapping.
 
+    `rollout_is_paused` stages the tenth generated kind, and the only one where
+    no revision is at fault. A revision that changes the shape of what the
+    summary cache stores was deployed and its rolling update was paused
+    half-way, so half the fleet writes the new shape and the other half cannot
+    read it. An account page fails when a replica on the older side draws an
+    entry a replica on the newer side wrote, and that is the whole of what
+    fails: the requests that cross between the two versions now serving.
+
+    The failing share is therefore a product of two shares - written by the
+    newer side, read by the older - scaled by how much of the traffic the cache
+    answers at all. Zero before a rollout starts, zero once it finishes, and
+    largest in the middle, which is arithmetic no other scenario here produces
+    and which a reader can check against the replica counts the platform
+    reports.
+
+    Its telemetry is `feature-flag-toggle`'s: an error rate that steps and
+    latency that does not move at all. That collision is the difficulty, and
+    what separates them is the change channel and nothing else - a flag moved
+    for one, a deployment landed for the other. What then separates it from a
+    bad deployment is that the deployment did not *finish*, which is a fact
+    about the rollout rather than about the code it carried, and which nothing
+    but the live Deployment can say.
+
+    Both revisions leave `tests/io_shop` green, so there is no defect for a
+    patch to turn green and no culprit commit to name. What is left to fix
+    afterwards is not a file: the migration needed a version that could read
+    both shapes before one that wrote only the new one, and no patch of either
+    revision supplies that. So it is mitigated by returning the deployment -
+    which ends the incident by *converging* the fleet rather than by removing
+    anything - and never resolved, because the repository still declares the
+    revision that was going out.
+
     `ships_the_statement` stages the same incident as `feature-flag-toggle` in
     every respect a reader of the telemetry could name - the same flag, the same
     cohort, the same shoppers failing for the same reason, the same error rate -
@@ -414,6 +465,7 @@ class Scenario:
     dependency_is_slow: bool = False
     surges: bool = False
     autoscaler_flaps: bool = False
+    rollout_is_paused: bool = False
     ships_the_statement: bool = False
     # The deploy a *generated* scenario stages, for the one whose cause is a
     # change rather than a state. An authored scenario carries its deploys on
@@ -449,6 +501,7 @@ class Scenario:
             or self.dependency_is_slow
             or self.surges
             or self.autoscaler_flaps
+            or self.rollout_is_paused
         )
 
     @property
@@ -480,6 +533,18 @@ THE_COMMIT_THAT_SLOWED_THE_AVERAGE = (
     "5e07d73148d0a704b8fefe5f379bc652bb773655"
 )
 THE_COMMIT_BEFORE_THAT_ONE = "70dbcfde2b549d110a3817d92d60b6dd9786e78b"
+# The revision being rolled out when the rolling update was paused: the one that
+# changed the shape of what the summary cache stores. Constants for the reason
+# the two pairs above are - the commit cannot name itself - and read as a pair
+# for a reason the others do not share. Neither of these is at fault. The diff
+# between them is the diagnosis because it shows a stored shape that changed
+# with no read path kept for the old one, which is the expand step of an
+# expand-contract migration that nobody performed; both leave `tests/io_shop`
+# green, and what is wrong is that the two of them are serving at once.
+THE_COMMIT_THAT_RESHAPED_THE_CACHE_ENTRY = (
+    "696c33a68b36aed6456cdc5b3806f33038488515"
+)
+THE_COMMIT_BEFORE_THE_RESHAPE = "5470c1a64205bb28f9f2e8a96dc6ffa5eb2e611e"
 FALLBACK_DISABLED = "fallback-disabled"
 FLAG_TOGGLE_RED_HERRING = "flag-toggle-red-herring"
 COMPETING_FLAG_CHANGES = "competing-flag-changes"
@@ -496,6 +561,11 @@ CPU_SATURATION = "cpu-saturation"
 # deciding how much of it there is will not settle. The same relation
 # `cpu-saturation` has to demand saturation, one level up.
 AUTOSCALER_FLAPPING = "autoscaler-flapping"
+# Named for the rollout rather than for what broke, unlike every scenario above
+# it. Nothing broke: two correct revisions are serving at once, and the only
+# thing that is wrong is that the deployment carrying one of them stopped
+# half-way.
+HALF_FINISHED_ROLLOUT = "half-finished-rollout"
 
 SCENARIOS: dict[str, Scenario] = {
     FEATURE_FLAG_TOGGLE: Scenario(
@@ -785,6 +855,46 @@ SCENARIOS: dict[str, Scenario] = {
         ),
         family=CAPACITY,
         autoscaler_flaps=True,
+    ),
+    HALF_FINISHED_ROLLOUT: Scenario(
+        id=HALF_FINISHED_ROLLOUT,
+        title="A deployment that stopped half-way",
+        description=(
+            "A revision went out and its rolling update was paused half-way - "
+            "somebody sent half the fleet to it to watch it, and went off "
+            "shift. What that revision changed is the shape of what Io's "
+            "summary cache stores: an entry used to be a figure, and now it is "
+            "a figure and the purchases behind it. Three replicas write the "
+            "new shape. Three replicas were deployed before it existed and "
+            "cannot read it. So an account page fails when a replica on the "
+            "older side draws an entry a replica on the newer side wrote, and "
+            "that is the only thing that fails. The share it amounts to is a "
+            "product of two shares - written by the new side, read by the old "
+            "- so it is nothing before a rollout begins, nothing once it "
+            "finishes, and largest exactly here: about one request in five, "
+            "with the cache carrying its usual nine in ten. Every quantile "
+            "stays flat, the cache is up and answering at the ratio it always "
+            "did, no flag was touched, and the process has been up since "
+            "before any of it. Both revisions pass the shop's own tests, so "
+            "there is no bad commit to find and nothing for a patch to fix - "
+            "what was skipped is a migration step, which is a process rather "
+            "than a file. Restarting changes nothing: the fleet is still split "
+            "when the process comes back. What ends it is returning the "
+            "deployment to the revision before it, not because that revision "
+            "was innocent but because one version reading and writing one "
+            "shape is a shop that works, whichever version it is. The "
+            "repository still declares the revision that was going out, so "
+            "this is mitigated and never resolved."
+        ),
+        family=HALF_ROLLED_OUT,
+        rollout_is_paused=True,
+        deploy=ScenarioDeploy(
+            revision=THE_COMMIT_THAT_RESHAPED_THE_CACHE_ENTRY,
+            previous_revision=THE_COMMIT_BEFORE_THE_RESHAPE,
+            repo_url="https://github.com/ohadraz/Argus-Demo-Target-App",
+            path="deploy",
+            initiated_by="kuki",
+        ),
     ),
 }
 

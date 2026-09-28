@@ -17,8 +17,12 @@ from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.generator import (
     BASELINE_MEMORY_BYTES,
     MEMORY_LIMIT_BYTES,
+    REPLICAS_DURING_A_ROLLOUT,
+    REPLICAS_ON_THE_NEWER_SIDE,
+    SETTLED_UPTIME,
     FlagTimeline,
     GeneratedMinute,
+    PausedRollout,
     SlowRollout,
     generate,
     the_cores_of,
@@ -226,6 +230,20 @@ _THE_AUTOSCALERS_SUFFIX = "-cpu"
 MERGE_PATCH_TYPE = "application/merge-patch+json"
 SPEC_FIELD = "spec"
 MIN_REPLICAS_FIELD = "minReplicas"
+
+# How a Deployment says how far a rolling update has got, in Kubernetes' own
+# vocabulary. A rollout in progress and a rollout that finished are the same
+# condition at different statuses, which is why the reason is what a reader
+# dispatches on: `Progressing`/`Unknown`/`DeploymentPaused` is a deployment
+# holding where it was stopped, and `Progressing`/`True`/`NewReplicaSetAvailable`
+# is one that converged. Spelled out because a stand-in inventing its own words
+# for this would be teaching a caller a wire that does not exist.
+ROLLING_UPDATE_STRATEGY = "RollingUpdate"
+PROGRESSING_CONDITION = "Progressing"
+ROLLOUT_PAUSED_REASON = "DeploymentPaused"
+ROLLOUT_COMPLETE_REASON = "NewReplicaSetAvailable"
+_PROGRESSING = "True"
+_PROGRESS_UNKNOWN = "Unknown"
 
 
 class ArgoCdActionParameter(BaseModel):
@@ -970,15 +988,129 @@ def argocd_managed_resource(application: str,
         return _the_autoscaler_of(application)
 
     return ArgoCdManagedResource(
-        manifest=json.dumps(
-            {
-                "apiVersion": "apps/v1",
-                "kind": "Deployment",
-                "metadata": {"name": application, "namespace": "production"},
-                "spec": {"replicas": state.replicas},
-            }
-        )
+        manifest=json.dumps(_the_deployment_of(application))
     )
+
+
+def _the_deployment_of(application: str) -> dict[str, Any]:
+    """The live Deployment, as the platform is holding it.
+
+    Two things about it, and the second is why this is a function rather than a
+    literal. `spec.replicas` is how large the deployment is, which is what a
+    caller deriving a new count or recording the one it is replacing reads. The
+    rest is how far a rolling update has got, which is the only place anybody can
+    learn that a deployment *landed and did not finish* - the revision history
+    says a sync happened and says nothing about whether the pods turned over.
+
+    A rollout in progress surges, so the fleet is larger than the deployment is
+    sized for while it lasts: `status.replicas` counts every pod up and
+    `status.updatedReplicas` counts the ones that have reached the new template,
+    which is how Kubernetes says the same thing. `spec.paused` says why it is
+    holding there.
+
+    A deployment nobody has interrupted answers plainly rather than saying
+    nothing: every replica up, every replica updated, and not paused. A channel
+    that reported only the unusual case is a channel a reader consults when they
+    already suspect the answer, and "it finished" is evidence.
+    """
+    rollout = state.active.paused_rollout if state.active is not None else None
+    replicas = state.replicas
+
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": application, "namespace": "production"},
+        "spec": {
+            "replicas": replicas,
+            "paused": _is_paused(rollout),
+            # Why a paused rollout has more pods up than the deployment asks
+            # for. Spelled out on the resource rather than assumed, because a
+            # reader who sees six replicas against a spec of three is owed the
+            # field that explains it - and this one is the ordinary setting for
+            # a service that must not lose capacity while it turns over.
+            "strategy": {
+                "type": ROLLING_UPDATE_STRATEGY,
+                "rollingUpdate": {"maxSurge": "100%", "maxUnavailable": 0},
+            },
+        },
+        "status": {
+            "replicas": (
+                REPLICAS_DURING_A_ROLLOUT if _is_paused(rollout) else replicas
+            ),
+            "updatedReplicas": (
+                REPLICAS_ON_THE_NEWER_SIDE if _is_paused(rollout) else replicas
+            ),
+            "conditions": [_the_progress_of(rollout)],
+        },
+    }
+
+
+def _is_paused(rollout: PausedRollout | None) -> bool:
+    """Whether the rolling update is stopped where it is.
+
+    Ended rather than cleared is how a rollback closes this stretch - the minutes
+    the shop spent split are what happened - so a rollout with an end recorded is
+    one that has converged, and reading the field rather than the object's
+    presence is what makes a rollback visible here at all.
+    """
+    return rollout is not None and rollout.ended_at is None
+
+
+def _the_progress_of(rollout: PausedRollout | None) -> dict[str, str]:
+    """What the platform says about this deployment's progress, and since when.
+
+    Kubernetes' own vocabulary, because a reader has to be able to tell a
+    deployment that is holding from one that merely has not been touched lately:
+    a paused rollout is `Progressing` at status `Unknown` with the reason
+    `DeploymentPaused`, and a finished one is `Progressing` at `True` with
+    `NewReplicaSetAvailable`. The transition time is what says how long it has
+    been that way, which for a paused rollout is the whole of how alarming it is.
+    """
+    if rollout is None or rollout.ended_at is not None:
+        settled = to_bucket_id(_the_deployment_settled_at(rollout))
+
+        return {
+            "type": PROGRESSING_CONDITION,
+            "status": _PROGRESSING,
+            "reason": ROLLOUT_COMPLETE_REASON,
+            "lastUpdateTime": settled,
+            "lastTransitionTime": settled,
+        }
+
+    paused = to_bucket_id(rollout.began_at)
+
+    return {
+        "type": PROGRESSING_CONDITION,
+        "status": _PROGRESS_UNKNOWN,
+        "reason": ROLLOUT_PAUSED_REASON,
+        "lastUpdateTime": paused,
+        "lastTransitionTime": paused,
+    }
+
+
+def _the_deployment_settled_at(rollout: PausedRollout | None) -> datetime:
+    """When the deployment last finished turning over.
+
+    A rollout that was paused and then rolled back converged at the rollback,
+    which is the instant a reader wants: it is what says how long the fleet has
+    been on one revision, and reporting the process's start instead would date a
+    convergence that happened a minute ago to twelve hours back.
+
+    Otherwise the process's own start, which is when the pods serving now came
+    up - and for a shop nobody has restarted that is further back than any window
+    reaches, which is what a deployment that finished long ago looks like.
+    Nothing staged means nothing deployed, and the answer is the same instant an
+    unstaged shop reports having started.
+    """
+    if rollout is not None and rollout.ended_at is not None:
+        return rollout.ended_at
+
+    active = state.active
+
+    if active is None or active.serving_since is None:
+        return datetime.now(UTC) - SETTLED_UPTIME
+
+    return active.serving_since
 
 
 @app.post("/argocd/{application}/resource")
@@ -1179,13 +1311,23 @@ def argocd_rollback(application: str, body: ArgoCdRollback) -> ArgoCdApplication
             ),
         )
 
-    if body.id not in {entry.id for entry in _the_revision_history()}:
+    history = _the_revision_history()
+
+    if body.id not in {entry.id for entry in history}:
         raise HTTPException(
             status_code=400,
             detail=f"no revision history entry with id {body.id}",
         )
 
-    state.roll_the_deployment_back()
+    if body.id == history[-1].id:
+        # The newest entry is the revision the application was already on, so
+        # asking for it is not a rollback at all - it is a withdrawal, which is
+        # how Argus puts a mitigation back. The endpoint is the platform's own
+        # and takes a direction the same way the platform's does: by which
+        # history entry it is addressed to.
+        state.withdraw_the_rollback()
+    else:
+        state.roll_the_deployment_back()
 
     return argocd_application(application)
 
@@ -1591,6 +1733,7 @@ def _generated_minutes() -> list[GeneratedMinute]:
         slow_rollout=_the_rollout_in(scenario, timeline),
         slow_deployment=active.deploy_slowdown if active else None,
         pricing_slowdown=active.pricing_slowdown if active else None,
+        paused_rollout=active.paused_rollout if active else None,
         demand_surge=active.demand_surge if active else None,
         # Handed in whether or not anything is staged, unlike every condition
         # above it. The others are a scenario's; this is the deployment's own size,

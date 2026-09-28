@@ -20,6 +20,7 @@ from target_app.generator import (
     DemandSurge,
     FlagTimeline,
     LiveAutoscaler,
+    PausedRollout,
     Pin,
     PricingSlowdown,
     ProviderOutage,
@@ -223,6 +224,18 @@ class ActiveScenario:
     # running it cost anything. A rollback ends the stretch and leaves the
     # entry, which is what the history is for.
     deploy_slowdown: SlowDeployment | None = None
+    # The stretch the fleet has spent split across two revisions, for the one
+    # scenario whose condition is that a deployment did not finish. `None`
+    # everywhere else, which is what keeps every other scenario's fleet on one
+    # revision - and keeps the platform reporting a deployment that converged,
+    # which is evidence too.
+    #
+    # Stored rather than derived from the deploy history, for the reason the slow
+    # deployment's stretch is: the history records that a revision went out, and
+    # this records over which minutes it had not finished going out. That is the
+    # fact the history cannot hold at all, because a history is a list of
+    # instants and this is a stretch.
+    paused_rollout: PausedRollout | None = None
     # The stretch the pricing service has spent answering slowly, for the one
     # scenario whose condition belongs to a neighbour of Io's own. `None`
     # everywhere else, which is what keeps that service prompt - and silent - in
@@ -472,6 +485,35 @@ class ScenarioState:
                 seeded_at=now,
                 process_started_at=now - SETTLED_UPTIME,
                 deploy_slowdown=SlowDeployment(
+                    began_at=now - timedelta(
+                        minutes=get_scenario_settings().onset_backdate_minutes
+                    )
+                ),
+            )
+            return
+
+        if scenario.rollout_is_paused:
+            # No flag, nothing unreachable, nothing wrong with this process and
+            # nothing wrong with either revision. What is staged is a deployment
+            # that landed and stopped: the revision this scenario names went out,
+            # its rolling update was paused half-way, and the fleet has been split
+            # across two versions ever since.
+            #
+            # A cache is configured and left working, as the canary scenario
+            # configures one: the incident is about what two versions of the shop
+            # put in it, so there has to be a cache for them to disagree in - and
+            # it answers at its usual ratio throughout, which is the series that
+            # tells this apart from the shop losing its cache altogether.
+            #
+            # Backdated like the others, so the incident is diagnosable the
+            # instant this returns.
+            self._remember_where_the_flags_are_now()
+            self._active = ActiveScenario(
+                scenario=scenario,
+                seeded_at=now,
+                process_started_at=now - SETTLED_UPTIME,
+                cache_endpoint=the_working_cache_endpoint(),
+                paused_rollout=PausedRollout(
                     began_at=now - timedelta(
                         minutes=get_scenario_settings().onset_backdate_minutes
                     )
@@ -805,6 +847,60 @@ class ScenarioState:
                 active,
                 deploy_slowdown=replace(active.deploy_slowdown, ended_at=at),
             )
+        elif active.paused_rollout is not None:
+            # The third thing a rollback ends, and the one it ends for a
+            # different reason than the other two. There the revision carried
+            # what was wrong and returning the deployment takes it away; here
+            # neither revision carries anything wrong, and what returning the
+            # deployment does is put every replica on one version - which is a
+            # shop that works, whichever version it is.
+            self._active = replace(
+                active,
+                paused_rollout=replace(active.paused_rollout, ended_at=at),
+            )
+
+        return at
+
+    def withdraw_the_rollback(self) -> datetime:
+        """Puts the shop back on the revision the rollback took it off, and says
+        when.
+
+        The other direction of the call above, and the platform's own: a
+        rollback is addressed to a history entry, so returning an application to
+        the entry it was on when somebody rolled it back is the same endpoint
+        pointed the other way. That is what a withdrawal does - Argus undoes a
+        mitigation by asking for the revision it found running.
+
+        A fresh stretch rather than the old one reopened, for the reason a flag
+        timeline starts a fresh one: this holds a single began-and-ended pair, so
+        the minutes between the rollback and the withdrawal cannot be expressed
+        as a gap, and claiming the fleet was split throughout would erase the
+        evidence that the rollback worked - which is the one thing those minutes
+        are read for.
+
+        Only the paused rollout is put back. The misconfigured cache and the
+        slower revision are left where the rollback left them, and that is a
+        limitation rather than a decision - `tests/e2e/test_withdrawing_an_incident.py`
+        already says the platform stand-in cannot distinguish a deployment put
+        back from one left rolled back, and asserts those two withdrawals
+        against the incident's record instead. This scenario is the first whose
+        condition a withdrawal can be checked against the world, so it is the
+        first that answers for it.
+
+        Free on a shop with no rollout staged, which is what makes it safe for
+        anybody to call: there is nothing to put back, and the answer is simply
+        when they asked.
+        """
+        at = utc_now()
+        active = self._active
+
+        if active is None or active.paused_rollout is None:
+            return at
+
+        if active.paused_rollout.ended_at is None:
+            return at
+
+        self._active = replace(active, paused_rollout=PausedRollout(began_at=at))
 
         return at
 
@@ -1125,6 +1221,13 @@ class ScenarioState:
         phase is a restart of the *other* service. Restarting this one leaves it
         running, which is the fixture declining to grade a wrong answer as a
         right one.
+
+        A rollout stopped half-way reaches all three by the same act again, and
+        it is the third scenario a rollback ends. What the settling minutes show
+        here is not a curve coming down but a rate that went to nothing staying
+        there - the fleet converges the instant the deployment is returned, and
+        an incident whose mitigation is instantaneous is exactly the one a reader
+        needs held open long enough to believe.
         """
         active = self._active
 
@@ -1149,6 +1252,12 @@ class ScenarioState:
             ended_at = (
                 active.deploy_slowdown.ended_at
                 if active.deploy_slowdown is not None
+                else None
+            )
+        elif active.scenario.rollout_is_paused:
+            ended_at = (
+                active.paused_rollout.ended_at
+                if active.paused_rollout is not None
                 else None
             )
         elif active.scenario.dependency_is_slow:
@@ -1285,6 +1394,18 @@ class ScenarioState:
                 return None, utc_now()
 
             return None, min(utc_now(), _settled_at(active.deploy_slowdown.ended_at))
+
+        if active is not None and active.scenario.rollout_is_paused:
+            # No flag, and what ends it is the same rollback the two scenarios
+            # above are ended by - settled the same way, and for a reason of its
+            # own. Nothing here comes *back down*: the error rate steps to zero
+            # the moment the fleet converges, so what the settling minutes are
+            # for is showing that it stayed there, which is the whole of what a
+            # reader is owed by an incident whose mitigation is instantaneous.
+            if active.paused_rollout is None or active.paused_rollout.ended_at is None:
+                return None, utc_now()
+
+            return None, min(utc_now(), _settled_at(active.paused_rollout.ended_at))
 
         if active is not None and active.scenario.dependency_is_slow:
             # No flag, and what ends it is a restart - but not the restart the
