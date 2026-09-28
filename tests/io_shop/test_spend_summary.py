@@ -28,6 +28,30 @@ def an_account_with_no_purchases_this_month(*prices: int) -> Account:
     )
 
 
+class CountedPurchases(tuple):
+    """A purchase list that records how many purchases were read out of it.
+
+    Counts both iteration and indexing - including whole slices - so that work
+    done per purchase is visible to a test rather than only to a shopper
+    waiting for the page.
+    """
+
+    def __new__(cls, purchases):
+        counted = super().__new__(cls, purchases)
+        counted.purchases_read = 0
+        return counted
+
+    def __iter__(self):
+        for purchase in super().__iter__():
+            self.purchases_read += 1
+            yield purchase
+
+    def __getitem__(self, index):
+        read = super().__getitem__(index)
+        self.purchases_read += len(read) if isinstance(index, slice) else 1
+        return read
+
+
 def test_the_lifetime_average_spreads_the_total_over_every_purchase() -> None:
     account = an_account_with_no_purchases_this_month(1000, 2000, 3000)
 
@@ -48,6 +72,27 @@ def test_the_lifetime_average_follows_the_purchases_not_the_carried_total() -> N
     )
 
     assert average_spend_per_item(an_account_whose_total_drifted) == 2000
+
+
+def test_the_lifetime_average_touches_each_purchase_a_constant_number_of_times() -> None:
+    # The page renders this figure on every account request, so the work has to
+    # stay linear in the length of a shopper's history. Re-deriving the running
+    # total for every purchase reads ~n*(n+1)/2 purchases and is what made the
+    # account page slow enough for shoppers to disconnect.
+    history_length = 200
+    purchases = CountedPurchases(
+        Purchase(price_cents=1000, in_current_month=False)
+        for _ in range(history_length)
+    )
+    a_shopper_with_a_long_history = Account(
+        shopper_id="shopper-of-three-years",
+        purchases=purchases,
+        total_cents=1000 * history_length,
+        total_this_month_cents=0,
+    )
+
+    assert average_spend_per_item(a_shopper_with_a_long_history) == 1000
+    assert purchases.purchases_read <= 4 * history_length
 
 
 def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:

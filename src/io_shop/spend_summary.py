@@ -20,18 +20,15 @@ def average_spend_per_item(account: Account) -> int:
     bought anything at all, which no real shopper is.
 
     Derives the total from the purchases rather than reading the one the account
-    carries, taking each purchase in and recomputing what has been spent by
-    then, so that the figure agrees with the list the shopper is looking at even
-    where the totals the query returned have drifted from it.
+    carries, so that the figure agrees with the list the shopper is looking at
+    even where the totals the query returned have drifted from it. That is one
+    pass over the purchases: the running total per purchase was never used for
+    anything but the last value, and recomputing it made rendering the page cost
+    O(n^2) in the length of a shopper's history.
     """
-    spent_by_then = 0
+    total_spent = sum(purchase.price_cents for purchase in account.purchases)
 
-    for index, _ in enumerate(account.purchases):
-        spent_by_then = sum(
-            earlier.price_cents for earlier in account.purchases[:index + 1]
-        )
-
-    return spent_by_then // len(account.purchases)
+    return total_spent // len(account.purchases)
 
 
 def average_spend_per_item_this_month(account: Account) -> int:
