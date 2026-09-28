@@ -20,7 +20,12 @@ from io_shop.monthly_statement import (
     StatementPeriod,
     render_monthly_statement,
 )
-from io_shop.payment_provider import AskTheProvider, card_on_file
+from io_shop.payment_provider import (
+    AskTheProvider,
+    PaymentProviderFailed,
+    StoredCard,
+    card_on_file,
+)
 from io_shop.pricing_service import AskThePricingService, basket_total
 from io_shop.spend_summary import render_spend_summary
 from io_shop.summary_cache import (
@@ -36,12 +41,12 @@ from io_shop.visits import record_visit
 class RenderedPage:
     """How serving one account page went.
 
-    Either the page rendered, in which case both of the things it shows are
-    here, or it failed, in which case neither is and `failure` carries the
-    error's own words and the line they were raised on - because those are what
-    reach the log and what a reader diagnoses from. A generic "request failed"
-    would describe every incident equally, and the error's words alone name a
-    fault without naming where it lives.
+    Either the page rendered, in which case what it shows is here, or it
+    failed, in which case none of it is and `failure` carries the error's own
+    words and the line they were raised on - because those are what reach the
+    log and what a reader diagnoses from. A generic "request failed" would
+    describe every incident equally, and the error's words alone name a fault
+    without naming where it lives.
 
     `statement` is the monthly statement panel, on the pages the newest rollout
     reached and absent everywhere else. It sits beside the figure rather than
@@ -64,6 +69,14 @@ class RenderedPage:
     page was correct and the shopper was charged the right amount; what a reader
     gets from this line is where the request's time went, which is the one thing
     no amount of the shop's own telemetry can say.
+
+    `provider_failure` is the same shape again, and for the sharpest reason of
+    the three: the card is one panel of this page and it belongs to another
+    company. When the provider will not answer, `card_last_four` is absent and
+    these are the words saying why - naming the provider's host, the path and
+    the status - while everything Io works out for itself is still shown. A
+    page that failed outright instead would turn somebody else's outage into
+    Io's own, which is what it did.
     """
 
     figure_cents: int | None
@@ -74,6 +87,7 @@ class RenderedPage:
     statement: MonthlyStatement | None = None
     basket_total_cents: int | None = None
     pricing_delay: str | None = None
+    provider_failure: str | None = None
 
 
 def serve_account_page(account: Account,
@@ -88,17 +102,18 @@ def serve_account_page(account: Account,
                        ) -> RenderedPage:
     """Renders the account page, reporting a failure rather than raising one.
 
-    Three things are shown and all three are needed: what the shopper averages
-    per item, which Io works out for itself; what their basket comes to, which
-    the pricing service works out; and the card it would charge, which only the
-    payment provider knows. The last two are calls to other services from inside
-    a page render, which is ordinary and is why a slowdown or an outage over
-    there arrives here as Io's own latency and Io's own error rate.
+    Three things are shown: what the shopper averages per item, which Io works
+    out for itself; what their basket comes to, which the pricing service works
+    out; and the card it would charge, which only the payment provider knows.
+    The last two are calls to other services from inside a page render, which is
+    ordinary and is why a slowdown over there arrives here as Io's own latency.
 
     The two are not the same kind of neighbour, and nothing in this function
     tells them apart: one is another team's service and one is another company's,
     and which is which is published in the service catalogue rather than
-    inferred from a host name.
+    inferred from a host name. What the page does do is treat the card as one
+    panel rather than as the page: a provider that will not answer costs the
+    shopper the last four digits of their card and nothing else.
 
     `use_monthly_summary` and `use_typical_spend` are the rollout decisions
     already made - whether this request is one of the ones each new figure is
@@ -128,7 +143,7 @@ def serve_account_page(account: Account,
             account, use_monthly_statement, statement_period
         )
         basket = basket_total(account.shopper_id, ask_the_pricing_service)
-        card = card_on_file(account.shopper_id, ask_the_provider)
+        card, provider_failure = _the_card_for(account.shopper_id, ask_the_provider)
     except Exception as error:  # noqa: BLE001 - the boundary records anything
         failure = f"{type(error).__name__}: {error} at {_where_it_was_raised(error)}"
         record_visit(account.shopper_id, failure)
@@ -138,13 +153,37 @@ def serve_account_page(account: Account,
     record_visit(account.shopper_id, str(figure_cents))
 
     return RenderedPage(figure_cents=figure_cents,
-                        card_last_four=card.last_four,
+                        card_last_four=card.last_four if card is not None else None,
                         failure=None,
                         served_from_cache=from_cache,
                         cache_failure=cache_failure,
                         statement=statement,
                         basket_total_cents=basket.total_cents,
-                        pricing_delay=basket.slow_call)
+                        pricing_delay=basket.slow_call,
+                        provider_failure=provider_failure)
+
+
+def _the_card_for(shopper_id: str,
+                  ask: AskTheProvider) -> tuple[StoredCard | None, str | None]:
+    """The card the provider holds, or nothing and the words for why not.
+
+    Only `PaymentProviderFailed` is caught, and only here. That exception means
+    one thing - another company's service did not give Io a card - and it is the
+    one failure on this page that the shop can render around, because the card
+    is a panel and not the page. Anything else raised while serving is a fault
+    in this repository and goes on failing the request, loudly, at the boundary.
+
+    The words are kept whole, down to the line they were raised on, so the log
+    line that names the provider's host, the path and the status is exactly the
+    one it always was. What changes is that it no longer arrives as Io's error
+    rate: it is reported beside a page that rendered, like an unreachable cache.
+    """
+    try:
+        return card_on_file(shopper_id, ask), None
+    except PaymentProviderFailed as failed:
+        return None, (
+            f"{type(failed).__name__}: {failed} at {_where_it_was_raised(failed)}"
+        )
 
 
 def _the_statement_for(account: Account,

@@ -4,13 +4,14 @@ The account page shows the card a shopper will be charged with, and the shop has
 never held that number: it lives with the payment provider, and the page asks
 for it while it renders. That makes the provider part of every account page -
 another company's service on Io's request path, which is the ordinary shape of a
-shop and the reason an outage somewhere else becomes an outage here.
+shop and the reason an outage somewhere else becomes a missing panel here.
 
-Nothing in this module retries, falls back, or renders the page without the
-card. That is deliberate rather than unfinished: when the provider is down there
-is nothing the shop can do about it, and code that softened the failure would
-turn an incident about somebody else's outage into an incident about Io's
-resilience.
+Nothing in this module retries. What it does do is report every way the provider
+can fail to hand over a card as one named failure, `PaymentProviderFailed`, so
+that the page above can render the rest of itself without the card and say why -
+see `io_shop.account_page._the_card_for`. The card is a panel, not the page, and
+code that failed the whole request would turn somebody else's outage into an
+outage of Io's own, which is precisely what it did.
 
 How the provider is reached is the caller's to supply. The shop states what it
 asks for and what it does with the answer, and whoever is running it says where
@@ -71,6 +72,11 @@ class PaymentProviderFailed(Exception):
     down from one that is refusing this particular shopper, and inventing the
     distinction in an exception type would be the shop claiming knowledge of
     another company's internals.
+
+    One type for every way it can go wrong, including a provider that could not
+    be reached at all, because the page above renders around exactly this type:
+    a second exception escaping from here would be indistinguishable, at the
+    boundary, from a bug in the shop and would fail the request like one.
     """
 
 
@@ -88,8 +94,23 @@ def card_on_file(shopper_id: str, ask: AskTheProvider) -> StoredCard:
     path Io asked for, and the status that came back. A failure that said only
     "could not load card" would be indistinguishable, in a log, from a bug in
     the shop.
+
+    An outage does not always arrive as a status. A caller reaching the provider
+    over the network raises when the connection is refused or the call times
+    out, and that is the same event with a different shape, so it is reported as
+    the same failure - with the original attached as the cause, so nothing about
+    it is lost.
     """
-    answer = ask(shopper_id)
+    try:
+        answer = ask(shopper_id)
+    except PaymentProviderFailed:
+        raise
+    except Exception as unreachable:
+        raise PaymentProviderFailed(
+            f"{PROVIDER_HOST} could not be reached for "
+            f"{CARD_PATH.format(shopper_id=shopper_id)}: "
+            f"{type(unreachable).__name__}: {unreachable}"
+        ) from unreachable
 
     if answer.status != _OK or answer.card is None:
         raise PaymentProviderFailed(
