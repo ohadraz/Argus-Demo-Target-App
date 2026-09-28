@@ -14,18 +14,28 @@ chose that spelling - which is why the fact is published in the service
 catalogue rather than left to be inferred here.
 
 The shop does not retry and does not price the basket itself when the service
-is slow. It waits, and it says how long it waited. A slow dependency is not this
-request's failure: the page is correct, the shopper is charged the right amount,
-and the only thing that changed is how long it took to say so.
+is slow. What it does do is say how long it is prepared to wait, because a
+caller that waits as long as it takes has handed its own latency to a service
+it does not run: a dependency answering in 1500ms makes every page 1500ms, and
+no amount of care on this side changes that. So the wait is bounded here. A
+call that comes back inside the deadline is a price, slow or not; a call that
+does not is abandoned, and the page renders without the figure rather than
+holding a shopper for as long as somebody else's incident lasts.
 
 How the service is reached is the caller's to supply, for the reason the payment
 provider's is: the shop is rendered many times over to produce a minute of
-telemetry, and a socket per render would be thousands of them per read.
+telemetry, and a socket per render would be thousands of them per read. The
+deadline is enforced here rather than left to that seam, because whether a
+particular client honours a timeout is not something the shop can see - and the
+bound has to hold for every way of reaching the service, not the well-behaved
+ones only.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as CallDidNotFinish
 from dataclasses import dataclass
 from typing import Final
 
@@ -43,6 +53,19 @@ BASKET_PATH: Final = "/v1/shoppers/{shopper_id}/basket-total"
 # in its own logs, and a service that has never been near this number is one
 # nobody writes a line about.
 SLOW_CALL_MS: Final = 200
+
+# How long a call may take before the shop stops waiting for it. Further out
+# than the threshold above - the shop remarks on a slow answer long before it
+# gives up on one - and far beyond anything this service does when it is well.
+# This is the number that caps an account page's time: whatever happens over
+# there, a render spends at most this long on the basket.
+PRICING_DEADLINE_MS: Final = 500
+
+# Where abandoned calls are left to finish. Shared rather than made per render,
+# for the reason the seam itself is handed in: a thread per page would be
+# thousands of them per minute of telemetry. A call the shop has given up on
+# goes on running here until the service answers, and its answer is dropped.
+_CALLS: Final = ThreadPoolExecutor(thread_name_prefix="pricing-call")
 
 
 @dataclass(frozen=True)
@@ -70,9 +93,15 @@ class PricedBasket:
     did not. It sits here rather than being raised, because a slow answer is
     still an answer - the same shape as `RenderedPage.cache_failure`, which
     reports something broken underneath a page that rendered perfectly well.
+
+    `total_cents` is `None` where the shop gave up waiting. That is the one case
+    in which there is no figure and no failure either: the page is still correct
+    about everything it does show, and `slow_call` says what was dropped and
+    after how long. A basket figure a shopper waits out an entire incident for
+    is worse than a page that arrives without it.
     """
 
-    total_cents: int
+    total_cents: int | None
     slow_call: str | None = None
 
 
@@ -91,20 +120,37 @@ class PricingServiceFailed(Exception):
 type AskThePricingService = Callable[[str], PricingAnswer]
 
 
-def basket_total(shopper_id: str, ask: AskThePricingService) -> PricedBasket:
+def basket_total(shopper_id: str,
+                 ask: AskThePricingService,
+                 deadline_ms: int = PRICING_DEADLINE_MS) -> PricedBasket:
     """What this shopper's basket comes to, and what the call cost to make.
 
-    Raises `PricingServiceFailed` for anything that is not a price. A slow price
-    is a price: it comes back with the words for how slow, so the shop can put
-    them in its own logs and a reader can see where a request's time went
-    without having any telemetry of the pricing service's own.
+    Waits at most `deadline_ms` for the service. Past that the call is left to
+    finish on its own and this returns a basket with no total and the words for
+    what was abandoned - so a dependency answering in seconds costs the page the
+    deadline and not the seconds.
+
+    Raises `PricingServiceFailed` for an answer that is not a price. A slow
+    price is still a price: it comes back with the words for how slow, so the
+    shop can put them in its own logs and a reader can see where a request's
+    time went without having any telemetry of the pricing service's own.
 
     Those words are the whole point of this function. A log line saying only
     "account page took 1900ms" describes every slow incident equally, and leaves
     a reader to guess which of the shop's own lines was the slow one - when in
     fact none of them was.
     """
-    answer = ask(shopper_id)
+    call = _CALLS.submit(ask, shopper_id)
+
+    try:
+        answer = call.result(timeout=deadline_ms / 1000)
+    except CallDidNotFinish:
+        call.cancel()
+
+        return PricedBasket(
+            total_cents=None,
+            slow_call=_gave_up_words(shopper_id, deadline_ms)
+        )
 
     if answer.total_cents is None:
         raise PricingServiceFailed(
@@ -131,5 +177,19 @@ def _slow_call_words(shopper_id: str, took_ms: int) -> str | None:
 
     return (
         f"{PRICING_HOST} took {took_ms}ms for "
+        f"{BASKET_PATH.format(shopper_id=shopper_id)}"
+    )
+
+
+def _gave_up_words(shopper_id: str, deadline_ms: int) -> str:
+    """What to say about a call the shop stopped waiting for.
+
+    The same three things a slow call names - the service, the path, the
+    milliseconds - and wording that makes the number the shop's deadline rather
+    than the service's answer, because a reader has to be able to tell "it took
+    this long" from "we waited this long and left".
+    """
+    return (
+        f"{PRICING_HOST} did not answer within {deadline_ms}ms for "
         f"{BASKET_PATH.format(shopper_id=shopper_id)}"
     )
