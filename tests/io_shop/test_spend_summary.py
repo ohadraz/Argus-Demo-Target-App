@@ -12,7 +12,9 @@ from io_shop.spend_summary import (
 """Io's account-page arithmetic - the lifetime figure and the monthly one.
 
 The monthly figure is newer and ships behind a rollout flag, so the cases below
-cover the shape the page has had for years plus the one the flag adds.
+cover the shape the page has had for years plus the one the flag adds - and,
+since both are worked out inside a page render, what the lifetime figure costs
+to reach as well as what it comes to.
 """
 
 
@@ -85,3 +87,45 @@ def test_the_page_lets_a_failure_reach_its_caller() -> None:
         render_spend_summary(
             a_shopper_who_never_bought_anything, use_monthly_summary=False
         )
+
+
+class CountingPurchase:
+    """A purchase that remembers how often its price was read.
+
+    Duck-typed rather than a `Purchase`, because the figure under test reads
+    nothing but `price_cents` - and reads are the unit of work here, which is
+    the thing a test of the figure alone cannot see.
+    """
+
+    def __init__(self, price_cents: int, reads: list[int]) -> None:
+        self._price_cents = price_cents
+        self._reads = reads
+
+    @property
+    def price_cents(self) -> int:
+        self._reads[0] += 1
+        return self._price_cents
+
+
+def test_the_lifetime_average_walks_the_history_once() -> None:
+    # Re-summing a growing prefix once per purchase reads every price about
+    # n^2/2 times and arrives at the number one pass already has. On the
+    # shop's busiest page that is the difference between fitting inside the
+    # CPU limit and queueing behind it, so it is asserted here rather than
+    # discovered under load.
+    how_many = 400
+    reads = [0]
+    an_account = Account(
+        shopper_id="shopper-with-a-long-history",
+        purchases=tuple(
+            CountingPurchase(100 + index, reads) for index in range(how_many)
+        ),
+        total_cents=0,
+        total_this_month_cents=0,
+    )
+
+    expected = sum(100 + index for index in range(how_many)) // how_many
+
+    assert average_spend_per_item(an_account) == expected
+    # One pass is `how_many` reads; the prefix-summing version was 80,200.
+    assert reads[0] <= 4 * how_many
