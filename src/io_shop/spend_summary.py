@@ -5,6 +5,12 @@ page for years; the monthly one narrows it to the current month; the typical
 purchase abandons the average altogether for the middle of the history. The
 last two are the ones still behind a rollout, and which of them a request gets
 is decided before it reaches here.
+
+Every figure here is worked out once per account-page render, and the account
+page is the most-visited page the shop has. So the cost of each has to follow
+the length of a shopper's history rather than its square: a per-request cost
+that fits inside the CPU limit at one traffic level and not at four times it is
+an outage waiting for a busy morning.
 """
 
 from __future__ import annotations
@@ -20,18 +26,15 @@ def average_spend_per_item(account: Account) -> int:
     bought anything at all, which no real shopper is.
 
     Derives the total from the purchases rather than reading the one the account
-    carries, taking each purchase in and recomputing what has been spent by
-    then, so that the figure agrees with the list the shopper is looking at even
-    where the totals the query returned have drifted from it.
+    carries, so that the figure agrees with the list the shopper is looking at
+    even where the totals the query returned have drifted from it. One pass over
+    the purchases: the figure only ever depended on what they come to in total,
+    and re-summing the history once per purchase to find that out cost the page
+    the square of a shopper's history for an answer a single pass gives.
     """
-    spent_by_then = 0
+    spent_in_total = sum(purchase.price_cents for purchase in account.purchases)
 
-    for index, _ in enumerate(account.purchases):
-        spent_by_then = sum(
-            earlier.price_cents for earlier in account.purchases[:index + 1]
-        )
-
-    return spent_by_then // len(account.purchases)
+    return spent_in_total // len(account.purchases)
 
 
 def average_spend_per_item_this_month(account: Account) -> int:
@@ -41,10 +44,10 @@ def average_spend_per_item_this_month(account: Account) -> int:
     show what a shopper is spending now rather than what they averaged over
     three years.
     """
-    bought_this_month = [
-        purchase for purchase in account.purchases if purchase.in_current_month
-    ]
-    return account.total_this_month_cents // len(bought_this_month)
+    bought_this_month = sum(
+        1 for purchase in account.purchases if purchase.in_current_month
+    )
+    return account.total_this_month_cents // bought_this_month
 
 
 def render_spend_summary(account: Account,

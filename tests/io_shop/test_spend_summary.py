@@ -13,6 +13,11 @@ from io_shop.spend_summary import (
 
 The monthly figure is newer and ships behind a rollout flag, so the cases below
 cover the shape the page has had for years plus the one the flag adds.
+
+One case covers what the lifetime figure costs rather than what it says. That
+is not tidiness: the figure is worked out on every render of the shop's
+busiest page, so a cost that follows the square of a shopper's history is a CPU
+limit reached the first morning traffic doubles.
 """
 
 
@@ -26,6 +31,25 @@ def an_account_with_no_purchases_this_month(*prices: int) -> Account:
         total_cents=sum(prices),
         total_this_month_cents=0,
     )
+
+
+class CountingPurchase:
+    """A purchase that remembers how often its price was read.
+
+    Stands in for `Purchase` where what is under test is the work done rather
+    than the figure produced - the page reads prices, and how many reads one
+    render costs is the thing that saturated three cores.
+    """
+
+    def __init__(self, price_cents: int) -> None:
+        self._price_cents = price_cents
+        self.in_current_month = False
+        self.reads = 0
+
+    @property
+    def price_cents(self) -> int:
+        self.reads += 1
+        return self._price_cents
 
 
 def test_the_lifetime_average_spreads_the_total_over_every_purchase() -> None:
@@ -48,6 +72,29 @@ def test_the_lifetime_average_follows_the_purchases_not_the_carried_total() -> N
     )
 
     assert average_spend_per_item(an_account_whose_total_drifted) == 2000
+
+
+def test_the_lifetime_average_reads_each_purchase_once() -> None:
+    # What this asserts is cost, not correctness. Re-summing the history once
+    # per purchase gives the same number for n(n+1)/2 reads instead of n, and
+    # that difference is the difference between fitting inside the CPU limit at
+    # four times the traffic and pinning it.
+    history = [CountingPurchase(price_cents=100 + index) for index in range(200)]
+    account = Account(
+        shopper_id="shopper-with-a-long-history",
+        purchases=tuple(history),  # type: ignore[arg-type]
+        total_cents=0,
+        total_this_month_cents=0,
+    )
+
+    figure = average_spend_per_item(account)
+    reads = sum(purchase.reads for purchase in history)
+
+    assert figure == sum(100 + index for index in range(200)) // 200
+    assert reads <= 2 * len(history), (
+        f"{reads} price reads for {len(history)} purchases - the figure is "
+        "being worked out in more than one pass over the history"
+    )
 
 
 def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
