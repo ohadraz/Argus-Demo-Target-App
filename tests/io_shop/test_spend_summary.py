@@ -67,6 +67,23 @@ def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
     assert average_spend_per_item_this_month(an_active_shopper) == 3000
 
 
+def test_the_monthly_average_is_nothing_for_a_shopper_idle_this_month() -> None:
+    # The incident: with the rollout on, every shopper who had bought before but
+    # not this month divided by an empty month and failed the page. Nothing
+    # bought this month averages to nothing, not to an error.
+    account = an_account_with_no_purchases_this_month(1000, 3000)
+
+    assert average_spend_per_item_this_month(account) == 0
+
+
+def test_the_page_renders_for_an_idle_shopper_when_the_rollout_is_on() -> None:
+    # The same case through the path the flag selects, which is how it reached
+    # the account page.
+    account = an_account_with_no_purchases_this_month(1000, 3000)
+
+    assert render_spend_summary(account, use_monthly_summary=True) == 0
+
+
 def test_the_page_takes_the_stable_summary_when_the_rollout_is_off() -> None:
     account = an_account_with_no_purchases_this_month(1000, 3000)
 
