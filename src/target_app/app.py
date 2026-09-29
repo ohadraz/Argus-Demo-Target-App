@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -31,7 +31,7 @@ from target_app.generator import (
 from target_app.history import FlagHistoryUnavailable
 from target_app.monitoring import AlertNotDelivered, fire_alert
 from target_app.oncall import a_user, an_incident
-from target_app.payments import charges_between
+from target_app.payments import a_page_of_charges
 from target_app.people import pay_grades_and_bands
 from target_app.rates import UnknownBase, rates_quoted_against
 from target_app.registry import dependencies_of
@@ -1447,13 +1447,29 @@ class StripeList(BaseModel):
     url: str = "/v1/charges"
 
 
+# What the provider will hand back at once, and what it hands back when nobody
+# says. Both are the real service's - "Limit can range between 1 and 100, and
+# the default is 10" - and a stand-in generous about either would license a
+# caller the real account then refuses.
+THE_SMALLEST_PAGE = 1
+THE_LARGEST_PAGE = 100
+THE_PAGE_NOBODY_ASKED_FOR = 10
+
+# How the provider refuses a request it will not answer: an `error` envelope
+# naming the kind of fault, the parameter at fault, and what was wrong with it.
+# The status is the provider's; the sentence is ours, because inventing the
+# vendor's own wording would be a lie a reader could come to depend on.
+A_REQUEST_THE_PROVIDER_REFUSES = 400
+AN_INVALID_REQUEST = "invalid_request_error"
+
+
 @app.get("/stripe/v1/charges", response_model=StripeList)
 def stripe_charges(
     created_gte: int = Query(0, alias="created[gte]"),
     created_lte: int = Query(0, alias="created[lte]"),
-    limit: int = Query(100),
+    limit: int = Query(THE_PAGE_NOBODY_ASKED_FOR),
     starting_after: str | None = Query(None),
-) -> StripeList:
+) -> StripeList | JSONResponse:
     """Stands in for Stripe's `GET /v1/charges`.
 
     The window arrives as the SDK sends it - `created[gte]` and `created[lte]`,
@@ -1462,23 +1478,44 @@ def stripe_charges(
     page would leave that path untested until a real account was in front of
     it.
 
-    Takings come from the same minutes `/metrics` reports, so an incident that
-    breaks the shop shows up in the money. A window with no scenario seeded is
-    a shop that took nothing, which is a real answer and not an error.
+    Takings over a minute `/metrics` still reports come from that minute, so an
+    incident that breaks the shop shows up in the money. Over a minute older
+    than the metrics reach they are the shop's ordinary trade, because Stripe
+    does not expire charges and a stand-in that answered an old window empty
+    would be teaching a consumer that no takings and no records are one answer.
+
+    Paged by generating the page rather than by slicing the window, which is
+    what lets a window of any age be asked for at all - see
+    `target_app.payments.a_page_of_charges`.
+
+    A page the provider would not serve is refused here too. The window is the
+    caller's business and the page size is the provider's, and a stand-in that
+    answered a thousand charges at once would let a caller solve its round
+    trips against a service that will not have it.
     """
+    if not THE_SMALLEST_PAGE <= limit <= THE_LARGEST_PAGE:
+        return JSONResponse(
+            status_code=A_REQUEST_THE_PROVIDER_REFUSES,
+            content={
+                "error": {
+                    "type": AN_INVALID_REQUEST,
+                    "param": "limit",
+                    "message": (
+                        f"limit must be between {THE_SMALLEST_PAGE} and "
+                        f"{THE_LARGEST_PAGE}, and {limit} is not"
+                    ),
+                }
+            },
+        )
+
     window_start = datetime.fromtimestamp(created_gte, tz=UTC)
     window_end = datetime.fromtimestamp(created_lte or created_gte, tz=UTC)
 
-    charges = charges_between(metrics(), window_start, window_end)
+    page, has_more = a_page_of_charges(
+        metrics(), window_start, window_end, limit, starting_after
+    )
 
-    if starting_after is not None:
-        seen = [index for index, charge in enumerate(charges)
-                if charge["id"] == starting_after]
-        charges = charges[seen[0] + 1:] if seen else []
-
-    page = charges[:limit]
-
-    return StripeList(data=page, has_more=len(charges) > len(page))
+    return StripeList(data=page, has_more=has_more)
 
 
 # PagerDuty's own envelope: a single resource comes back wrapped under its own

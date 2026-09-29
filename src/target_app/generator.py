@@ -67,7 +67,7 @@ TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # the baseline is smooth enough to be a baseline, and a whole six-hour window
 # still generates in under a second - once, after which it is remembered.
 _SAMPLE_SIZE = 200
-_REPORTED_VOLUME_PER_MINUTE = 1200
+REPORTED_VOLUME_PER_MINUTE = 1200
 
 # How many of a shop's registered shoppers have bought anything in the current
 # month. Most have not, which is what a real customer base looks like - and it
@@ -85,7 +85,7 @@ _MAX_FAILURE_LINES_PER_MINUTE = 2
 # The service's healthy behaviour, and how much it wobbles minute to minute. The
 # wobble matters: a baseline with no spread at all is not a baseline anything
 # can be measured as departing from.
-_BASELINE_ERROR_RATE = 0.01
+BASELINE_ERROR_RATE = 0.01
 _BASELINE_ERROR_RATE_WOBBLE = 0.005
 _BASELINE_P50_MS = 45
 _BASELINE_P95_MS = 215
@@ -1379,7 +1379,7 @@ def _generate_minute(
     # them - which is what lets capacity be added to a bucket without moving a
     # number in any scenario that has nothing to do with it.
     reported_volume = round(
-        _REPORTED_VOLUME_PER_MINUTE
+        REPORTED_VOLUME_PER_MINUTE
         * (demand_surge.multiple_at(minute) if demand_surge is not None else 1.0)
     )
     cores_available = the_cores_of(
@@ -2198,7 +2198,7 @@ def _serve_one_account_page(
         return _ServedPage(flag_is_on, page.failure, cost, page.served_from_cache,
                            page.cache_failure)
 
-    if entropy.random() < _BASELINE_ERROR_RATE + entropy.uniform(
+    if entropy.random() < BASELINE_ERROR_RATE + entropy.uniform(
         -_BASELINE_ERROR_RATE_WOBBLE, _BASELINE_ERROR_RATE_WOBBLE
     ):
         # Every real service fails a little without anything being wrong. Some

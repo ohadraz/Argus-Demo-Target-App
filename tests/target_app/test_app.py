@@ -18,9 +18,11 @@ from io_shop.visits import (
 )
 from target_app import app as app_module
 from target_app.app import (
+    AN_INVALID_REQUEST,
     AUTOSCALER_GROUP,
     AUTOSCALER_KIND,
     AUTOSCALER_VERSION,
+    A_REQUEST_THE_PROVIDER_REFUSES,
     GENERATED_SPAN_MINUTES,
     MERGE_PATCH_TYPE,
     MIN_REPLICAS_FIELD,
@@ -28,6 +30,9 @@ from target_app.app import (
     RESTART_ACTION,
     SCALE_ACTION,
     SPEC_FIELD,
+    THE_LARGEST_PAGE,
+    THE_PAGE_NOBODY_ASKED_FOR,
+    THE_SMALLEST_PAGE,
     app,
     to_bucket_id,
 )
@@ -64,6 +69,26 @@ No lifespan: it waits for a real flag provider, and nothing here stages a flag.
 RESTART_ACTION_PATH = "/argocd/io-shop/resource/actions/v2"
 
 
+def _the_catalogs_own_clients_replaced_by(
+    flags: FlagClient, fallback_flags: FlagClient
+) -> tuple[FlagClient, FlagClient]:
+    """Points the two clients the catalogue reads at these, and answers the two
+    it was reading.
+
+    The state object is not the only way into the provider: the catalogue reads
+    both flags through the module's own clients, to report their live state
+    whatever is staged. Replacing the state alone left those aimed at a provider
+    no test here runs, so every catalogue request spent two four-second failed
+    connects to answer `None` - which is the same answer an unreachable provider
+    is supposed to give, so the suite was correct and two and a half times
+    slower, and stayed that way until somebody timed it.
+    """
+    was = app_module.flags, app_module.fallback_flags
+    app_module.flags, app_module.fallback_flags = flags, fallback_flags
+
+    return was
+
+
 @pytest.fixture
 def client() -> Iterator[TestClient]:
     """The service with a stubbed provider behind it, for one test.
@@ -85,11 +110,13 @@ def client() -> Iterator[TestClient]:
     # reset; the other backdates a staging toggle to when the change it stages
     # actually happened.
     app_module.state = ScenarioState(flags, fallback_flags, Mock(), Mock())
+    was_read_directly = _the_catalogs_own_clients_replaced_by(flags, fallback_flags)
     forget_every_visit()
 
     yield TestClient(app)
 
     app_module.state = was
+    _the_catalogs_own_clients_replaced_by(*was_read_directly)
     forget_every_visit()
 
 
@@ -170,6 +197,62 @@ def the_minute_of(client: TestClient, restarted: Response) -> dict:
 # second of a minute has to elapse before it is a reading, and a little more
 # than that covers the request that asks.
 A_MINUTE_BECOMES_READABLE_SECONDS = 3.0
+
+# An hour, in the unix seconds the provider's window arrives as. Any hour: what
+# these cases are about is the page, and the shop trades through every minute.
+SOME_WINDOW_START = 1_788_436_800
+SOME_WINDOW_END = SOME_WINDOW_START + 3_600
+
+
+def _charges_in_some_window(client: TestClient, **asked: object) -> Response:
+    return client.get(
+        "/stripe/v1/charges",
+        params={
+            "created[gte]": SOME_WINDOW_START,
+            "created[lte]": SOME_WINDOW_END,
+            **asked,
+        },
+    )
+
+
+def test_a_page_nobody_sized_holds_what_the_provider_gives_unasked(
+    client: TestClient
+) -> None:
+    # Ten, which is the real service's default. A stand-in answering its own
+    # maximum instead would hide from an adapter that it has to ask - and the
+    # adapter that forgot would then read a tenth of every window in production
+    # and none of that here.
+    answered = _charges_in_some_window(client)
+
+    assert len(answered.json()["data"]) == THE_PAGE_NOBODY_ASKED_FOR
+
+
+def test_the_largest_page_the_provider_serves_is_served(client: TestClient) -> None:
+    answered = _charges_in_some_window(client, limit=THE_LARGEST_PAGE)
+
+    assert len(answered.json()["data"]) == THE_LARGEST_PAGE
+
+
+def test_a_page_larger_than_the_provider_serves_is_refused(
+    client: TestClient
+) -> None:
+    # The round trips a week of charges costs are real, and asking for a bigger
+    # page is the first fix anybody reaches for. It is not available: the real
+    # service caps this at a hundred, so a stand-in that quietly served more
+    # would bless a fix that fails on the first live account it meets.
+    refused = _charges_in_some_window(client, limit=THE_LARGEST_PAGE + 1)
+
+    assert refused.status_code == A_REQUEST_THE_PROVIDER_REFUSES
+    assert refused.json()["error"]["param"] == "limit"
+
+
+def test_a_page_of_nothing_is_refused(client: TestClient) -> None:
+    # The other end of the same rule. A page of none reads as a shop that took
+    # nothing, which is the one answer this endpoint must never give by accident.
+    refused = _charges_in_some_window(client, limit=THE_SMALLEST_PAGE - 1)
+
+    assert refused.status_code == A_REQUEST_THE_PROVIDER_REFUSES
+    assert refused.json()["error"]["type"] == AN_INVALID_REQUEST
 
 
 def test_the_leak_is_seedable_by_id(client: TestClient) -> None:
@@ -342,22 +425,22 @@ def a_staged_upstream_failure(client: TestClient) -> None:
     assert seeded.status_code == 200
 
 
-def test_the_upstream_failure_is_offered_in_the_console() -> None:
+def test_the_upstream_failure_is_offered_in_the_console(client: TestClient) -> None:
     # Worth watching: it is the scenario where the right answer is that Argus
     # does nothing, and an audience seeing that happen is the point of showing
     # it at all.
     offered = [
-        entry["id"] for entry in TestClient(app).get("/scenario/catalog").json()["scenarios"]
+        entry["id"] for entry in client.get("/scenario/catalog").json()["scenarios"]
     ]
 
     assert UPSTREAM_DEPENDENCY_FAILURE in offered
 
 
-def test_the_upstream_failure_offers_no_flag_to_watch() -> None:
+def test_the_upstream_failure_offers_no_flag_to_watch(client: TestClient) -> None:
     # No flag is in play, so none may be badged. A page naming one would be
     # pointing an audience at a suspect the fixture invented, and offering a
     # control that changes nothing.
-    catalog = TestClient(app).get("/scenario/catalog").json()
+    catalog = client.get("/scenario/catalog").json()
     upstream = next(
         entry for entry in catalog["scenarios"]
         if entry["id"] == UPSTREAM_DEPENDENCY_FAILURE
@@ -531,11 +614,13 @@ def a_shop_whose_flag_is_on() -> Iterator[TestClient]:
     # reset; the other backdates a staging toggle to when the change it stages
     # actually happened.
     app_module.state = ScenarioState(flags, fallback_flags, Mock(), Mock())
+    was_read_directly = _the_catalogs_own_clients_replaced_by(flags, fallback_flags)
     forget_every_visit()
 
     yield TestClient(app)
 
     app_module.state = was
+    _the_catalogs_own_clients_replaced_by(*was_read_directly)
     forget_every_visit()
 
 
