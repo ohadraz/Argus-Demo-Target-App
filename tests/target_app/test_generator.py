@@ -1911,3 +1911,118 @@ def test_a_restart_changes_nothing_but_the_start_time() -> None:
 
     assert after.process_start_time_seconds == came_up.timestamp()
     assert after.error_rate > 0.12
+
+
+def a_window_with_the_monthly_rollup_dropped(
+    began_minutes_ago: int = SOME_SPAN_MINUTES + 5,
+) -> list[GeneratedMinute]:
+    """A window served while the cheaper write path was live throughout.
+
+    The whole window rather than part of it, because that is what this scenario
+    stages: the flag went on days before anybody asks, so every minute anybody can
+    fetch was served with the fault in place. A window with a quiet stretch in it
+    would let a flat assertion pass on minutes the fault was not live for.
+    """
+    return generate(
+        a_flag_on_since(began_minutes_ago),
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="monthly-spend-feature",
+        ships_the_incremental_write=True,
+    )
+
+
+def test_the_flag_is_on_for_every_minute_of_the_window() -> None:
+    # The premise the flatness claims below rest on. A flat window is only
+    # evidence if the fault was live across it; otherwise every assertion here is
+    # passing on a shop where nothing was staged.
+    minutes = a_window_with_the_monthly_rollup_dropped()
+
+    assert all(
+        "monthly-spend-feature=on" in " ".join(minute.log_lines) for minute in minutes
+    )
+
+
+def test_dropping_the_monthly_rollup_fails_no_request() -> None:
+    # The scenario rather than a property of it. A write that skips a total throws
+    # nothing and returns nothing to anybody, so there is no failure to count -
+    # which is why no rule fires and why the shop has to be asked rather than
+    # watched.
+    minutes = a_window_with_the_monthly_rollup_dropped()
+
+    assert all(minute.error_rate < CLEARLY_HEALTHY for minute in minutes)
+
+
+def test_dropping_the_monthly_rollup_makes_nothing_wait() -> None:
+    # All three quantiles, and the third is the one worth naming: the tail is
+    # where every other invisible incident in this fixture hides, and this one is
+    # not there either. Compared against the window's own quiet minutes, which is
+    # the only honest baseline - a flag-on minute draws one value more per request
+    # than a flag-off one, so two separately generated windows differ inside the
+    # wobble without anything having happened.
+    minutes = a_window_with_the_monthly_rollup_dropped(began_minutes_ago=10)
+
+    calm = minute_at(15, minutes)
+    live = minute_at(2, minutes)
+
+    assert abs(live.p50_ms - calm.p50_ms) < calm.p50_ms // 4
+    assert abs(live.p95_ms - calm.p95_ms) < calm.p95_ms // 4
+    assert abs(live.p99_ms - calm.p99_ms) < calm.p99_ms // 4
+
+
+def test_dropping_the_monthly_rollup_eats_no_memory() -> None:
+    minutes = a_window_with_the_monthly_rollup_dropped()
+
+    assert all(
+        minute.memory_used_bytes < BASELINE_MEMORY_BYTES * 1.1 for minute in minutes
+    )
+
+
+def test_the_shop_goes_on_reporting_the_traffic_and_the_capacity_it_always_did(
+) -> None:
+    # The two series a reader checks before believing a flat window: the shop is
+    # serving its usual traffic on its usual cores, so the flatness above is a shop
+    # that is well rather than a shop nobody is visiting.
+    minutes = a_window_with_the_monthly_rollup_dropped()
+    with_nothing_staged = generate(
+        None, SOME_NOW, SOME_SPAN_MINUTES, flag="monthly-spend-feature"
+    )
+
+    assert [minute.request_volume for minute in minutes] == [
+        minute.request_volume for minute in with_nothing_staged
+    ]
+    assert [minute.cpu_limit_cores for minute in minutes] == [
+        minute.cpu_limit_cores for minute in with_nothing_staged
+    ]
+
+
+def test_the_only_failures_in_the_window_are_the_shops_ordinary_noise() -> None:
+    # Not "no failures at all": every real service drops a few requests without
+    # anything being wrong, and this shop reports a shopper closing a connection
+    # about once in a hundred in every window of every scenario. What matters is
+    # that nothing else appears - no exception from the shop's own code, and
+    # nothing naming the thing that is actually broken.
+    failures = [
+        line
+        for minute in a_window_with_the_monthly_rollup_dropped()
+        for line in minute.log_lines
+        if "ERROR" in line
+    ]
+
+    assert failures
+    assert all("ClientDisconnected" in line for line in failures)
+
+
+def test_no_minute_of_the_window_mentions_a_total_or_a_summary() -> None:
+    # Nothing in the shop's own words says anything about it. The lines that exist
+    # report the flag's value and pages rendering normally, which is what a well
+    # shop says - so a reader handed this window has been handed no evidence, and
+    # the alert is the whole of the channel.
+    said = " ".join(
+        line
+        for minute in a_window_with_the_monthly_rollup_dropped()
+        for line in minute.log_lines
+    )
+
+    assert "total" not in said
+    assert "summary" not in said

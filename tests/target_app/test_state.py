@@ -25,6 +25,7 @@ from target_app.scenarios import (
     PRICING_SERVICE_DEGRADED,
     RESOURCE_LEAK,
     SCENARIOS,
+    SILENT_DATA_CORRUPTION,
     SLOW_CANARY_ROLLOUT,
     UPSTREAM_DEPENDENCY_FAILURE,
     Scenario,
@@ -70,6 +71,7 @@ def a_scenario_state(
     flags: Mock,
     fallback_flags: Mock | None = None,
     forget_the_flag_history: Mock | None = None,
+    backdate_the_flag_history: Mock | None = None,
 ) -> ScenarioState:
     """A state object whose second flag nobody is looking at.
 
@@ -79,12 +81,15 @@ def a_scenario_state(
 
     Clearing the flag history is stubbed for the same reason, and for one more:
     the real one reaches the provider's own database, so a reset here would go
-    looking for a database no unit test has.
+    looking for a database no unit test has. Backdating it is stubbed for exactly
+    that second reason - it reaches the same database - and defaulted because only
+    the scenario whose onset is days old ever asks for it.
     """
     return ScenarioState(
         flags,
         fallback_flags or a_flag_client_reporting(True),
         forget_the_flag_history or Mock(),
+        backdate_the_flag_history or Mock(),
     )
 
 
@@ -1411,3 +1416,99 @@ def test_withdrawing_a_rollback_nobody_took_changes_nothing() -> None:
 
     assert state.active.paused_rollout.began_at == began
     assert state.active.paused_rollout.ended_at is None
+
+
+def a_state_with_the_totals_drifting(
+    backdate_the_flag_history: Mock | None = None,
+) -> ScenarioState:
+    """A shop with the silent-data-corruption scenario staged.
+
+    Its flag reports on, because that is what staging it does, and the check's
+    finding is read off that flag's timeline.
+    """
+    state = a_scenario_state(
+        a_flag_client_reporting(True),
+        backdate_the_flag_history=backdate_the_flag_history,
+    )
+    state.seed(SCENARIOS[SILENT_DATA_CORRUPTION])
+
+    return state
+
+
+def test_the_drifting_scenario_is_backdated_by_days_rather_than_minutes() -> None:
+    # The one scenario whose onset has to be outside the window the metrics cover.
+    # Backdated by minutes it would be an onset a consumer could measure for
+    # itself, and the whole claim of the mode - that only the data dates the fault
+    # - would go untested.
+    state = a_state_with_the_totals_drifting()
+
+    age = utc_now() - state.active.timeline.turned_on_at
+
+    assert age.days >= get_scenario_settings().drift_backdate_days
+
+
+def test_staging_it_records_the_flag_change_when_the_change_happened() -> None:
+    # Without this the provider's log says the flag moved a moment ago while the
+    # alert says the writing went wrong a week ago, and the one piece of evidence
+    # naming a cause sits outside every window anybody would look in.
+    backdate = Mock()
+
+    state = a_state_with_the_totals_drifting(backdate)
+
+    flags, at, since = backdate.call_args.args
+    assert flags == [state._flags.name]
+    assert at == state.active.timeline.turned_on_at
+    assert since > at
+
+
+def test_staging_any_other_scenario_backdates_no_history() -> None:
+    # Every other onset is minutes old, so the provider's log is already close
+    # enough and a rewrite would be a fixture editing an audit trail for nothing.
+    backdate = Mock()
+    state = a_scenario_state(
+        a_flag_client_reporting(True), backdate_the_flag_history=backdate
+    )
+
+    state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
+
+    backdate.assert_not_called()
+
+
+def test_the_check_finds_the_totals_the_staged_write_path_left_behind() -> None:
+    state = a_state_with_the_totals_drifting()
+
+    assert state.the_integrity_check_found().anything_disagrees
+
+
+def test_the_check_finds_nothing_on_a_shop_with_nothing_staged() -> None:
+    # The job is the shop's and runs whatever is going on, so it has to be able
+    # to answer "nothing" - and it examines the accounts rather than skipping them,
+    # which is what makes that answer evidence.
+    state = a_scenario_state(a_flag_client_reporting(False))
+
+    found = state.the_integrity_check_found()
+
+    assert not found.anything_disagrees
+    assert found.accounts_checked > 0
+
+
+def test_the_check_finds_nothing_while_another_scenario_is_staged() -> None:
+    # The shop has one feature flag and several scenarios behind it, so what the
+    # flag is shipping is the scenario's to say. A flag turned on to break the
+    # account page must not also corrupt the shop's totals.
+    state = a_scenario_state(a_flag_client_reporting(True))
+    state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
+
+    assert not state.the_integrity_check_found().anything_disagrees
+
+
+def test_restarting_the_shop_leaves_the_finding_exactly_where_it_was() -> None:
+    # The fault is in what was written down, so a fresh process reads back the
+    # same wrong totals. Nothing else in this fixture behaves this way - a restart
+    # reclaims a heap, and here it reclaims nothing.
+    state = a_state_with_the_totals_drifting()
+    before = state.the_integrity_check_found()
+
+    state.restart_the_shop()
+
+    assert state.the_integrity_check_found() == before

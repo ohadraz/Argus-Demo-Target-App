@@ -24,6 +24,8 @@ import httpx
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from io_shop.spend_reconciliation import Reconciliation
+from target_app.integrity import THE_CHECK_RUNS_EVERY
 from target_app.scenarios import (
     AUTOSCALER_FLAPPING,
     BAD_DEPLOYMENT,
@@ -54,6 +56,35 @@ SERVICE_NAME = "io-shop"
 _HIGH_LATENCY = "HighLatency"
 _HIGH_ERROR_RATE = "HighErrorRate"
 _HIGH_MEMORY_USAGE = "HighMemoryUsage"
+# The one rule here that is not written against a series at all. Every name above
+# names something a metrics stack measures over time; this one names a comparison
+# between two stored figures, which is the only way the incident behind it can be
+# reported - no series moves, so no threshold is ever crossed.
+_TOTALS_DO_NOT_RECONCILE = "SpendTotalsDoNotReconcile"
+
+# How many disagreeing totals the shop pages somebody for.
+#
+# Not one. A single total that does not add up is a support ticket and a
+# correction, and a rule that fired on it would fire most weeks; what is worth
+# waking somebody for is a *population* of them, because that is what says a write
+# path rather than a row is wrong. Twenty-five is comfortably above the noise a
+# real shop lives with and far below what this scenario stages.
+_ENOUGH_TOTALS_TO_PAGE = 25
+
+# Which annotation carries the minute the writing went wrong.
+#
+# Its own annotation and not a sentence to be parsed out of the summary, because
+# it is the one figure in this payload a consumer has to do arithmetic with: it is
+# the onset, and the alert is the only thing in the whole incident that knows it.
+# Prose in the summary too, for a reader - but a reader and a consumer should not
+# be sharing one field when one of them needs a timestamp.
+_THE_ONSET_ANNOTATION = "onset"
+_THE_SUMMARY_ANNOTATION = "summary"
+
+# What a hundredth of the shop's currency is called when a figure is said in
+# whole units. The gap is carried in cents everywhere else, because that is what a
+# price is stored in; an alert is read by a person, and a person reads money.
+_CENTS_IN_A_UNIT = 100
 
 # The rule each scenario trips, and what it says. Anything not named here is
 # paging about an error rate, which is what most of these scenarios break.
@@ -141,14 +172,52 @@ class AlertNotDelivered(Exception):
     """
 
 
-def an_alert_for(scenario_id: str | None, at: datetime) -> dict[str, Any]:
+def an_alert_for(scenario_id: str | None,
+                 at: datetime,
+                 finding: Reconciliation | None = None) -> dict[str, Any]:
     """The firing alert, in Grafana Alertmanager's own webhook shape.
 
     Deliberately the vendor's shape, field nesting included: the consumer parses
     this with the same code it would point at a real Grafana, so a friendlier
     payload here would be a lie that consumer would have to be written around.
+
+    `finding` is what the shop's data-integrity job last reported, where anything
+    has asked it. It takes precedence over the map below when it carries enough
+    disagreeing totals to page about, because it is the only thing here that knows
+    something no series does - and it is ignored entirely otherwise, which is what
+    keeps a quiet shop from being paged about a check that found nothing.
     """
+    if finding is not None and len(finding.accounts_that_disagree) >= (
+        _ENOUGH_TOTALS_TO_PAGE
+    ):
+        return _one_firing_alert(
+            _TOTALS_DO_NOT_RECONCILE, _what_the_check_found_said(finding), at,
+            onset=finding.oldest_affected_purchase_at
+        )
+
     alertname, summary = _WHAT_FIRED.get(scenario_id or "", _BY_DEFAULT)
+
+    return _one_firing_alert(alertname, summary, at)
+
+
+def _one_firing_alert(alertname: str,
+                      summary: str,
+                      at: datetime,
+                      onset: datetime | None = None) -> dict[str, Any]:
+    """One firing alert in the vendor's envelope, with whatever it can say.
+
+    `startsAt` is when the rule fired, always, for every alert this shop sends.
+    For a rule watching a series that is also roughly when the service departed
+    its baseline; for the integrity check it is a week later than the fault, which
+    is exactly why the onset is carried separately and not inferred from this.
+    """
+    annotations = {_THE_SUMMARY_ANNOTATION: summary}
+
+    if onset is not None:
+        # Absent rather than empty where the check could not date its own
+        # finding. A consumer reading an onset it can parse and act on must not
+        # also have to decide whether a blank one means "now".
+        annotations[_THE_ONSET_ANNOTATION] = onset.strftime(TIMESTAMP_FORMAT)
 
     return {
         "status": "firing",
@@ -160,11 +229,42 @@ def an_alert_for(scenario_id: str | None, at: datetime) -> dict[str, Any]:
                     "service": SERVICE_NAME,
                     "severity": "critical",
                 },
-                "annotations": {"summary": summary},
+                "annotations": annotations,
                 "startsAt": at.strftime(TIMESTAMP_FORMAT),
             }
         ],
     }
+
+
+def _what_the_check_found_said(finding: Reconciliation) -> str:
+    """The finding in the words a responder is paged with.
+
+    Three figures, and the third is the one that makes this alert unlike every
+    other one here. How many totals disagree says how big the incident is; the
+    widest gap says how bad the worst of it is; and the oldest affected purchase
+    says *when the writing went wrong*, which nothing else in the incident knows -
+    the check runs weekly, so the minute this fired says nothing about it.
+
+    Money in whole units to two places, because a person reads this. The cents
+    stay cents in the annotation a consumer reads.
+    """
+    oldest = finding.oldest_affected_purchase_at
+    since = (
+        f"the oldest affected purchase was recorded at "
+        f"{oldest.strftime(TIMESTAMP_FORMAT)}"
+        if oldest is not None
+        else "no purchase in the histories accounts for the gaps, so the finding "
+             "cannot be dated"
+    )
+
+    return (
+        f"{len(finding.accounts_that_disagree)} of {finding.accounts_checked} "
+        f"shopper totals do not reconcile with the purchases behind them. The "
+        f"widest is short by "
+        f"{finding.largest_gap_cents / _CENTS_IN_A_UNIT:,.2f}, and {since}. "
+        f"Found by the spend-integrity check, which runs every "
+        f"{THE_CHECK_RUNS_EVERY.days} days, so the fault is up to that old."
+    )
 
 
 def fire_alert(
@@ -172,6 +272,7 @@ def fire_alert(
     settings: MonitoringSettings | None = None,
     post: HttpPost = httpx.post,
     now: Callable[[], datetime] = utc_now,
+    finding: Reconciliation | None = None,
 ) -> dict[str, Any]:
     """Posts the firing alert to the configured webhook and returns what came
     back, so a caller can report the incident it started.
@@ -186,7 +287,7 @@ def fire_alert(
     try:
         response = post(
             url,
-            json=an_alert_for(scenario_id, now()),
+            json=an_alert_for(scenario_id, now(), finding),
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()

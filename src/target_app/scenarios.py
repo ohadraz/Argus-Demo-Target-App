@@ -191,6 +191,20 @@ THE_TAIL = ScenarioFamily(
         "incident exists in the 99th percentile and nowhere else."
     ),
 )
+FOUNDATIONAL_INTEGRITY = ScenarioFamily(
+    id="foundational-integrity",
+    name="Foundational integrity",
+    taxonomy=(
+        "Silent data corruption (FM-26), inside foundational integrity - 12% of "
+        "incidents"
+    ),
+    blurb=(
+        "Nothing fails, nothing slows, and what the shop has already written "
+        "down is wrong. What separates these from every other family is that "
+        "the condition outlives its own cause: putting the change back stops "
+        "the next one and repairs none of the ones before it."
+    ),
+)
 HALF_ROLLED_OUT = ScenarioFamily(
     id="half-rolled-out",
     name="Half rolled out",
@@ -217,6 +231,7 @@ FAMILY_ORDER: tuple[ScenarioFamily, ...] = (
     CONFIGURATION,
     NEIGHBOURS,
     CAPACITY,
+    FOUNDATIONAL_INTEGRITY,
     THE_TAIL,
     HALF_ROLLED_OUT,
 )
@@ -422,6 +437,33 @@ class Scenario:
     offered in the console: an audience shown two identical incidents learns
     nothing from the second.
 
+    `drifts_the_monthly_total` stages the eleventh generated kind, and the only
+    one where nothing about the shop is unwell at any moment a monitor could
+    read. A flag turned on a cheaper way of writing a purchase down, and that
+    way stopped adding the purchase to the running total of what its shopper has
+    spent this month. So the stored total falls further behind the purchases
+    behind it with every sale, the lifetime figure stays right because it derives
+    its own total from the list, the monthly figure on the same page is quietly
+    low, and nothing throws, nothing waits and no series moves at all.
+
+    It is the only scenario here that no series can show and no series can show
+    the end of, which is why it is the only one the shop has to *tell* anybody
+    about: a job of the shop's own re-adds the purchases, finds the totals that
+    disagree, and fires an alert carrying the count, the widest gap and the
+    oldest purchase the gap can be made of. That last figure is the whole of what
+    dates the incident. The job runs weekly, so when it found this says nothing
+    about when the writing went wrong.
+
+    It is also the only scenario nothing here can put right. Returning the flag
+    stops the next purchase being mis-recorded and corrects not one of the
+    thousands already written, so re-running the check afterwards finds exactly
+    the same accounts and no affected purchase newer than the flip - which is
+    what recovery means for this mode and is nothing any graph shows. A restart
+    changes nothing whatsoever: the fault is in what was written, and a fresh
+    process reads back the same wrong totals. What is owed at the end of it is a
+    fix to the write path and a one-off repair of the data, and the repair is
+    nobody's to run without being asked.
+
     `deploy_is_slow` stages the sixth generated kind, and the only one whose
     live condition is which revision is deployed. The revision that went out
     computes a shopper's lifetime average by walking their purchases once per
@@ -466,6 +508,7 @@ class Scenario:
     surges: bool = False
     autoscaler_flaps: bool = False
     rollout_is_paused: bool = False
+    drifts_the_monthly_total: bool = False
     ships_the_statement: bool = False
     # The deploy a *generated* scenario stages, for the one whose cause is a
     # change rather than a state. An authored scenario carries its deploys on
@@ -545,6 +588,22 @@ THE_COMMIT_THAT_RESHAPED_THE_CACHE_ENTRY = (
     "696c33a68b36aed6456cdc5b3806f33038488515"
 )
 THE_COMMIT_BEFORE_THE_RESHAPE = "5470c1a64205bb28f9f2e8a96dc6ffa5eb2e611e"
+# The revision that stopped adding a purchase to its shopper's monthly total, and
+# the one before it. Real commits, pushed, and the diff between them is the
+# diagnosis: it shows the addition removed and a comment reasoning that the figure
+# is derived from the purchases - which is true of the lifetime average and false
+# of the monthly one.
+#
+# **Nothing serves these two to anybody, unlike every pair above them.** Those are
+# read by a `ScenarioDeploy` and reach a consumer through the deploy history; this
+# scenario carries no deploy, because a flag turned the write path on and a
+# deployment did not, and a history entry at the onset would stage a deploy-caused
+# incident instead of this one. They are written down so that a person - or a
+# grader applying a patch - can find the two revisions the fault lives between.
+THE_COMMIT_THAT_DROPPED_THE_MONTHLY_ROLLUP = (
+    "83cf54d6c49fa0371449e045b59209eb97507ce9"
+)
+THE_COMMIT_BEFORE_THE_ROLLUP_WENT = "f61363044ee33fc1b8d3a3b519bcc6a1f2ef7648"
 FALLBACK_DISABLED = "fallback-disabled"
 FLAG_TOGGLE_RED_HERRING = "flag-toggle-red-herring"
 COMPETING_FLAG_CHANGES = "competing-flag-changes"
@@ -566,6 +625,11 @@ AUTOSCALER_FLAPPING = "autoscaler-flapping"
 # thing that is wrong is that the deployment carrying one of them stopped
 # half-way.
 HALF_FINISHED_ROLLOUT = "half-finished-rollout"
+# Named for what is wrong with the data rather than for what caused it, unlike
+# every flag scenario above. A flag is what turned it on, and saying so in the
+# name would put the answer in the id of the one incident whose cause nothing in
+# the telemetry can reach.
+SILENT_DATA_CORRUPTION = "silent-data-corruption"
 
 SCENARIOS: dict[str, Scenario] = {
     FEATURE_FLAG_TOGGLE: Scenario(
@@ -895,6 +959,42 @@ SCENARIOS: dict[str, Scenario] = {
             path="deploy",
             initiated_by="kuki",
         ),
+    ),
+    SILENT_DATA_CORRUPTION: Scenario(
+        id=SILENT_DATA_CORRUPTION,
+        title="Totals that stopped keeping up",
+        description=(
+            "Io is making checkout cheaper. Recording a purchase used to re-add "
+            "a shopper's whole history to work out what they had spent; behind "
+            "'monthly-spend-feature' it simply adds the price to the totals the "
+            "account already carries. The cheaper path adds it to the lifetime "
+            "total and not to this month's, on the reasoning that a month can be "
+            "added up from the purchases whenever anybody wants it - which is "
+            "true of the lifetime average, and is not true of the monthly figure "
+            "that reads the stored total. So every sale leaves that total a "
+            "little further behind, and nothing anywhere notices. Every account "
+            "page renders. The lifetime figure is right, because it derives its "
+            "own total from the list of purchases; the monthly figure beside it "
+            "is low, and the two numbers disagree on the same page. Nothing "
+            "throws, so the error rate never moves. Nothing waits, so no "
+            "quantile moves. The heap is flat, the shop is the right size, the "
+            "cache is answering and the process has been up for hours. No rule "
+            "fires and nobody is paged - which is the incident. What finds it is "
+            "a job of Io's own, run weekly, that re-adds every shopper's "
+            "purchases and counts the totals that disagree: it fires an alert "
+            "carrying how many, the widest gap, and the oldest purchase that gap "
+            "can be made of. That last figure is the only thing in the whole "
+            "incident that says when the writing went wrong, because the job "
+            "found it a week late. Turning the flag back off stops the next "
+            "purchase being mis-recorded and repairs not one of the thousands "
+            "already written, so the check run afterwards finds the same accounts "
+            "and nothing newer - and a restart changes nothing at all, because "
+            "the fault is in what was written down. What is left is a fix to the "
+            "write path and a one-off repair of the data, and nobody may run the "
+            "repair without being asked."
+        ),
+        family=FOUNDATIONAL_INTEGRITY,
+        drifts_the_monthly_total=True,
     ),
 }
 

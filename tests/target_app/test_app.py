@@ -42,7 +42,9 @@ from target_app.scenarios import (
     MONTHLY_STATEMENT_PANEL,
     PRICING_SERVICE_DEGRADED,
     RESOURCE_LEAK,
+    SILENT_DATA_CORRUPTION,
     SLOW_CANARY_ROLLOUT,
+    TIMESTAMP_FORMAT,
     UPSTREAM_DEPENDENCY_FAILURE,
 )
 from target_app.settings import the_deployed_replica_count
@@ -1423,3 +1425,110 @@ def test_a_converged_fleet_says_when_it_converged(client: TestClient) -> None:
     condition = the_deployment_of(client, "io-shop")["status"]["conditions"][0]
 
     assert condition["lastTransitionTime"] == to_bucket_id(datetime.now(UTC))
+
+
+def a_staged_drift(client: TestClient) -> None:
+    seeded = client.post(
+        "/scenario/seed", json={"scenario_id": SILENT_DATA_CORRUPTION}
+    )
+
+    assert seeded.status_code == 200
+
+
+def test_the_drifting_totals_scenario_is_seedable_by_id(client: TestClient) -> None:
+    a_staged_drift(client)
+
+    assert client.get("/scenario/status").json()["active_scenario"] == (
+        SILENT_DATA_CORRUPTION
+    )
+
+
+def test_the_console_offers_it_under_a_foundational_integrity_family(
+    client: TestClient
+) -> None:
+    # A family the rail did not have. Every family above it is covered entire, and
+    # this is the first one chosen by its share of real incidents rather than by
+    # elimination - so the group has to exist for the scenario to be offered at
+    # all.
+    catalog = client.get("/scenario/catalog").json()
+
+    families = {family["id"]: family for family in catalog["families"]}
+    offered = {
+        scenario["id"]: scenario["family"] for scenario in catalog["scenarios"]
+    }
+
+    assert offered[SILENT_DATA_CORRUPTION] == "foundational-integrity"
+    assert "12%" in families["foundational-integrity"]["taxonomy"]
+
+
+def test_the_family_sits_where_its_share_of_incidents_puts_it(
+    client: TestClient
+) -> None:
+    # The rail is the one place the shop says what kinds of incident exist at all,
+    # and it is ordered by share, largest first. Twelve percent goes below capacity
+    # at thirteen and above the tail at three.
+    order = [
+        family["id"] for family in client.get("/scenario/catalog").json()["families"]
+    ]
+
+    assert order.index("capacity") < order.index("foundational-integrity")
+    assert order.index("foundational-integrity") < order.index("the-tail")
+
+
+def test_the_drifting_shop_is_paged_about_by_its_integrity_check(
+    client: TestClient
+) -> None:
+    # The whole channel, and the wiring between the two halves of it. No series
+    # moved, so no rule on a series fired; what found this is the shop's own job,
+    # and what the monitoring stack has to page about is the finding rather than a
+    # window somebody could go and read.
+    a_staged_drift(client)
+
+    fired = an_alert_for(
+        SILENT_DATA_CORRUPTION,
+        datetime.now(UTC),
+        app_module.state.the_integrity_check_found(),
+    )["alerts"][0]
+
+    assert fired["labels"]["alertname"] == "SpendTotalsDoNotReconcile"
+    assert "onset" in fired["annotations"]
+
+
+def test_the_onset_it_is_paged_with_is_a_week_older_than_the_page(
+    client: TestClient
+) -> None:
+    # The reason the onset is in the payload at all. The check runs weekly, so when
+    # it fired says nothing about when the writing went wrong - and a consumer that
+    # took `startsAt` for the onset would anchor the incident on the wrong week
+    # entirely.
+    a_staged_drift(client)
+
+    fired = an_alert_for(
+        SILENT_DATA_CORRUPTION,
+        datetime.now(UTC),
+        app_module.state.the_integrity_check_found(),
+    )["alerts"][0]
+
+    began = datetime.strptime(
+        fired["annotations"]["onset"], TIMESTAMP_FORMAT
+    ).replace(tzinfo=UTC)
+
+    assert datetime.now(UTC) - began > timedelta(days=6)
+
+
+def test_a_shop_with_nothing_wrong_with_its_totals_is_paged_about_its_own_fault(
+    client: TestClient
+) -> None:
+    # The job is the shop's and runs whatever is going on, so every alert is
+    # offered its finding. On a shop whose totals are in order it has to decide
+    # nothing, and the scenario's own rule is what fires.
+    a_staged_leak(client)
+
+    fired = an_alert_for(
+        RESOURCE_LEAK,
+        datetime.now(UTC),
+        app_module.state.the_integrity_check_found(),
+    )["alerts"][0]
+
+    assert fired["labels"]["alertname"] == "HighMemoryUsage"
+    assert "onset" not in fired["annotations"]

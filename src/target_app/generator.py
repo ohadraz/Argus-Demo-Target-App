@@ -999,7 +999,8 @@ def generate(timeline: FlagTimeline | None,
              demand_surge: DemandSurge | None = None,
              capacity: Capacity | None = None,
              autoscaler: LiveAutoscaler | None = None,
-             ships_the_statement: bool = False) -> list[GeneratedMinute]:
+             ships_the_statement: bool = False,
+             ships_the_incremental_write: bool = False) -> list[GeneratedMinute]:
     """Every minute from `span_minutes` ago up to and including the one in
     progress, once any of it has happened.
 
@@ -1115,6 +1116,22 @@ def generate(timeline: FlagTimeline | None,
     and the latency are the summary scenario's. What it changes is the file the
     shop's log names as having raised the failure, and that file is the whole
     of what the scenario is for.
+
+    `ships_the_incremental_write` is the fourth thing the one flag can ship, and
+    the only one that is not on the read path at all: a cheaper way of writing a
+    purchase down, which stopped keeping a shopper's monthly total in step with
+    their purchases. So it changes nothing here, deliberately and completely. No
+    page fails, no page waits, every quantile is where it was and the error rate
+    is the shop's ordinary noise - a window of this scenario is a window of a well
+    shop, because from the outside it *is* one. What went wrong is in the stored
+    figures, which no series here reads, and the only thing that finds it is a job
+    of the shop's own - see `target_app.integrity`.
+
+    It suppresses the monthly summary for the same reason the two above do: one
+    flag, several scenarios, and at most one feature live at a time. A window that
+    shipped the summary alongside this would have an error rate that steps, and
+    the whole point of the mode - that nothing a monitoring stack watches moves -
+    would be gone.
     """
     current_minute = now.replace(second=0, microsecond=0)
     elapsed_in_current = int((now - current_minute).total_seconds())
@@ -1149,6 +1166,7 @@ def generate(timeline: FlagTimeline | None,
             capacity=capacity,
             autoscaler=autoscaler,
             ships_the_statement=ships_the_statement,
+            ships_the_incremental_write=ships_the_incremental_write,
         )
         for offset in range(span_minutes, 0, -1)
     ]
@@ -1182,6 +1200,7 @@ def generate(timeline: FlagTimeline | None,
                 capacity=capacity,
                 autoscaler=autoscaler,
                 ships_the_statement=ships_the_statement,
+                ships_the_incremental_write=ships_the_incremental_write,
             )
         )
 
@@ -1217,6 +1236,7 @@ def _a_whole_minute(
     capacity: Capacity | None = None,
     autoscaler: LiveAutoscaler | None = None,
     ships_the_statement: bool = False,
+    ships_the_incremental_write: bool = False,
 ) -> GeneratedMinute:
     """One minute that has finished, generated once and then remembered.
 
@@ -1263,6 +1283,7 @@ def _a_whole_minute(
         capacity=capacity,
         autoscaler=autoscaler,
         ships_the_statement=ships_the_statement,
+        ships_the_incremental_write=ships_the_incremental_write,
     )
 
 
@@ -1287,6 +1308,7 @@ def _generate_minute(
     capacity: Capacity | None = None,
     autoscaler: LiveAutoscaler | None = None,
     ships_the_statement: bool = False,
+    ships_the_incremental_write: bool = False,
 ) -> GeneratedMinute:
     minute_id = minute.strftime(TIMESTAMP_FORMAT)
     entropy = random.Random(minute_id)
@@ -1407,6 +1429,7 @@ def _generate_minute(
             the_rollout_reached_it=index < reached_by_the_rollout,
             the_flag_ships_the_slow_feature=slow_rollout is not None,
             the_flag_ships_the_statement=ships_the_statement,
+            the_flag_ships_the_incremental_write=ships_the_incremental_write,
             # The month this minute falls in, which is what a request arriving
             # in it would have been asking about. Taken from the minute rather
             # than from the clock, so that a window fetched twice reads the
@@ -2018,6 +2041,7 @@ def _serve_one_account_page(
     the_rollout_reached_it: bool = False,
     the_flag_ships_the_slow_feature: bool = False,
     the_flag_ships_the_statement: bool = False,
+    the_flag_ships_the_incremental_write: bool = False,
     statement_period: StatementPeriod | None = None,
     the_pricing_call_was_slow: bool = False,
     rollout_entropy: random.Random | None = None,
@@ -2059,13 +2083,21 @@ def _serve_one_account_page(
     hundred, a draw is wrong about which percentile the incident appears in
     often enough to cost the scenario the only thing it demonstrates.
 
-    `the_flag_ships_the_slow_feature` and `the_flag_ships_the_statement` say
-    which feature the flag is shipping, because the shop has one flag and
-    several scenarios behind it. Most ship the monthly summary, whose divisor
-    is empty for a shopper who has bought nothing this month; one ships the
-    typical purchase, which is correct for everybody and merely slow; one ships
-    the monthly statement panel, which breaks for exactly the shoppers the
-    summary breaks for and does it in a far larger file.
+    `the_flag_ships_the_slow_feature`, `the_flag_ships_the_statement` and
+    `the_flag_ships_the_incremental_write` say which feature the flag is
+    shipping, because the shop has one flag and several scenarios behind it. Most
+    ship the monthly summary, whose divisor is empty for a shopper who has bought
+    nothing this month; one ships the typical purchase, which is correct for
+    everybody and merely slow; one ships the monthly statement panel, which
+    breaks for exactly the shoppers the summary breaks for and does it in a far
+    larger file.
+
+    The last of them is not on this path at all, and is named here only to be
+    kept off it. What that flag ships is a cheaper way of *writing a purchase
+    down*, and a page render neither writes nor reads the total it damaged - so
+    the request served below is a well shop's request, every time, which is the
+    whole of what that scenario stages. See `target_app.integrity` for the job
+    that does find it.
 
     At most one of them is true at a time, and that is a property of the
     scenarios rather than something checked here. Shipping two at once would
@@ -2102,7 +2134,9 @@ def _serve_one_account_page(
     # The canary is still drawn either way, so that suppressing the summary
     # here cannot shift a single figure in the scenarios that do ship it.
     use_monthly_summary = in_the_canary and not (
-        the_flag_ships_the_slow_feature or the_flag_ships_the_statement
+        the_flag_ships_the_slow_feature
+        or the_flag_ships_the_statement
+        or the_flag_ships_the_incremental_write
     )
     # The third thing the one flag can ship. Same cohort as the monthly summary
     # and the same shoppers break it - a month with nothing bought in it has no

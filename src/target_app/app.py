@@ -1341,9 +1341,21 @@ def raise_alert() -> AlertRaised:
     caller: the rule that trips is a property of what is wrong with the service,
     and a console that could choose it would be choosing the incident's
     symptoms.
+
+    The shop's data-integrity job is asked what it found on the way past, and for
+    one scenario that answer is the alert - see `target_app.integrity`. It is
+    asked whatever is staged, because the job is the shop's and runs regardless of
+    anybody's incident; on a shop whose totals are in order it finds nothing and
+    decides nothing, which is the answer a check has to be able to give.
+
+    This is the only caller. The check has no endpoint of its own, so nothing
+    outside this process can run it - which is what makes an action taken on this
+    incident unconfirmable rather than merely slow to confirm.
     """
     try:
-        delivered = fire_alert(state.active_scenario_id)
+        delivered = fire_alert(
+            state.active_scenario_id, finding=state.the_integrity_check_found()
+        )
     except AlertNotDelivered as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
 
@@ -1747,6 +1759,12 @@ def _generated_minutes() -> list[GeneratedMinute]:
         # `ScenarioState.autoscaler`.
         autoscaler=state.autoscaler,
         ships_the_statement=scenario.ships_the_statement,
+        # Named here and changing nothing below it, which is the point: the flag
+        # ships a write path, so a window of this scenario is a window of a well
+        # shop. What it buys is that the flag does not also route reads to the
+        # monthly summary, which would give the one invisible incident an error
+        # rate.
+        ships_the_incremental_write=scenario.drifts_the_monthly_total,
     )
 
 

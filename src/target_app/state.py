@@ -10,6 +10,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
+from io_shop.spend_reconciliation import Reconciliation
 from io_shop.summary_cache import CacheEndpoint
 from io_shop.visits import forget_every_visit
 from target_app.flags import FlagClient, FlagProviderUnavailable
@@ -27,7 +28,11 @@ from target_app.generator import (
     Scaling,
     SlowDeployment,
 )
-from target_app.history import forget_the_changes_to
+from target_app.history import (
+    forget_the_changes_to,
+    record_the_change_as_having_happened_at,
+)
+from target_app.integrity import what_the_check_found
 from target_app.scenarios import (
     FALLBACK_FLAG,
     FEATURE_FLAG,
@@ -135,6 +140,31 @@ def _the_decoys_quiet_state(scenario: Scenario) -> bool:
 # Clearing the flag provider's recorded history, injected so that a test can
 # watch a reset ask for it without a provider database to ask.
 HistoryEraser = Callable[[Sequence[str]], None]
+
+# And moving a recorded change back to when it happened, injected for the same
+# reason. Its own seam rather than a flag on the eraser's: a reset erases and a
+# staging backdates, and the two are asked for at opposite ends of a run.
+HistoryBackdater = Callable[[Sequence[str], datetime, datetime], None]
+
+
+def _how_long_ago_this_one_began(scenario: Scenario) -> timedelta:
+    """How far back a scenario's onset is placed from the instant it is staged.
+
+    Minutes for every scenario whose incident is visible in a series: enough
+    history for an onset to be located in, and no more, so an audience is not
+    watching a flat graph waiting for something to happen.
+
+    Days for the one whose incident is visible in no series at all. Its onset has
+    to be *older than the metrics reach*, because the whole claim of that scenario
+    is that nothing in the telemetry dates the fault and only the data does - and
+    an onset a consumer could measure for itself would leave that claim untested.
+    """
+    settings = get_scenario_settings()
+
+    if scenario.drifts_the_monthly_total:
+        return timedelta(days=settings.drift_backdate_days)
+
+    return timedelta(minutes=settings.onset_backdate_minutes)
 
 
 def _set(client: FlagClient, enabled: bool) -> None:
@@ -323,10 +353,14 @@ class ScenarioState:
         flags: FlagClient,
         fallback_flags: FlagClient,
         forget_the_flag_history: HistoryEraser = forget_the_changes_to,
+        backdate_the_flag_history: HistoryBackdater = (
+            record_the_change_as_having_happened_at
+        ),
     ) -> None:
         self._flags = flags
         self._fallback_flags = fallback_flags
         self._forget_the_flag_history = forget_the_flag_history
+        self._backdate_the_flag_history = backdate_the_flag_history
         self._active: ActiveScenario | None = None
         self._moments: list[FlagMoment] = []
         self._last_seen: dict[str, bool] = {}
@@ -647,7 +681,21 @@ class ScenarioState:
         # Backdated so a diagnosable incident exists the instant this returns.
         # The alternative is an audience watching a flat graph for five minutes
         # before anything is worth alerting on.
-        onset = now - timedelta(minutes=get_scenario_settings().onset_backdate_minutes)
+        onset = now - _how_long_ago_this_one_began(scenario)
+        # And the provider's log backdated with it, for the one scenario whose
+        # onset is days rather than minutes old.
+        #
+        # Every other scenario leaves this alone, and can: its flag change is
+        # recorded a few seconds after an onset a few minutes old, and nobody
+        # comparing a minute to a minute notices. Here the two would be a week
+        # apart, and the flag change is the only evidence naming the cause - so a
+        # consumer looking for what changed around the onset would find an empty
+        # window and the incident would be unanswerable. Recorded when it
+        # happened, which is also simply the truth.
+        if scenario.drifts_the_monthly_total:
+            self._backdate_the_flag_history(
+                [self._flags_for(scenario).name], onset, now
+            )
         self._active = ActiveScenario(
             scenario=scenario,
             seeded_at=now,
@@ -1047,6 +1095,49 @@ class ScenarioState:
     def moments(self) -> list[FlagMoment]:
         """Every flag change noticed since the scenario was staged, in order."""
         return list(self._moments)
+
+    def the_integrity_check_found(self) -> Reconciliation:
+        """What the shop's data-integrity job reports, run now.
+
+        Worked out at the moment it is asked, exactly as the telemetry is, so that
+        a flag somebody has just put back is already reflected in it: purchases
+        recorded since the flip went through the path that keeps the total, so the
+        count stops growing and not one stored figure is corrected. That
+        difference - nothing new, everything old - is what recovery means for this
+        mode, and there is no series it could be read from.
+
+        A restart is nowhere in this, which is why a restart changes nothing about
+        it. The fault is in what was written down, and the process that reads it
+        back is a new one reading the same wrong totals.
+
+        The check is not addressable from outside this service, and this method is
+        the reason it can stay that way: the only caller is the monitoring stack
+        deciding whether there is anything to page about - see
+        `target_app.monitoring`.
+        """
+        return what_the_check_found(self._the_drifting_write_path(), utc_now())
+
+    def _the_drifting_write_path(self) -> FlagTimeline | None:
+        """The stretch the cheaper write path has been live over, or `None`.
+
+        `None` for every scenario but one, which is what keeps every other shop's
+        totals in step with its purchases: the shop has one feature flag and
+        several scenarios behind it, so what the flag is shipping is the
+        scenario's to say and not the flag's - see
+        `target_app.generator._serve_one_account_page`.
+
+        Read off the flag's own timeline rather than stored beside it, for the
+        reason the slow rollout's stretch is derived: the write path went live the
+        minute the flag went on and stopped the minute it went off, and a second
+        record of that would be one that comes to disagree with the first about
+        when somebody reverted.
+        """
+        active = self._active
+
+        if active is None or not active.scenario.drifts_the_monthly_total:
+            return None
+
+        return self.timeline_now()
 
     def observe_the_flags(self) -> list[FlagMoment]:
         """Reads both flags and records any that have moved since the last look.

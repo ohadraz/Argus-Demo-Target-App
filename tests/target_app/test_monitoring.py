@@ -6,6 +6,7 @@ from unittest.mock import create_autospec
 import httpx
 import pytest
 
+from io_shop.spend_reconciliation import DisagreeingAccount, Reconciliation
 from target_app.monitoring import (
     AlertNotDelivered,
     MonitoringSettings,
@@ -16,6 +17,7 @@ from target_app.scenarios import (
     BAD_DEPLOYMENT,
     FEATURE_FLAG_TOGGLE,
     RESOURCE_LEAK,
+    SILENT_DATA_CORRUPTION,
 )
 
 """What the shop's monitoring promises about the alert it raises.
@@ -28,6 +30,16 @@ happen is never reported as one.
 
 SOME_INSTANT = datetime(2026, 8, 29, 10, 41, 0, tzinfo=UTC)
 DONT_CARE_INSTANT = SOME_INSTANT
+
+# A purchase recorded a week before the check that found it, and deliberately not
+# on a minute boundary: a measured onset is always a bucket id and this one never
+# is, because it is the instant a shopper bought something rather than a minute
+# somebody aggregated.
+AN_OLD_PURCHASE = datetime(2026, 9, 22, 9, 19, 43, tzinfo=UTC)
+
+# How many accounts the check looked at. Larger than any count of disagreements
+# below, because a count of disagreements says nothing without it.
+SOME_ACCOUNTS_CHECKED = 400
 
 
 def a_settings(webhook_url: str = "http://argus.test/webhooks/alerts") -> MonitoringSettings:
@@ -136,3 +148,126 @@ def test_a_receiver_that_rejects_the_alert_is_not_reported_as_an_alert_raised() 
 
     with pytest.raises(AlertNotDelivered):
         fire_alert(FEATURE_FLAG_TOGGLE, settings=a_settings(), post=post)
+
+
+def a_finding(accounts: int,
+              largest_gap_cents: int = 129_731,
+              oldest_affected_purchase_at: datetime | None = AN_OLD_PURCHASE
+              ) -> Reconciliation:
+    """What the shop's integrity check reported, with `accounts` disagreeing.
+
+    Built rather than run, because what these cases are about is the payload: the
+    check's own arithmetic is covered where it lives, and a test that ran the check
+    here would be asserting a figure it did not choose.
+    """
+    return Reconciliation(
+        accounts_checked=SOME_ACCOUNTS_CHECKED,
+        accounts_that_disagree=tuple(
+            DisagreeingAccount(
+                shopper_id=f"shopper-{index}",
+                gap_cents=largest_gap_cents,
+                oldest_affected_purchase_at=oldest_affected_purchase_at,
+            )
+            for index in range(accounts)
+        ),
+    )
+
+
+def test_totals_that_do_not_reconcile_fire_a_rule_of_their_own() -> None:
+    # The one rule here not written against a series. No threshold on any metric
+    # was crossed, because none moved.
+    alert = an_alert_for(SILENT_DATA_CORRUPTION, DONT_CARE_INSTANT, a_finding(240))
+
+    assert alert["alerts"][0]["labels"]["alertname"] == "SpendTotalsDoNotReconcile"
+
+
+def test_the_finding_is_paged_about_as_the_shop_rather_than_as_a_scenario() -> None:
+    # The service and the severity are the ones every other alert carries: a
+    # consumer routes on these, and an incident that arrived labelled differently
+    # would be an incident about a different service.
+    alert = an_alert_for(SILENT_DATA_CORRUPTION, DONT_CARE_INSTANT, a_finding(240))
+
+    assert alert["alerts"][0]["labels"]["service"] == "io-shop"
+    assert alert["alerts"][0]["labels"]["severity"] == "critical"
+
+
+def test_the_summary_says_how_many_totals_disagree() -> None:
+    alert = an_alert_for(SILENT_DATA_CORRUPTION, DONT_CARE_INSTANT, a_finding(240))
+
+    assert "240 of 400" in alert["alerts"][0]["annotations"]["summary"]
+
+
+def test_the_summary_says_the_widest_gap_as_money() -> None:
+    # A responder reads this. The gap is cents everywhere else, because that is
+    # what a price is stored in.
+    alert = an_alert_for(
+        SILENT_DATA_CORRUPTION, DONT_CARE_INSTANT, a_finding(240, 129_731)
+    )
+
+    assert "1,297.31" in alert["alerts"][0]["annotations"]["summary"]
+
+
+def test_the_summary_says_when_the_oldest_affected_purchase_was_recorded() -> None:
+    # The only figure in the incident that dates the fault, said in the prose as
+    # well as in the annotation - a reader gets the sentence, a consumer gets the
+    # field, and neither has to parse the other's.
+    alert = an_alert_for(SILENT_DATA_CORRUPTION, DONT_CARE_INSTANT, a_finding(240))
+
+    assert "2026-09-22T09:19:43Z" in alert["alerts"][0]["annotations"]["summary"]
+
+
+def test_the_onset_is_carried_as_a_field_of_its_own() -> None:
+    # Its own annotation, because a consumer has to do arithmetic with it. Parsing
+    # it back out of a sentence would make the prose a wire format.
+    alert = an_alert_for(SILENT_DATA_CORRUPTION, DONT_CARE_INSTANT, a_finding(240))
+
+    assert alert["alerts"][0]["annotations"]["onset"] == "2026-09-22T09:19:43Z"
+
+
+def test_when_the_check_ran_is_not_when_the_writing_went_wrong() -> None:
+    # The whole reason the onset is carried separately. This check runs weekly, so
+    # `startsAt` is up to a week later than the fault - and a consumer that took
+    # it for the onset would anchor the incident on the wrong week.
+    alert = an_alert_for(SILENT_DATA_CORRUPTION, SOME_INSTANT, a_finding(240))
+
+    assert alert["alerts"][0]["startsAt"] == "2026-08-29T10:41:00Z"
+    assert alert["alerts"][0]["annotations"]["onset"] != (
+        alert["alerts"][0]["startsAt"]
+    )
+
+
+def test_a_finding_that_cannot_be_dated_carries_no_onset_at_all() -> None:
+    # Absent rather than empty. A consumer reading an onset it can act on must not
+    # also have to decide whether a blank one means "now".
+    alert = an_alert_for(
+        SILENT_DATA_CORRUPTION,
+        DONT_CARE_INSTANT,
+        a_finding(240, oldest_affected_purchase_at=None),
+    )
+
+    assert "onset" not in alert["alerts"][0]["annotations"]
+
+
+def test_a_handful_of_disagreeing_totals_pages_nobody_about_reconciliation() -> None:
+    # Not one, and not a handful. A total that does not add up is a support ticket
+    # and a correction; a rule that fired on it would fire most weeks, and what is
+    # worth waking somebody for is a population of them.
+    alert = an_alert_for(FEATURE_FLAG_TOGGLE, DONT_CARE_INSTANT, a_finding(3))
+
+    assert alert["alerts"][0]["labels"]["alertname"] == "HighErrorRate"
+
+
+def test_a_check_that_found_nothing_leaves_the_ordinary_alert_alone() -> None:
+    # The shop's integrity job runs whatever is staged, so every alert is offered
+    # its finding. A quiet answer has to decide nothing.
+    alert = an_alert_for(BAD_DEPLOYMENT, DONT_CARE_INSTANT, a_finding(0))
+
+    assert alert["alerts"][0]["labels"]["alertname"] == "HighLatency"
+
+
+def test_an_alert_raised_without_a_finding_is_the_one_it_always_was() -> None:
+    # Nothing asked the check. Every caller that predates it still gets the rule
+    # its scenario trips.
+    alert = an_alert_for(RESOURCE_LEAK, DONT_CARE_INSTANT)
+
+    assert alert["alerts"][0]["labels"]["alertname"] == "HighMemoryUsage"

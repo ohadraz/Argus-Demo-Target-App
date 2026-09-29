@@ -154,6 +154,19 @@ class ScenarioSettings(BaseSettings):
     # from ahead of it, and the shop is already saturated when anybody first looks.
     surge_backdate_minutes: int = Field(default=20, gt=0)
 
+    # How long ago the cheaper write path went live, for the one scenario whose
+    # fault is what has already been written. Days rather than minutes, and it is
+    # the only backdate here measured in them.
+    #
+    # The other three are sized so that a departure is visible in a window
+    # somebody is about to read. This one has the opposite job: nothing about this
+    # incident is in any window, and the check that finds it runs weekly, so the
+    # onset has to be *older than the metrics reach* - otherwise a consumer could
+    # measure it from the series and would never have to take the shop's word for
+    # it. A week is the check's own period, which is also the honest number: a
+    # weekly job finds up to a week of damage.
+    drift_backdate_days: int = Field(default=7, gt=0)
+
 
 def the_deployed_cache_endpoint(values_file: Path = VALUES_FILE) -> CacheEndpoint:
     """Where the deployment says the cache is.
