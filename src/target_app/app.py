@@ -771,6 +771,27 @@ def restart_the_shop() -> ShopRestarted:
     return ShopRestarted(restarted_at=state.restart_the_shop())
 
 
+def _the_platform_has_to_answer() -> None:
+    """Refuses an action where the staged platform is carrying none.
+
+    `503` rather than a hang. A hang is the more literal unreachability and the
+    wrong one to stage: a caller waits its whole timeout for one, on a walk that
+    reaches for the platform more than once, and learns at the end of it exactly
+    what it learns here at once. It is also what a downed API server behind an
+    ingress actually answers.
+
+    Called by the routes that act and by none of the routes that report. A
+    platform that hid its own history would take the deployment out of the
+    change channel a reader diagnoses from, and the incident would be about not
+    seeing rather than about not acting.
+    """
+    if state.the_platform_will_not_act:
+        raise HTTPException(
+            status_code=503,
+            detail="the deployment platform's API server is unavailable"
+        )
+
+
 @app.post("/argocd/{application}/resource/actions/v2")
 def argocd_run_resource_action(application: str,
                                body: ArgoCdResourceAction) -> dict[str, str]:
@@ -803,6 +824,8 @@ def argocd_run_resource_action(application: str,
 
     Argo CD answers an empty body on success, and so does this.
     """
+    _the_platform_has_to_answer()
+
     if body.action == SCALE_ACTION:
         _scale(application, body)
 
@@ -1143,6 +1166,8 @@ def argocd_patch_resource(application: str,
 
     Argo CD answers an empty body on success, and so does this.
     """
+    _the_platform_has_to_answer()
+
     if kind != AUTOSCALER_KIND:
         raise HTTPException(
             status_code=400,
@@ -1278,6 +1303,8 @@ def argocd_update_spec(application: str,
     part of rolling back rather than a separate concern, and it is the half a
     withdrawal has to put back.
     """
+    _the_platform_has_to_answer()
+
     state.set_automated_sync(body.syncPolicy.automated is not None)
 
     return _the_spec_now()
@@ -1302,6 +1329,8 @@ def argocd_rollback(application: str, body: ArgoCdRollback) -> ArgoCdApplication
     accepted a rollback to a revision it never deployed would have a caller
     believe production had moved when it had not.
     """
+    _the_platform_has_to_answer()
+
     if state.syncs_itself:
         raise HTTPException(
             status_code=400,

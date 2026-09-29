@@ -42,6 +42,7 @@ from target_app.monitoring import an_alert_for
 from target_app.scenarios import (
     AUTOSCALER_FLAPPING,
     CACHE_MISCONFIGURED,
+    CONTROL_PLANE_UNREACHABLE,
     CPU_SATURATION,
     HALF_FINISHED_ROLLOUT,
     MONTHLY_STATEMENT_PANEL,
@@ -1617,3 +1618,135 @@ def test_a_shop_with_nothing_wrong_with_its_totals_is_paged_about_its_own_fault(
 
     assert fired["labels"]["alertname"] == "HighMemoryUsage"
     assert "onset" not in fired["annotations"]
+
+
+def a_staged_unreachable_control_plane(client: TestClient) -> None:
+    seeded = client.post(
+        "/scenario/seed", json={"scenario_id": CONTROL_PLANE_UNREACHABLE}
+    )
+
+    assert seeded.status_code == 200
+
+
+def test_the_unreachable_platform_scenario_is_seedable_by_id(
+    client: TestClient
+) -> None:
+    a_staged_unreachable_control_plane(client)
+
+    assert client.get("/scenario/status").json()["active_scenario"] == (
+        CONTROL_PLANE_UNREACHABLE
+    )
+
+
+def test_a_rollback_is_refused_by_a_platform_that_will_not_act(
+    client: TestClient
+) -> None:
+    # A 503 and not the 400 the same call earns from a platform that is
+    # answering and reconciling itself. Ordering rather than pedantry: a caller
+    # told its rollback was rejected would go and suspend sync, which is a
+    # second call to a platform that is taking none.
+    a_staged_unreachable_control_plane(client)
+
+    refused = client.post("/argocd/io-shop/rollback", json={"id": 1})
+
+    assert refused.status_code == 503
+
+
+def test_a_restart_is_refused_by_a_platform_that_will_not_act(
+    client: TestClient
+) -> None:
+    # The scale-out is the same route with a different action, so this covers
+    # both of the two the resource-action endpoint carries.
+    a_staged_unreachable_control_plane(client)
+
+    refused = client.post(RESTART_ACTION_PATH, json={"action": RESTART_ACTION})
+
+    assert refused.status_code == 503
+
+
+def test_pinning_the_autoscaler_is_refused_by_a_platform_that_will_not_act(
+    client: TestClient
+) -> None:
+    a_staged_unreachable_control_plane(client)
+
+    refused = patched(client, "io-shop", a_floor_of(6))
+
+    assert refused.status_code == 503
+
+
+def test_suspending_sync_is_refused_by_a_platform_that_will_not_act(
+    client: TestClient
+) -> None:
+    a_staged_unreachable_control_plane(client)
+
+    refused = client.put("/argocd/io-shop/spec", json={"syncPolicy": {}})
+
+    assert refused.status_code == 503
+
+
+def test_the_platform_goes_on_reporting_what_it_has_deployed(
+    client: TestClient
+) -> None:
+    a_staged_unreachable_control_plane(client)
+
+    application = client.get("/argocd/io-shop")
+
+    assert application.status_code == 200
+
+
+def test_the_deployment_is_still_in_the_history_a_reader_diagnoses_from(
+    client: TestClient
+) -> None:
+    # The whole reason the refusal is on the acting routes alone. A platform
+    # that hid its own history would take the deployment out of the change
+    # channel, no rollback would be ranked, and the incident would be about not
+    # seeing rather than about not acting.
+    a_staged_unreachable_control_plane(client)
+
+    history = client.get("/argocd/io-shop").json()["status"]["history"]
+
+    assert len(history) == 2
+
+
+def test_the_resource_tree_still_answers(client: TestClient) -> None:
+    a_staged_unreachable_control_plane(client)
+
+    tree = client.get("/argocd/io-shop/resource-tree")
+
+    assert tree.status_code == 200
+
+
+def test_the_shop_goes_on_reporting_its_own_telemetry(
+    client: TestClient
+) -> None:
+    # Load-bearing. A mitigation is judged by reading this, so a shop that went
+    # down with its platform would leave every mitigation unjudgeable and the
+    # incident would end for that reason instead of this one.
+    a_staged_unreachable_control_plane(client)
+
+    buckets = client.get("/metrics")
+
+    assert buckets.status_code == 200
+    assert buckets.json() != []
+
+
+def test_resetting_returns_the_platform_to_acting(client: TestClient) -> None:
+    a_staged_unreachable_control_plane(client)
+
+    client.post("/scenario/reset")
+
+    assert client.put(
+        "/argocd/io-shop/spec", json={"syncPolicy": {}}
+    ).status_code == 200
+
+
+def test_the_console_offers_it_under_the_foundational_integrity_family(
+    client: TestClient
+) -> None:
+    catalog = client.get("/scenario/catalog").json()
+
+    offered = {
+        scenario["id"]: scenario["family"] for scenario in catalog["scenarios"]
+    }
+
+    assert offered[CONTROL_PLANE_UNREACHABLE] == "foundational-integrity"

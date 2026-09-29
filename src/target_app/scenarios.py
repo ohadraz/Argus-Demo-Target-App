@@ -480,6 +480,14 @@ class Scenario:
     branch - so it is mitigated and not resolved, and re-enabling the platform's
     own reconciliation brings it straight back.
 
+    `control_plane_is_down` stages something no other field here does: not an
+    incident, but a platform that will not carry a mitigation. The deployment
+    platform's acting routes refuse while it holds and its reporting routes go
+    on answering - so the change history still names the deployment, the
+    deployment is still a candidate, and what fails is reaching for it. A
+    condition that refused the reads as well would hide the change and stage a
+    shop nobody can diagnose, which is a different mode and not this one.
+
     `family` is what kind of incident this stages, and it has no default. A
     default would put every scenario written from here on into whichever family
     happened to be first, silently, and a grouping nobody chose is worse than no
@@ -510,6 +518,7 @@ class Scenario:
     rollout_is_paused: bool = False
     drifts_the_monthly_total: bool = False
     ships_the_statement: bool = False
+    control_plane_is_down: bool = False
     # The deploy a *generated* scenario stages, for the one whose cause is a
     # change rather than a state. An authored scenario carries its deploys on
     # its minutes; a generated one has no minutes to hang them on, and a
@@ -630,6 +639,12 @@ HALF_FINISHED_ROLLOUT = "half-finished-rollout"
 # name would put the answer in the id of the one incident whose cause nothing in
 # the telemetry can reach.
 SILENT_DATA_CORRUPTION = "silent-data-corruption"
+# Named for the platform rather than for the incident, unlike every scenario
+# above it. What breaks the shop here is an ordinary flag change; what the
+# scenario stages is that four of the five things Argus could do about one are
+# unavailable at once, because the platform all four go through is not
+# answering - and that has nothing to do with this incident or any incident.
+CONTROL_PLANE_UNREACHABLE = "control-plane-unreachable"
 
 SCENARIOS: dict[str, Scenario] = {
     FEATURE_FLAG_TOGGLE: Scenario(
@@ -995,6 +1010,37 @@ SCENARIOS: dict[str, Scenario] = {
         ),
         family=FOUNDATIONAL_INTEGRITY,
         drifts_the_monthly_total=True,
+    ),
+    CONTROL_PLANE_UNREACHABLE: Scenario(
+        id=CONTROL_PLANE_UNREACHABLE,
+        title="The platform that carries the fix will not act",
+        description=(
+            "Two changes reached Io's account page in the same minute, and the "
+            "page started failing. A revision went out that reworks how a "
+            "shopper's average is worked out, and 'monthly-spend-feature' was "
+            "switched on for two in five account pages. The revision is the "
+            "closer and more specific change, so returning it is the first "
+            "thing worth trying - and it is the one thing that cannot be done, "
+            "because the deployment platform's API server is not answering. "
+            "Every generic mitigation but one goes through that platform: the "
+            "rollback, the restart, the scale-out and the autoscaler pin are "
+            "unavailable together, and none of them is unavailable for any "
+            "reason to do with this incident. What is left is the flag, which "
+            "lives with a different provider, is still answering, and does end "
+            "the incident when it goes back. The shop itself is well "
+            "throughout - it serves, it reports its own metrics, and the "
+            "platform goes on saying what it has deployed. It simply will not "
+            "act."
+        ),
+        family=FOUNDATIONAL_INTEGRITY,
+        control_plane_is_down=True,
+        deploy=ScenarioDeploy(
+            revision=THE_COMMIT_THAT_SLOWED_THE_AVERAGE,
+            previous_revision=THE_COMMIT_BEFORE_THAT_ONE,
+            repo_url="https://github.com/ohadraz/Argus-Demo-Target-App",
+            path="deploy",
+            initiated_by="kuki",
+        ),
     ),
 }
 

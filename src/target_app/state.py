@@ -725,6 +725,23 @@ class ScenarioState:
         )
 
     @property
+    def the_platform_will_not_act(self) -> bool:
+        """Whether the deployment platform is refusing to carry an action.
+
+        Per-scenario state rather than process state, unlike `syncs_itself` and
+        `replicas` below it: those describe the arrangement the application runs
+        under, and this describes an incident's world - true for as long as the
+        scenario staging it is active, and over when that scenario is reset.
+
+        It answers only for acting. What the platform *reports* is unaffected,
+        which is the whole of how this stages a platform that cannot be
+        mitigated through rather than one that cannot be seen.
+        """
+        active = self._active
+
+        return active is not None and active.scenario.control_plane_is_down
+
+    @property
     def syncs_itself(self) -> bool:
         """Whether the platform is reconciling this application on its own.
 
