@@ -8,6 +8,7 @@ from a query the shop has already run, and the list is what it renders.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,14 @@ class Purchase:
     therefore the honest reading of a sparse record rather than a convenience -
     `"General"` is where a shop's own catalogue puts anything it has not
     classified, and nothing refunded is the ordinary state of a purchase.
+
+    `recorded_at` is when the shop wrote this purchase down, and it is the one
+    field here no page reads. Every figure on the account page is scoped by the
+    month flag above, which is all a page needs; an instant is what something
+    asking *when* a record went wrong needs, and nothing asked that until the
+    monthly totals stopped keeping up with the purchases behind them - see
+    `io_shop.spend_reconciliation`. `None` for a purchase from a record that
+    kept no time, which is every purchase the pages were written against.
     """
 
     price_cents: int
@@ -35,6 +44,7 @@ class Purchase:
     delivery_cents: int = 0
     discount_cents: int = 0
     instalments_remaining: int = 0
+    recorded_at: datetime | None = None
 
 
 @dataclass(frozen=True)
