@@ -4,6 +4,7 @@ import json
 import time
 from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime, timedelta
+from statistics import median
 from unittest.mock import Mock
 
 import pytest
@@ -77,7 +78,11 @@ def client() -> Iterator[TestClient]:
     fallback_flags.name = "legacy-checkout-fallback"
 
     was = app_module.state
-    app_module.state = ScenarioState(flags, fallback_flags, Mock())
+    # Both of the provider's history seams stubbed, for one reason: each reaches
+    # the provider's own database, which no test here has. One clears the log on a
+    # reset; the other backdates a staging toggle to when the change it stages
+    # actually happened.
+    app_module.state = ScenarioState(flags, fallback_flags, Mock(), Mock())
     forget_every_visit()
 
     yield TestClient(app)
@@ -93,11 +98,37 @@ def a_staged_leak(client: TestClient) -> None:
 
 
 def the_newest_minute(client: TestClient) -> dict:
-    buckets = client.get("/metrics").json()
+    """The bucket covering the minute the shop is in, once there is one.
 
-    assert buckets
+    Waits for it, for exactly the reason `the_minute_of` below waits: the minute
+    in progress is reported only once a whole second of it has elapsed, so a read
+    landing in the first second of a minute answers with the minute *before* it -
+    a bucket describing the shop as it was before whatever this test just did.
 
-    return buckets[-1]
+    That bucket is right and asserting an action against it is wrong. It bit the
+    scale-out cases the same way it bit the restart cases, and in the same
+    proportion: `test_putting_the_count_back_returns_the_shop_to_saturation` read
+    a stale minute as its relieved baseline, found it already saturated, and
+    failed against a figure that had never moved.
+    """
+    deadline = time.monotonic() + A_MINUTE_BECOMES_READABLE_SECONDS
+    this_minute = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M")
+
+    while True:
+        buckets = client.get("/metrics").json()
+
+        assert buckets
+
+        if buckets[-1]["bucket_id"].startswith(this_minute):
+            return buckets[-1]
+
+        assert time.monotonic() < deadline, (
+            f"no bucket covers {this_minute}, the newest being "
+            f"{buckets[-1]['bucket_id']}"
+        )
+        # A read that crossed a minute boundary is asking about a minute that has
+        # now passed, and waiting for it would wait for ever.
+        this_minute = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M")
 
 
 def the_minute_of(client: TestClient, restarted: Response) -> dict:
@@ -493,7 +524,11 @@ def a_shop_whose_flag_is_on() -> Iterator[TestClient]:
     fallback_flags.name = "legacy-checkout-fallback"
 
     was = app_module.state
-    app_module.state = ScenarioState(flags, fallback_flags, Mock())
+    # Both of the provider's history seams stubbed, for one reason: each reaches
+    # the provider's own database, which no test here has. One clears the log on a
+    # reset; the other backdates a staging toggle to when the change it stages
+    # actually happened.
+    app_module.state = ScenarioState(flags, fallback_flags, Mock(), Mock())
     forget_every_visit()
 
     yield TestClient(app)
@@ -1290,6 +1325,28 @@ def test_the_paused_rollout_reports_one_deploy_at_the_onset(
     assert history[-1]["revision"] != history[0]["revision"]
 
 
+def a_typical_quiet_minute(buckets: list[dict]) -> dict[str, float]:
+    """The middle of the window's quiet minutes, quantile by quantile.
+
+    A single minute will not do as the baseline here, and the reason is the cache
+    rather than anything about this scenario. The quantiles of a cached shop are
+    taken over what it actually served, so a minute that happened to draw ten
+    misses instead of twenty reports a 95th percentile down in the cached band -
+    about 37ms against the usual 190. Measured over two thousand minutes, one in a
+    hundred does exactly that.
+
+    Read off one arbitrary bucket, that is a baseline a hundred times too low and
+    a test that fails for the whole minute it is in. The middle of three hundred
+    minutes cannot be an unlucky draw.
+    """
+    quiet = buckets[:300]
+
+    return {
+        quantile: median(bucket[quantile] for bucket in quiet)
+        for quantile in ("p50_ms", "p95_ms", "p99_ms")
+    }
+
+
 def test_the_paused_rollout_moves_the_error_rate_and_not_the_quantiles(
     client: TestClient
 ) -> None:
@@ -1297,7 +1354,7 @@ def test_the_paused_rollout_moves_the_error_rate_and_not_the_quantiles(
 
     buckets = client.get("/metrics").json()
     split = buckets[-2]
-    quiet = buckets[0]
+    quiet = a_typical_quiet_minute(buckets)
 
     assert split["error_rate"] > 0.12
     assert split["p50_ms"] < quiet["p50_ms"] * 1.5
