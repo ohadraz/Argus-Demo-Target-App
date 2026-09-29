@@ -585,6 +585,19 @@ THE_COMMIT_THAT_SLOWED_THE_AVERAGE = (
     "5e07d73148d0a704b8fefe5f379bc652bb773655"
 )
 THE_COMMIT_BEFORE_THAT_ONE = "70dbcfde2b549d110a3817d92d60b6dd9786e78b"
+# The revision deployed into the control-plane outage: the one that decides
+# which purchases fall in this month from when each was recorded rather than
+# from the flag the writer set, so that its diff owns the divisor the monthly
+# average is dividing by. It sits on a branch of its own and is never merged -
+# what the shop actually runs is `main`, where the monthly average is what the
+# fix corpus expects to patch, and a deployed revision only has to be a commit
+# the change channel can compare against, not one the history leads to.
+THE_COMMIT_THAT_MOVED_THE_MONTH_BOUNDARY = (
+    "3398e10e131ea6c16f468f1bc1ac0fa6426d1b0c"
+)
+THE_COMMIT_BEFORE_THE_MONTH_BOUNDARY_MOVED = (
+    "f0bcdb929bc6e89981742d03b02f36a40cd19ca0"
+)
 # The revision being rolled out when the rolling update was paused: the one that
 # changed the shape of what the summary cache stores. Constants for the reason
 # the two pairs above are - the commit cannot name itself - and read as a pair
@@ -1035,8 +1048,8 @@ SCENARIOS: dict[str, Scenario] = {
         family=FOUNDATIONAL_INTEGRITY,
         control_plane_is_down=True,
         deploy=ScenarioDeploy(
-            revision=THE_COMMIT_THAT_SLOWED_THE_AVERAGE,
-            previous_revision=THE_COMMIT_BEFORE_THAT_ONE,
+            revision=THE_COMMIT_THAT_MOVED_THE_MONTH_BOUNDARY,
+            previous_revision=THE_COMMIT_BEFORE_THE_MONTH_BOUNDARY_MOVED,
             repo_url="https://github.com/ohadraz/Argus-Demo-Target-App",
             path="deploy",
             initiated_by="kuki",
