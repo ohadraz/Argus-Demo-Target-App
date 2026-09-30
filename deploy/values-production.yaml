@@ -43,7 +43,7 @@ autoscaling:
 # the only sign is that the series stops.
 metrics:
   port: 9090
-  portName: metrics
+  portName: http-metrics
 
 # Where the rendered-summary cache lives.
 #
