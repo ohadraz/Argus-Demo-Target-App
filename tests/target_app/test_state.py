@@ -22,6 +22,7 @@ from target_app.scenarios import (
     FEATURE_FLAG_TOGGLE,
     FLAG_TOGGLE_RED_HERRING,
     HALF_FINISHED_ROLLOUT,
+    MONITORING_BLIND_SPOT,
     PRICING_SERVICE_DEGRADED,
     RESOURCE_LEAK,
     SCENARIOS,
@@ -1512,3 +1513,63 @@ def test_restarting_the_shop_leaves_the_finding_exactly_where_it_was() -> None:
     state.restart_the_shop()
 
     assert state.the_integrity_check_found() == before
+
+
+def a_state_with_the_shop_gone_quiet() -> ScenarioState:
+    """A shop with the monitoring-blind-spot scenario staged.
+
+    Its flag reports on, because that is what staging it does, and the minute
+    the publishing stopped is read off that flag's timeline.
+    """
+    state = a_scenario_state(a_flag_client_reporting(True))
+    state.seed(SCENARIOS[MONITORING_BLIND_SPOT])
+    return state
+
+
+def test_a_shop_that_stopped_publishing_reports_the_minute_it_went_quiet() -> None:
+    state = a_state_with_the_shop_gone_quiet()
+
+    assert state.the_minute_the_shop_went_quiet() is not None
+
+
+def test_the_minute_reported_is_the_minute_the_flag_moved() -> None:
+    # The boundary the alert and the generator have to agree about. The alert
+    # states this minute as its onset and the generator withholds it, so a
+    # disagreement here would leave a consumer looking for a last row that is
+    # missing, or finding one too many.
+    state = a_state_with_the_shop_gone_quiet()
+
+    assert state.the_minute_the_shop_went_quiet() == state.active.timeline.turned_on_at.replace(
+        second=0, microsecond=0
+    )
+
+
+def test_the_minute_is_old_enough_for_a_rule_to_have_fired_on_it() -> None:
+    # Staging backdates the onset so a diagnosable incident exists the instant
+    # seeding returns, and for this mode that backdate is also what makes the
+    # absence older than a missed scrape.
+    state = a_state_with_the_shop_gone_quiet()
+
+    quiet_for = utc_now() - state.the_minute_the_shop_went_quiet()
+
+    assert quiet_for >= timedelta(minutes=2)
+
+
+def test_a_shop_that_is_publishing_reports_no_such_minute() -> None:
+    # Asked on every staging, so it has to be able to say nothing is wrong. The
+    # shop has one flag and several scenarios behind it, and what the flag is
+    # doing is the scenario's to say.
+    state = a_scenario_state(a_flag_client_reporting(True))
+    state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
+
+    assert state.the_minute_the_shop_went_quiet() is None
+
+
+def test_resetting_leaves_no_minute_to_report() -> None:
+    # The reset restores telemetry publishing, which for this scenario is the
+    # whole of what a reset has to undo.
+    state = a_state_with_the_shop_gone_quiet()
+
+    state.reset()
+
+    assert state.the_minute_the_shop_went_quiet() is None

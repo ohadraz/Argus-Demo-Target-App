@@ -16,7 +16,7 @@ of the shop.
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import lru_cache
 from typing import Any
 
@@ -61,6 +61,24 @@ _HIGH_MEMORY_USAGE = "HighMemoryUsage"
 # between two stored figures, which is the only way the incident behind it can be
 # reported - no series moves, so no threshold is ever crossed.
 _TOTALS_DO_NOT_RECONCILE = "SpendTotalsDoNotReconcile"
+# The second rule here not written against a value, and the only one written
+# against the *absence* of one. Every name above fires because a series crossed
+# a line; this one fires because a series that was reporting stopped, which no
+# threshold can express - there is nothing to compare. Every real monitoring
+# stack has this rule and it is the last shape of alert this shop could not
+# raise.
+_METRICS_ABSENT = "MetricsAbsent"
+
+# How long the shop has to go unheard-from before that is an incident rather
+# than a gap.
+#
+# Not one minute. A scrape that did not land is an ordinary event in every
+# monitoring stack there is, and a rule that paged on one would page most days -
+# so the dwell is what separates an absence from a miss, exactly as a duration
+# separates a spike from a departure in the rules above. Two minutes is long
+# enough that nothing routine reaches it and short enough that the shop is not
+# unwatched for a quarter of an hour before anybody hears.
+_LONG_ENOUGH_TO_BE_AN_ABSENCE = timedelta(minutes=2)
 
 # How many disagreeing totals the shop pages somebody for.
 #
@@ -174,7 +192,8 @@ class AlertNotDelivered(Exception):
 
 def an_alert_for(scenario_id: str | None,
                  at: datetime,
-                 finding: Reconciliation | None = None) -> dict[str, Any]:
+                 finding: Reconciliation | None = None,
+                 unheard_from_since: datetime | None = None) -> dict[str, Any]:
     """The firing alert, in Grafana Alertmanager's own webhook shape.
 
     Deliberately the vendor's shape, field nesting included: the consumer parses
@@ -186,6 +205,21 @@ def an_alert_for(scenario_id: str | None,
     disagreeing totals to page about, because it is the only thing here that knows
     something no series does - and it is ignored entirely otherwise, which is what
     keeps a quiet shop from being paged about a check that found nothing.
+
+    `unheard_from_since` is the first minute the shop published nothing, where it
+    has stopped publishing at all. It is the second thing here that knows what no
+    series does, and for the opposite reason: the check above reads figures no
+    rule watches, and this one is the rule noticing there are no figures. Like the
+    finding, it is ignored entirely when absent, which is what keeps a shop that
+    is reporting from being paged about silence.
+
+    It is checked against the dwell rather than taken on trust. A rule of this
+    kind that fired the moment a sample was late would fire most days, so an
+    absence younger than `_LONG_ENOUGH_TO_BE_AN_ABSENCE` is a miss and not an
+    incident - and what fires then is whatever the shop's state warrants, which
+    for a shop that is otherwise well is nothing worth reading. Saying so in the
+    rule rather than at the caller is deliberate: how long silence has to last is
+    the monitoring stack's judgement, exactly as a threshold's duration is.
     """
     if finding is not None and len(finding.accounts_that_disagree) >= (
         _ENOUGH_TOTALS_TO_PAGE
@@ -195,9 +229,47 @@ def an_alert_for(scenario_id: str | None,
             onset=finding.oldest_affected_purchase_at
         )
 
+    if (
+        unheard_from_since is not None
+        and at - unheard_from_since >= _LONG_ENOUGH_TO_BE_AN_ABSENCE
+    ):
+        return _one_firing_alert(
+            _METRICS_ABSENT,
+            _what_the_silence_said(unheard_from_since, at),
+            at,
+            onset=unheard_from_since
+        )
+
     alertname, summary = _WHAT_FIRED.get(scenario_id or "", _BY_DEFAULT)
 
     return _one_firing_alert(alertname, summary, at)
+
+
+def _what_the_silence_said(unheard_from_since: datetime, at: datetime) -> str:
+    """The absence in the words a responder is paged with.
+
+    Two figures, and the second is what makes this alert unlike every other one
+    here. When the last sample arrived says where to look; *how long ago that
+    was* says this is an absence rather than a gap, and it is the only thing in
+    the payload that distinguishes the two.
+
+    It also says what the alert is not about, in as many words. A responder
+    reading that a shop has stopped reporting will reach first for the shop, and
+    the one thing this rule can be sure of is that the shop answered the request
+    that would have carried these figures - because nothing here is a health
+    check. What is unknown is everything the figures would have said, and a
+    summary that left that implicit invites the reading it exists to prevent.
+    """
+    minutes = int((at - unheard_from_since).total_seconds() // 60)
+
+    return (
+        f"No metrics received from io-shop since "
+        f"{unheard_from_since.strftime(TIMESTAMP_FORMAT)} - {minutes}m with no "
+        f"sample, against a scrape interval of one minute. The series stopped "
+        f"rather than crossing a threshold, so nothing here says whether the "
+        f"shop is well: these minutes have no readings to judge, not readings "
+        f"that look bad."
+    )
 
 
 def _one_firing_alert(alertname: str,
@@ -273,6 +345,7 @@ def fire_alert(
     post: HttpPost = httpx.post,
     now: Callable[[], datetime] = utc_now,
     finding: Reconciliation | None = None,
+    unheard_from_since: datetime | None = None,
 ) -> dict[str, Any]:
     """Posts the firing alert to the configured webhook and returns what came
     back, so a caller can report the incident it started.
@@ -287,7 +360,7 @@ def fire_alert(
     try:
         response = post(
             url,
-            json=an_alert_for(scenario_id, now(), finding),
+            json=an_alert_for(scenario_id, now(), finding, unheard_from_since),
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()

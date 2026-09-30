@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import create_autospec
 
 import httpx
@@ -16,6 +16,7 @@ from target_app.monitoring import (
 from target_app.scenarios import (
     BAD_DEPLOYMENT,
     FEATURE_FLAG_TOGGLE,
+    MONITORING_BLIND_SPOT,
     RESOURCE_LEAK,
     SILENT_DATA_CORRUPTION,
 )
@@ -271,3 +272,112 @@ def test_an_alert_raised_without_a_finding_is_the_one_it_always_was() -> None:
     alert = an_alert_for(RESOURCE_LEAK, DONT_CARE_INSTANT)
 
     assert alert["alerts"][0]["labels"]["alertname"] == "HighMemoryUsage"
+
+
+# When the shop was last heard from, and a minute boundary unlike the purchase
+# above: a sample arrives for a minute, so the absence of one is dated to a
+# minute and never to an instant inside it.
+THE_LAST_MINUTE_HEARD_FROM = datetime(2026, 8, 29, 10, 36, 0, tzinfo=UTC)
+
+
+def test_a_shop_that_stopped_reporting_fires_the_absence_rule() -> None:
+    # The second rule here not written against a series, and the only one
+    # written against there being none. Nothing crossed a threshold because
+    # nothing was published to cross one.
+    alert = an_alert_for(
+        MONITORING_BLIND_SPOT, SOME_INSTANT, None, THE_LAST_MINUTE_HEARD_FROM
+    )
+
+    assert alert["alerts"][0]["labels"]["alertname"] == "MetricsAbsent"
+
+
+def test_the_absence_is_paged_about_as_the_shop_like_every_other_alert() -> None:
+    alert = an_alert_for(
+        MONITORING_BLIND_SPOT, SOME_INSTANT, None, THE_LAST_MINUTE_HEARD_FROM
+    )
+
+    assert alert["alerts"][0]["labels"]["service"] == "io-shop"
+    assert alert["alerts"][0]["labels"]["severity"] == "critical"
+
+
+def test_the_absence_alert_carries_the_first_silent_minute_as_the_onset() -> None:
+    # The only thing in the incident that dates it, and the minute the whole
+    # investigation hangs off: no onset can be measured from rows that are not
+    # there.
+    alert = an_alert_for(
+        MONITORING_BLIND_SPOT, SOME_INSTANT, None, THE_LAST_MINUTE_HEARD_FROM
+    )
+
+    assert alert["alerts"][0]["annotations"]["onset"] == "2026-08-29T10:36:00Z"
+
+
+def test_the_absence_alert_fires_well_after_the_minute_it_is_about() -> None:
+    # What makes the mode diagnosable rather than only what makes the rule
+    # correct. Nothing put in front of a reader says what time it is now, so the
+    # distance between the last row and this alert's own firing is the whole of
+    # the evidence that anything is missing - and an alert firing in the same
+    # minute as its last sample would leave nothing to state.
+    alert = an_alert_for(
+        MONITORING_BLIND_SPOT, SOME_INSTANT, None, THE_LAST_MINUTE_HEARD_FROM
+    )
+    one = alert["alerts"][0]
+
+    fired_at = datetime.strptime(one["startsAt"], "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=UTC
+    )
+    stated = datetime.strptime(
+        one["annotations"]["onset"], "%Y-%m-%dT%H:%M:%SZ"
+    ).replace(tzinfo=UTC)
+
+    assert fired_at - stated >= timedelta(minutes=2)
+
+
+def test_the_summary_says_how_long_the_shop_has_been_unheard_from() -> None:
+    # The figure that separates an absence from a gap, and the only one in the
+    # payload that does.
+    alert = an_alert_for(
+        MONITORING_BLIND_SPOT, SOME_INSTANT, None, THE_LAST_MINUTE_HEARD_FROM
+    )
+
+    assert "5m with no sample" in alert["alerts"][0]["annotations"]["summary"]
+
+
+def test_the_summary_says_the_minutes_have_no_readings_rather_than_bad_ones() -> None:
+    # The reading this alert exists to prevent. A responder told a shop stopped
+    # reporting will reach for the shop first, and the one thing the rule knows
+    # is that these minutes have nothing to judge.
+    said = an_alert_for(
+        MONITORING_BLIND_SPOT, SOME_INSTANT, None, THE_LAST_MINUTE_HEARD_FROM
+    )["alerts"][0]["annotations"]["summary"]
+
+    assert "no readings to judge" in said
+
+
+def test_a_shop_that_is_still_publishing_is_not_paged_about_silence() -> None:
+    # Asked on every staging, exactly as the integrity check is, so the rule has
+    # to be able to say there is nothing to report.
+    alert = an_alert_for(FEATURE_FLAG_TOGGLE, SOME_INSTANT, None, None)
+
+    assert alert["alerts"][0]["labels"]["alertname"] != "MetricsAbsent"
+
+
+def test_one_missed_sample_is_not_an_absence() -> None:
+    # A scrape that did not land is an ordinary event in every monitoring stack,
+    # and a rule that paged on one would page most days. The dwell is what makes
+    # this an incident rather than a miss.
+    a_moment_ago = SOME_INSTANT - timedelta(seconds=40)
+
+    alert = an_alert_for(MONITORING_BLIND_SPOT, SOME_INSTANT, None, a_moment_ago)
+
+    assert alert["alerts"][0]["labels"]["alertname"] != "MetricsAbsent"
+
+
+def test_a_finding_outranks_an_absence() -> None:
+    # Both are rules that know something no series does, and they cannot fire as
+    # one alert. The finding wins because it names damage that has already
+    # happened, where the absence names minutes nobody can account for.
+    alert = an_alert_for(
+        SILENT_DATA_CORRUPTION, SOME_INSTANT, a_finding(240), THE_LAST_MINUTE_HEARD_FROM
+    )
+
+    assert alert["alerts"][0]["labels"]["alertname"] == "SpendTotalsDoNotReconcile"

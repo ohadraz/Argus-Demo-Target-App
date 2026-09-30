@@ -1156,6 +1156,39 @@ class ScenarioState:
 
         return self.timeline_now()
 
+    def the_minute_the_shop_went_quiet(self) -> datetime | None:
+        """The first minute the shop published no metrics, or `None`.
+
+        `None` for every scenario but one, for the reason the drifting write path
+        is `None` everywhere else: the shop has one feature flag and several
+        scenarios behind it, so what the flag is doing is the scenario's to say.
+        A shop that is reporting has no such minute, and nothing should be paged
+        about silence that is not happening.
+
+        Read off the flag's own timeline rather than stored, so a flag somebody
+        has just put back is already reflected: the publishing stopped the minute
+        the flag went on, and a second record of that would be one that comes to
+        disagree with the first.
+
+        Truncated to the minute, and it is the minute of the flip rather than the
+        one before it - the same boundary `FlagTimeline.was_on_during` draws, and
+        therefore the same minute the generator withholds. The two have to agree:
+        this is the minute the alert states as its onset, and a consumer looking
+        for the last row before it would otherwise find one that is missing, or
+        one too many.
+        """
+        active = self._active
+
+        if active is None or not active.scenario.stops_publishing_telemetry:
+            return None
+
+        timeline = self.timeline_now()
+
+        if timeline is None:
+            return None
+
+        return timeline.turned_on_at.replace(second=0, microsecond=0)
+
     def observe_the_flags(self) -> list[FlagMoment]:
         """Reads both flags and records any that have moved since the last look.
 

@@ -1389,7 +1389,13 @@ def raise_alert() -> AlertRaised:
     """
     try:
         delivered = fire_alert(
-            state.active_scenario_id, finding=state.the_integrity_check_found()
+            state.active_scenario_id,
+            finding=state.the_integrity_check_found(),
+            # Asked whatever is staged, exactly as the integrity check is and for
+            # the same reason: a monitoring stack notices a series has stopped
+            # without being told which incident is on, and on a shop that is
+            # publishing there is no such minute to report.
+            unheard_from_since=state.the_minute_the_shop_went_quiet()
         )
     except AlertNotDelivered as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
@@ -1464,6 +1470,13 @@ def metrics() -> list[MetricBucket]:
                 cache_hit_ratio=minute.cache_hit_ratio,
             )
             for minute in _generated_minutes()
+            # The one channel that drops a minute, and it drops it rather than
+            # reporting it as zero: a bucket of zeros describes a shop serving
+            # nothing, and a reader who could not tell that from a shop nobody
+            # is hearing from would diagnose the second as the first. `/logs`
+            # above serves the same minutes untouched, which is what says the
+            # shop behind the missing rows is well.
+            if minute.published
         ]
 
     return _authored_metrics(
@@ -1863,6 +1876,9 @@ def _the_window_now() -> list[GeneratedMinute]:
         # monthly summary, which would give the one invisible incident an error
         # rate.
         ships_the_incremental_write=scenario.drifts_the_monthly_total,
+        # Named here beside the others and changing nothing about them: what it
+        # withholds is the minute itself, not any reading in it.
+        stops_publishing_telemetry=scenario.stops_publishing_telemetry,
     )
 
 

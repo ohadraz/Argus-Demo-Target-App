@@ -977,6 +977,18 @@ class GeneratedMinute:
     # `None` where the deployment configured no cache, which is a different
     # fact from a cache answering nothing - see `_how_much_the_cache_carried`.
     cache_hit_ratio: float | None = None
+    # Whether the shop published this minute's metrics at all. False only while
+    # the blind-spot scenario's flag is on, and a property of the minute rather
+    # than of the reader: the same minute is unpublished for everybody.
+    #
+    # A minute is still *generated* when it is unpublished, and that is the
+    # whole reason this is a flag instead of a gap in the list. Both channels
+    # are built from these minutes, so a minute dropped here would take its log
+    # lines with it - and a shop whose logs went quiet alongside its metrics is
+    # a shop that is down, which is a different incident and the one thing this
+    # scenario must not look like. `/metrics` drops the unpublished minutes;
+    # `/logs` serves them exactly as it serves every other minute.
+    published: bool = True
 
 
 def generate(timeline: FlagTimeline | None,
@@ -1000,7 +1012,8 @@ def generate(timeline: FlagTimeline | None,
              capacity: Capacity | None = None,
              autoscaler: LiveAutoscaler | None = None,
              ships_the_statement: bool = False,
-             ships_the_incremental_write: bool = False) -> list[GeneratedMinute]:
+             ships_the_incremental_write: bool = False,
+             stops_publishing_telemetry: bool = False) -> list[GeneratedMinute]:
     """Every minute from `span_minutes` ago up to and including the one in
     progress, once any of it has happened.
 
@@ -1132,6 +1145,20 @@ def generate(timeline: FlagTimeline | None,
     shipped the summary alongside this would have an error rate that steps, and
     the whole point of the mode - that nothing a monitoring stack watches moves -
     would be gone.
+
+    `stops_publishing_telemetry` is the only thing the flag can ship that changes
+    no reading at all, because it stops there being one. Every minute is still
+    generated, and the minutes the flag was on for are marked unpublished - which
+    is what `/metrics` drops and what `/logs` ignores, so the shop goes on saying
+    it is well over exactly the minutes no series covers. It ships no feature
+    either, so a window of this scenario is a window of a well shop for the same
+    reason the one above it is.
+
+    Marked rather than omitted, and that is the whole shape of the thing: both
+    channels are built from these minutes, so a minute left out here would take
+    its log lines with it, and a shop whose logs went quiet alongside its metrics
+    is a shop that is down. That is a different incident, and the one this
+    scenario must not be mistaken for.
     """
     current_minute = now.replace(second=0, microsecond=0)
     elapsed_in_current = int((now - current_minute).total_seconds())
@@ -1167,6 +1194,7 @@ def generate(timeline: FlagTimeline | None,
             autoscaler=autoscaler,
             ships_the_statement=ships_the_statement,
             ships_the_incremental_write=ships_the_incremental_write,
+            stops_publishing_telemetry=stops_publishing_telemetry,
         )
         for offset in range(span_minutes, 0, -1)
     ]
@@ -1201,6 +1229,7 @@ def generate(timeline: FlagTimeline | None,
                 autoscaler=autoscaler,
                 ships_the_statement=ships_the_statement,
                 ships_the_incremental_write=ships_the_incremental_write,
+                stops_publishing_telemetry=stops_publishing_telemetry,
             )
         )
 
@@ -1237,6 +1266,7 @@ def _a_whole_minute(
     autoscaler: LiveAutoscaler | None = None,
     ships_the_statement: bool = False,
     ships_the_incremental_write: bool = False,
+    stops_publishing_telemetry: bool = False,
 ) -> GeneratedMinute:
     """One minute that has finished, generated once and then remembered.
 
@@ -1284,6 +1314,7 @@ def _a_whole_minute(
         autoscaler=autoscaler,
         ships_the_statement=ships_the_statement,
         ships_the_incremental_write=ships_the_incremental_write,
+        stops_publishing_telemetry=stops_publishing_telemetry,
     )
 
 
@@ -1309,6 +1340,7 @@ def _generate_minute(
     autoscaler: LiveAutoscaler | None = None,
     ships_the_statement: bool = False,
     ships_the_incremental_write: bool = False,
+    stops_publishing_telemetry: bool = False,
 ) -> GeneratedMinute:
     minute_id = minute.strftime(TIMESTAMP_FORMAT)
     entropy = random.Random(minute_id)
@@ -1430,6 +1462,7 @@ def _generate_minute(
             the_flag_ships_the_slow_feature=slow_rollout is not None,
             the_flag_ships_the_statement=ships_the_statement,
             the_flag_ships_the_incremental_write=ships_the_incremental_write,
+            the_flag_stops_publishing=stops_publishing_telemetry,
             # The month this minute falls in, which is what a request arriving
             # in it would have been asking about. Taken from the minute rather
             # than from the clock, so that a window fetched twice reads the
@@ -1563,6 +1596,25 @@ def _generate_minute(
             heap=_heap_lines_for(minute_id, minute, heap_bytes, pressure, lifetime),
             cache=_cache_lines_for(minute_id, outcomes),
             pricing=_pricing_lines_for(minute_id, outcomes),
+        ),
+        # The same test every other condition in this generator asks of the
+        # flag, rather than a boundary of its own: `was_on_during` treats the
+        # minute containing a flip as flagged throughout, so the minute the flag
+        # moved in is the first that publishes nothing, and it is the onset. An
+        # absence alert states that minute - the first with no sample - which it
+        # works out from the last one that arrived.
+        #
+        # Keyed on this and deliberately not on `seconds_on`, which the
+        # readings above use. The two agree about the minute the flag goes on
+        # and disagree about the minute it goes off: the seconds are the honest
+        # measure of a partly-flagged minute's error rate, and publishing is not
+        # a rate. A minute the flag was not on for the whole of is a minute the
+        # shop published, so the rows resume at the minute of the revert rather
+        # than the one after it, and the sight returns as soon as it truly did.
+        published=not (
+            stops_publishing_telemetry
+            and timeline is not None
+            and timeline.was_on_during(minute)
         ),
     )
 
@@ -2042,6 +2094,7 @@ def _serve_one_account_page(
     the_flag_ships_the_slow_feature: bool = False,
     the_flag_ships_the_statement: bool = False,
     the_flag_ships_the_incremental_write: bool = False,
+    the_flag_stops_publishing: bool = False,
     statement_period: StatementPeriod | None = None,
     the_pricing_call_was_slow: bool = False,
     rollout_entropy: random.Random | None = None,
@@ -2099,6 +2152,16 @@ def _serve_one_account_page(
     whole of what that scenario stages. See `target_app.integrity` for the job
     that does find it.
 
+    `the_flag_stops_publishing` is on this path even less than that one, and is
+    named here for exactly the same purpose: to be kept off it. What that flag
+    withholds is the shop's own telemetry, which a request neither reads nor
+    writes, so every request below is a well shop's request. It matters that it
+    is named rather than left out, because the minutes it withholds are still
+    generated and their log lines are still served - so a flag that also shipped
+    the summary would have the shop's logs reporting failures over precisely the
+    minutes no metric covers, and the corroboration the whole mode rests on
+    would say the opposite of what it is there to say.
+
     At most one of them is true at a time, and that is a property of the
     scenarios rather than something checked here. Shipping two at once would
     not be a second scenario, it would be one scenario staging two faults: the
@@ -2137,6 +2200,7 @@ def _serve_one_account_page(
         the_flag_ships_the_slow_feature
         or the_flag_ships_the_statement
         or the_flag_ships_the_incremental_write
+        or the_flag_stops_publishing
     )
     # The third thing the one flag can ship. Same cohort as the monthly summary
     # and the same shoppers break it - a month with nothing bought in it has no

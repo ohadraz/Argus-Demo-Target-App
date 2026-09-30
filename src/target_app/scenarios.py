@@ -195,14 +195,17 @@ FOUNDATIONAL_INTEGRITY = ScenarioFamily(
     id="foundational-integrity",
     name="Foundational integrity",
     taxonomy=(
-        "Silent data corruption (FM-26), inside foundational integrity - 12% of "
-        "incidents"
+        "Silent data corruption (FM-26) and monitoring blind spot (FM-27), "
+        "inside foundational integrity - 12% of incidents"
     ),
     blurb=(
-        "Nothing fails, nothing slows, and what the shop has already written "
-        "down is wrong. What separates these from every other family is that "
-        "the condition outlives its own cause: putting the change back stops "
-        "the next one and repairs none of the ones before it."
+        "Nothing fails and nothing slows, and no rule watching a series will "
+        "ever fire. What separates these from every other family is that "
+        "something of the incident outlives its own cause: putting the change "
+        "back stops the next wrong total and repairs none of the ones before "
+        "it, and restores the shop's sight without restoring the minutes it "
+        "was blind for. One is a shop that wrote the wrong thing down; the "
+        "other is a shop that wrote nothing down at all."
     ),
 )
 HALF_ROLLED_OUT = ScenarioFamily(
@@ -464,6 +467,27 @@ class Scenario:
     fix to the write path and a one-off repair of the data, and the repair is
     nobody's to run without being asked.
 
+    `stops_publishing_telemetry` stages the twelfth generated kind, and the only
+    one where what is wrong is the shop's own account of itself. The flag turns
+    off telemetry publishing. The shop serves every request correctly, its logs
+    go on reporting every minute, and `/metrics` carries rows up to the minute
+    the flag moved and none at or after it. Nothing throws, nothing waits, and
+    no series moves - because for those minutes there is no series.
+
+    It is the opposite of `drifts_the_monthly_total` in the one way that matters
+    to a reader, and the two sit in the same family for it. There every minute is
+    present and sitting at its baseline, and what is wrong is what the shop
+    wrote. Here the minutes are missing and nothing the shop wrote is wrong. Both
+    are incidents no threshold can fire on; the first is found by a job that
+    re-reads the data, the second by a rule that notices a series which was
+    reporting has stopped.
+
+    Returning the flag restores publishing, and the minutes lost while it was on
+    are lost for good - nothing retains an unpublished minute. So recovery here
+    is the sight coming back rather than a level coming down, and a restart
+    changes nothing at all: the flag is still on afterwards and the minutes are
+    still missing.
+
     `deploy_is_slow` stages the sixth generated kind, and the only one whose
     live condition is which revision is deployed. The revision that went out
     computes a shopper's lifetime average by walking their purchases once per
@@ -518,6 +542,7 @@ class Scenario:
     rollout_is_paused: bool = False
     drifts_the_monthly_total: bool = False
     ships_the_statement: bool = False
+    stops_publishing_telemetry: bool = False
     control_plane_is_down: bool = False
     # The deploy a *generated* scenario stages, for the one whose cause is a
     # change rather than a state. An authored scenario carries its deploys on
@@ -658,6 +683,13 @@ SILENT_DATA_CORRUPTION = "silent-data-corruption"
 # unavailable at once, because the platform all four go through is not
 # answering - and that has nothing to do with this incident or any incident.
 CONTROL_PLANE_UNREACHABLE = "control-plane-unreachable"
+# Named for what Argus loses rather than for what the shop does, unlike every
+# scenario above it - including the one it shares a family with. `silent-data-
+# corruption` is named for the state of the data because a flag is what turned it
+# on and saying so would put the answer in the id. Here the flag is no more the
+# answer than it is there, and the reason for the name is different: nothing is
+# wrong with the shop at all, so there is no condition of the shop's to name.
+MONITORING_BLIND_SPOT = "monitoring-blind-spot"
 
 SCENARIOS: dict[str, Scenario] = {
     FEATURE_FLAG_TOGGLE: Scenario(
@@ -1054,6 +1086,37 @@ SCENARIOS: dict[str, Scenario] = {
             path="deploy",
             initiated_by="kuki",
         ),
+    ),
+    MONITORING_BLIND_SPOT: Scenario(
+        id=MONITORING_BLIND_SPOT,
+        title="The shop stops reporting and goes on trading",
+        description=(
+            "Io's shop is publishing its own telemetry behind a flag, and "
+            "'monthly-spend-feature' has been switched on. The flag is not a "
+            "feature here: it stops the shop publishing the per-minute figures "
+            "it reports about itself. So the shop goes on trading exactly as it "
+            "was - orders succeed, every account page renders the right "
+            "numbers, nothing throws and nothing waits - and from the minute "
+            "the flag moved, `/metrics` carries no row at all. The window "
+            "before it is ordinary and the window after it does not exist. "
+            "Nothing crossed a threshold, because for those minutes there is "
+            "no series to cross one. What pages somebody is the rule every "
+            "monitoring stack has and none of these scenarios has needed yet: "
+            "a series that was reporting has stopped, held long enough that it "
+            "cannot be a scrape that was missed. The alert says when the last "
+            "sample arrived, which is the only thing that dates the incident, "
+            "and the shop's logs go on saying it is well across every minute "
+            "the metrics do not cover - which is the corroboration, and the "
+            "only channel that has any. Turning the flag back off restores the "
+            "publishing from that minute on and restores not one of the "
+            "minutes it was blind for: they were never published and nothing "
+            "keeps them. A restart changes nothing whatsoever, because the "
+            "flag is still on afterwards. What is owed at the end of it is not "
+            "a fix to the shop - there is nothing wrong with the shop - but an "
+            "instrumentation gap, and the alert rule that caught it."
+        ),
+        family=FOUNDATIONAL_INTEGRITY,
+        stops_publishing_telemetry=True,
     ),
 }
 
