@@ -22,6 +22,7 @@ from target_app.generator import (
     PricingSlowdown,
     ProviderOutage,
     Scaling,
+    ScrapeOutage,
     SlowDeployment,
     SlowRollout,
     generate,
@@ -2035,46 +2036,51 @@ def test_no_minute_of_the_window_mentions_a_total_or_a_summary() -> None:
 
 
 def a_shop_that_stopped_publishing(
-    flip: datetime = SOME_NOW - timedelta(minutes=5),
-    revert: datetime | None = None,
+    landed: datetime = SOME_NOW - timedelta(minutes=5),
+    rolled_back: datetime | None = None,
     now: datetime = SOME_NOW,
 ) -> list[GeneratedMinute]:
     """A window of the monitoring-blind-spot scenario.
 
-    The flip defaults to five minutes back, which is what staging backdates it
+    The deployment lands five minutes back, which is what staging backdates it
     by, so the window has a quiet stretch in front of the silence and the
     silence is old enough for a rule to have fired on it.
+
+    No timeline, and that is the scenario rather than a convenience: this
+    incident stages no flag at all, and a window built around one would be a
+    window of a different mode.
     """
     return generate(
-        FlagTimeline(turned_on_at=flip, turned_off_at=revert),
+        None,
         now,
         SOME_SPAN_MINUTES,
-        stops_publishing_telemetry=True,
+        scrape_outage=ScrapeOutage(began_at=landed, ended_at=rolled_back),
     )
 
 
-def test_a_shop_that_stopped_publishing_withholds_the_minute_the_flag_moved() -> None:
+def test_a_shop_that_stopped_publishing_withholds_the_minute_the_deploy_landed() -> None:
     # The onset, and the boundary the alert and the generator have to agree
-    # about: the minute containing the flip is the first one carrying nothing,
-    # because a minute the shop spent part of unpublished has no full reading.
-    flip = SOME_NOW - timedelta(minutes=5)
+    # about: the minute containing the deployment is the first one carrying
+    # nothing, because a minute the shop spent part of uncollected has no full
+    # reading.
+    landed = SOME_NOW - timedelta(minutes=5)
 
     published = [
         minute.minute_id
-        for minute in a_shop_that_stopped_publishing(flip)
+        for minute in a_shop_that_stopped_publishing(landed)
         if minute.published
     ]
 
-    assert flip.strftime(AS_A_MINUTE_ID) not in published
+    assert landed.strftime(AS_A_MINUTE_ID) not in published
 
 
-def test_no_minute_from_the_flip_onwards_is_published() -> None:
-    flip = SOME_NOW - timedelta(minutes=5)
-    the_flip_minute = flip.replace(second=0, microsecond=0)
+def test_no_minute_from_the_deploy_onwards_is_published() -> None:
+    landed = SOME_NOW - timedelta(minutes=5)
+    the_flip_minute = landed.replace(second=0, microsecond=0)
 
     withheld = [
         minute.minute_id
-        for minute in a_shop_that_stopped_publishing(flip)
+        for minute in a_shop_that_stopped_publishing(landed)
         if not minute.published
     ]
 
@@ -2084,15 +2090,15 @@ def test_no_minute_from_the_flip_onwards_is_published() -> None:
     ]
 
 
-def test_the_quiet_stretch_before_the_flip_is_present_and_ordinary() -> None:
+def test_the_quiet_stretch_before_the_deploy_is_present_and_ordinary() -> None:
     # What makes the stopping legible at all, and what `find_onset` reads. A
     # window with nothing in front of the silence would describe a shop nobody
     # ever instrumented.
-    flip = SOME_NOW - timedelta(minutes=5)
+    landed = SOME_NOW - timedelta(minutes=5)
 
     before = [
         minute
-        for minute in a_shop_that_stopped_publishing(flip)
+        for minute in a_shop_that_stopped_publishing(landed)
         if minute.published
     ]
 
@@ -2128,10 +2134,10 @@ def test_the_withheld_minutes_still_carry_their_log_lines() -> None:
 
 
 def test_the_withheld_minutes_describe_a_shop_that_is_well() -> None:
-    # The flag stops the publishing and ships no feature, so the minutes nobody
-    # can see are ordinary minutes. A flag that also shipped the summary would
-    # have the logs reporting a third of requests failing over exactly the
-    # minutes no metric covers.
+    # The rename stops the collecting and changes nothing the shop does, so the
+    # minutes nobody can see are ordinary minutes. A revision that also broke
+    # something would have the logs reporting failures over exactly the minutes
+    # no metric covers.
     withheld = [
         minute
         for minute in a_shop_that_stopped_publishing()
@@ -2141,34 +2147,40 @@ def test_the_withheld_minutes_describe_a_shop_that_is_well() -> None:
     assert all(minute.error_rate < CLEARLY_HEALTHY for minute in withheld)
 
 
-def test_putting_the_flag_back_restores_the_publishing() -> None:
+def test_rolling_the_deployment_back_restores_the_publishing() -> None:
     # Recovery for this mode, and the only thing that says the mitigation
     # worked: there is no level to come back down to.
-    revert = SOME_NOW - timedelta(minutes=2)
+    rolled_back = SOME_NOW - timedelta(minutes=2)
 
     published = [
         minute.minute_id
-        for minute in a_shop_that_stopped_publishing(revert=revert)
+        for minute in a_shop_that_stopped_publishing(rolled_back=rolled_back)
         if minute.published
     ]
 
-    assert revert.replace(second=0, microsecond=0).strftime(AS_A_MINUTE_ID) in published
+    assert (
+        rolled_back.replace(second=0, microsecond=0).strftime(AS_A_MINUTE_ID)
+        in published
+    )
 
 
 def test_the_minutes_it_was_blind_for_do_not_come_back() -> None:
-    # Nothing retains an unpublished minute, so returning the flag restores the
-    # sight and not the record. The gap stays in the window for as long as the
-    # window covers it.
-    flip = SOME_NOW - timedelta(minutes=5)
-    revert = SOME_NOW - timedelta(minutes=2)
+    # Nothing retains an uncollected minute, so returning the deployment
+    # restores the sight and not the record. The gap stays in the window for as
+    # long as the window covers it.
+    landed = SOME_NOW - timedelta(minutes=5)
+    rolled_back = SOME_NOW - timedelta(minutes=2)
 
     published = [
         minute.minute_id
-        for minute in a_shop_that_stopped_publishing(flip, revert)
+        for minute in a_shop_that_stopped_publishing(landed, rolled_back)
         if minute.published
     ]
 
-    assert flip.replace(second=0, microsecond=0).strftime(AS_A_MINUTE_ID) not in published
+    assert (
+        landed.replace(second=0, microsecond=0).strftime(AS_A_MINUTE_ID)
+        not in published
+    )
 
 
 def test_a_scenario_that_is_not_this_one_publishes_every_minute() -> None:

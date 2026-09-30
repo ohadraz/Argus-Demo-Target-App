@@ -564,8 +564,9 @@ class Scenario:
         Most generated scenarios are not: a leak is the process's own
         accumulation, an upstream failure is another company's service, a
         misconfigured cache is a value in a file, a bad deployment is the
-        revision that is running, and a slow dependency is another team's
-        process. A page offering a flag to watch for any of them would be
+        revision that is running, a slow dependency is another team's process,
+        and a monitoring blind spot is the name of a port. A page offering a
+        flag to watch for any of them would be
         offering a control that changes nothing, and naming a flag as the thing
         that breaks the shop would be pointing at a suspect the fixture
         invented.
@@ -579,6 +580,7 @@ class Scenario:
             or self.surges
             or self.autoscaler_flaps
             or self.rollout_is_paused
+            or self.stops_publishing_telemetry
         )
 
     @property
@@ -601,6 +603,19 @@ CACHE_MISCONFIGURED = "cache-misconfigured"
 #
 # Filled in after the commit exists, which is why it is a constant here and not
 # a literal in the scenario - the commit cannot name itself.
+# The commit that renamed the metrics port in `deploy/values-production.yaml`,
+# and its parent. Real commits in this repository, looked up rather than
+# invented for the reason the cache pair below is: the diagnosis is the diff
+# between them.
+#
+# The rename is the whole incident and it reads as housekeeping - every other
+# port in the file is named for its protocol, and this one was made to match.
+# Nothing in the shop reads the name; the scrape config does, and it selects
+# the target by it. So the shop went on serving its metrics endpoint to a
+# platform that had stopped asking.
+THE_COMMIT_THAT_RENAMED_THE_METRICS_PORT = "9f4ad14582c99c497eb6c2d2af87566cd4493020"
+THE_COMMIT_BEFORE_THE_RENAME = "e283ba3af732fc4285166a060b827b1305cd30d9"
+
 THE_COMMIT_THAT_MOVED_THE_CACHE_PORT = "0d8e826225f0de73958a8a8dd3d867b2ae249e72"
 THE_COMMIT_BEFORE_IT = "544cef36a8eaf45c5b030c3d5c21473d8176cef3"
 # The revision the bad deployment shipped: the lifetime average derived from
@@ -1091,33 +1106,42 @@ SCENARIOS: dict[str, Scenario] = {
         id=MONITORING_BLIND_SPOT,
         title="The shop stops reporting and goes on trading",
         description=(
-            "Io's shop is publishing its own telemetry behind a flag, and "
-            "'monthly-spend-feature' has been switched on. The flag is not a "
-            "feature here: it stops the shop publishing the per-minute figures "
-            "it reports about itself. So the shop goes on trading exactly as it "
-            "was - orders succeed, every account page renders the right "
-            "numbers, nothing throws and nothing waits - and from the minute "
-            "the flag moved, `/metrics` carries no row at all. The window "
-            "before it is ordinary and the window after it does not exist. "
-            "Nothing crossed a threshold, because for those minutes there is "
-            "no series to cross one. What pages somebody is the rule every "
-            "monitoring stack has and none of these scenarios has needed yet: "
-            "a series that was reporting has stopped, held long enough that it "
-            "cannot be a scrape that was missed. The alert says when the last "
-            "sample arrived, which is the only thing that dates the incident, "
-            "and the shop's logs go on saying it is well across every minute "
-            "the metrics do not cover - which is the corroboration, and the "
-            "only channel that has any. Turning the flag back off restores the "
-            "publishing from that minute on and restores not one of the "
-            "minutes it was blind for: they were never published and nothing "
-            "keeps them. A restart changes nothing whatsoever, because the "
-            "flag is still on afterwards. What is owed at the end of it is not "
-            "a fix to the shop - there is nothing wrong with the shop - but an "
-            "instrumentation gap, and the alert rule that caught it."
+            "A deployment renamed the shop's metrics port in "
+            "'deploy/values-production.yaml' - 'metrics' became 'http-metrics', "
+            "so that every port in the file is named for the protocol it "
+            "carries. Nothing in the shop reads that name. The scrape config "
+            "does, and it selects the target by it, so from the minute the "
+            "revision landed the platform stopped collecting from a shop that "
+            "was still serving its metrics endpoint exactly as before. The shop "
+            "goes on trading as it was - orders succeed, every account page "
+            "renders the right numbers, nothing throws and nothing waits - and "
+            "`/metrics` carries no row at all. The window before it is ordinary "
+            "and the window after it does not exist. Nothing crossed a "
+            "threshold, because for those minutes there is no series to cross "
+            "one. What pages somebody is the rule every monitoring stack has "
+            "and none of these scenarios has needed yet: a series that was "
+            "reporting has stopped, held long enough that it cannot be a scrape "
+            "that was missed. The alert says when the last sample arrived, "
+            "which is the only thing that dates the incident, and the shop's "
+            "logs go on saying it is well across every minute the metrics do "
+            "not cover - which is the corroboration, and the only channel that "
+            "has any. No flag moved, so there is nothing to revert; a restart "
+            "changes nothing, because the renamed port comes back with the "
+            "process. What ends it is rolling the deployment back to the "
+            "revision before the rename, which restores the collecting from "
+            "that minute on and restores not one of the minutes it was blind "
+            "for: they were never collected and nothing keeps them."
         ),
         family=FOUNDATIONAL_INTEGRITY,
         stops_publishing_telemetry=True,
-    ),
+        deploy=ScenarioDeploy(
+            revision=THE_COMMIT_THAT_RENAMED_THE_METRICS_PORT,
+            previous_revision=THE_COMMIT_BEFORE_THE_RENAME,
+            repo_url="https://github.com/ohadraz/Argus-Demo-Target-App",
+            path="deploy",
+            initiated_by="kuki"
+        )
+    )
 }
 
 

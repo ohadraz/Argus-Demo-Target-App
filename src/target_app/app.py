@@ -1878,7 +1878,7 @@ def _the_window_now() -> list[GeneratedMinute]:
         ships_the_incremental_write=scenario.drifts_the_monthly_total,
         # Named here beside the others and changing nothing about them: what it
         # withholds is the minute itself, not any reading in it.
-        stops_publishing_telemetry=scenario.stops_publishing_telemetry,
+        scrape_outage=active.scrape_outage if active else None,
     )
 
 

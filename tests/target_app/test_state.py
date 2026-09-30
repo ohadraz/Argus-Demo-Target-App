@@ -1518,10 +1518,11 @@ def test_restarting_the_shop_leaves_the_finding_exactly_where_it_was() -> None:
 def a_state_with_the_shop_gone_quiet() -> ScenarioState:
     """A shop with the monitoring-blind-spot scenario staged.
 
-    Its flag reports on, because that is what staging it does, and the minute
-    the publishing stopped is read off that flag's timeline.
+    Its flags report off, because this scenario stages none: what it stages is
+    a deployed revision, and the minute the collecting stopped is read off the
+    scrape outage rather than off any timeline.
     """
-    state = a_scenario_state(a_flag_client_reporting(True))
+    state = a_scenario_state(a_flag_client_reporting(False))
     state.seed(SCENARIOS[MONITORING_BLIND_SPOT])
     return state
 
@@ -1532,16 +1533,27 @@ def test_a_shop_that_stopped_publishing_reports_the_minute_it_went_quiet() -> No
     assert state.the_minute_the_shop_went_quiet() is not None
 
 
-def test_the_minute_reported_is_the_minute_the_flag_moved() -> None:
+def test_the_minute_reported_is_the_minute_the_deployment_landed() -> None:
     # The boundary the alert and the generator have to agree about. The alert
     # states this minute as its onset and the generator withholds it, so a
     # disagreement here would leave a consumer looking for a last row that is
     # missing, or finding one too many.
     state = a_state_with_the_shop_gone_quiet()
 
-    assert state.the_minute_the_shop_went_quiet() == state.active.timeline.turned_on_at.replace(
-        second=0, microsecond=0
+    assert (
+        state.the_minute_the_shop_went_quiet()
+        == state.active.scrape_outage.began_at.replace(second=0, microsecond=0)
     )
+
+
+def test_the_scenario_that_stops_the_publishing_stages_no_flag() -> None:
+    # The whole reason this was re-staged. A flag moving at the onset is
+    # evidence naming a cause, and here the cause is a revision - so a flag
+    # left on would put a suspect in the change channel that the incident has
+    # nothing to do with.
+    state = a_state_with_the_shop_gone_quiet()
+
+    assert state.active.timeline is None
 
 
 def test_the_minute_is_old_enough_for_a_rule_to_have_fired_on_it() -> None:

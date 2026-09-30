@@ -499,6 +499,49 @@ class ProviderOutage:
 
 
 @dataclass(frozen=True)
+class ScrapeOutage:
+    """When the shop stopped being collected from, and when it was again.
+
+    Not a fault in the shop, and named so that nothing reads it as one. The
+    process goes on serving its metrics endpoint over every one of these
+    minutes exactly as it does outside them; what changed is that the platform
+    stopped selecting it as a target, because the deployment renamed the port
+    the scrape config matches on. So there is nothing wrong with the shop,
+    nothing wrong with its code, and the thing to put back is a value in a
+    file - which it has in common with `CacheOutage` and with nothing else
+    here.
+
+    What separates it from every other condition in this generator is that it
+    changes no reading. The others move a number; this one removes the row the
+    number would have been in. A window of these minutes is not a window of a
+    shop that is unwell, it is a window with nothing in it at all.
+
+    `ended_at` being `None` means the shop is still not being collected from.
+    """
+
+    began_at: datetime
+    ended_at: datetime | None = None
+
+    def covers(self, minute: datetime) -> bool:
+        """Whether this whole minute went uncollected.
+
+        The same boundaries `FlagTimeline.was_on_during` draws, and for the
+        same reason: a deployment lands mid-minute, and the minute it landed in
+        is the first with no row - which is the minute an absence alert states
+        as its onset, worked out from the last row that did arrive. The rows
+        resume at the minute of the rollback rather than the one after it, so
+        the sight returns as soon as it truly did.
+        """
+        if minute < self.began_at.replace(second=0, microsecond=0):
+            return False
+
+        if self.ended_at is None:
+            return True
+
+        return minute < self.ended_at.replace(second=0, microsecond=0)
+
+
+@dataclass(frozen=True)
 class CacheOutage:
     """When the shop stopped being able to reach its cache, and when it could
     again.
@@ -1013,7 +1056,7 @@ def generate(timeline: FlagTimeline | None,
              autoscaler: LiveAutoscaler | None = None,
              ships_the_statement: bool = False,
              ships_the_incremental_write: bool = False,
-             stops_publishing_telemetry: bool = False) -> list[GeneratedMinute]:
+             scrape_outage: ScrapeOutage | None = None) -> list[GeneratedMinute]:
     """Every minute from `span_minutes` ago up to and including the one in
     progress, once any of it has happened.
 
@@ -1146,13 +1189,14 @@ def generate(timeline: FlagTimeline | None,
     the whole point of the mode - that nothing a monitoring stack watches moves -
     would be gone.
 
-    `stops_publishing_telemetry` is the only thing the flag can ship that changes
-    no reading at all, because it stops there being one. Every minute is still
-    generated, and the minutes the flag was on for are marked unpublished - which
-    is what `/metrics` drops and what `/logs` ignores, so the shop goes on saying
-    it is well over exactly the minutes no series covers. It ships no feature
-    either, so a window of this scenario is a window of a well shop for the same
-    reason the one above it is.
+    `scrape_outage` is the only condition here that changes no reading at all,
+    because it stops there being one. No flag ships it and nothing in the shop
+    does it: the deployment renamed the port the scrape config matches on, so
+    the platform stopped selecting the shop as a target while the shop went on
+    serving the same endpoint to nobody. Every minute is still generated, and
+    the minutes inside the outage are marked unpublished - which is what
+    `/metrics` drops and what `/logs` ignores, so the shop goes on saying it is
+    well over exactly the minutes no series covers.
 
     Marked rather than omitted, and that is the whole shape of the thing: both
     channels are built from these minutes, so a minute left out here would take
@@ -1194,7 +1238,7 @@ def generate(timeline: FlagTimeline | None,
             autoscaler=autoscaler,
             ships_the_statement=ships_the_statement,
             ships_the_incremental_write=ships_the_incremental_write,
-            stops_publishing_telemetry=stops_publishing_telemetry,
+            scrape_outage=scrape_outage,
         )
         for offset in range(span_minutes, 0, -1)
     ]
@@ -1229,7 +1273,7 @@ def generate(timeline: FlagTimeline | None,
                 autoscaler=autoscaler,
                 ships_the_statement=ships_the_statement,
                 ships_the_incremental_write=ships_the_incremental_write,
-                stops_publishing_telemetry=stops_publishing_telemetry,
+                scrape_outage=scrape_outage,
             )
         )
 
@@ -1266,7 +1310,7 @@ def _a_whole_minute(
     autoscaler: LiveAutoscaler | None = None,
     ships_the_statement: bool = False,
     ships_the_incremental_write: bool = False,
-    stops_publishing_telemetry: bool = False,
+    scrape_outage: ScrapeOutage | None = None,
 ) -> GeneratedMinute:
     """One minute that has finished, generated once and then remembered.
 
@@ -1314,7 +1358,7 @@ def _a_whole_minute(
         autoscaler=autoscaler,
         ships_the_statement=ships_the_statement,
         ships_the_incremental_write=ships_the_incremental_write,
-        stops_publishing_telemetry=stops_publishing_telemetry,
+        scrape_outage=scrape_outage,
     )
 
 
@@ -1340,7 +1384,7 @@ def _generate_minute(
     autoscaler: LiveAutoscaler | None = None,
     ships_the_statement: bool = False,
     ships_the_incremental_write: bool = False,
-    stops_publishing_telemetry: bool = False,
+    scrape_outage: ScrapeOutage | None = None,
 ) -> GeneratedMinute:
     minute_id = minute.strftime(TIMESTAMP_FORMAT)
     entropy = random.Random(minute_id)
@@ -1462,7 +1506,6 @@ def _generate_minute(
             the_flag_ships_the_slow_feature=slow_rollout is not None,
             the_flag_ships_the_statement=ships_the_statement,
             the_flag_ships_the_incremental_write=ships_the_incremental_write,
-            the_flag_stops_publishing=stops_publishing_telemetry,
             # The month this minute falls in, which is what a request arriving
             # in it would have been asking about. Taken from the minute rather
             # than from the clock, so that a window fetched twice reads the
@@ -1597,25 +1640,13 @@ def _generate_minute(
             cache=_cache_lines_for(minute_id, outcomes),
             pricing=_pricing_lines_for(minute_id, outcomes),
         ),
-        # The same test every other condition in this generator asks of the
-        # flag, rather than a boundary of its own: `was_on_during` treats the
-        # minute containing a flip as flagged throughout, so the minute the flag
-        # moved in is the first that publishes nothing, and it is the onset. An
-        # absence alert states that minute - the first with no sample - which it
-        # works out from the last one that arrived.
-        #
-        # Keyed on this and deliberately not on `seconds_on`, which the
-        # readings above use. The two agree about the minute the flag goes on
-        # and disagree about the minute it goes off: the seconds are the honest
-        # measure of a partly-flagged minute's error rate, and publishing is not
-        # a rate. A minute the flag was not on for the whole of is a minute the
-        # shop published, so the rows resume at the minute of the revert rather
-        # than the one after it, and the sight returns as soon as it truly did.
-        published=not (
-            stops_publishing_telemetry
-            and timeline is not None
-            and timeline.was_on_during(minute)
-        ),
+        # Whole minutes, and deliberately not the share-of-minute arithmetic the
+        # readings above use: a partly-collected minute is not a partly-true
+        # row, it is a row that either exists or does not. `covers` draws the
+        # same boundaries `was_on_during` does, so the minute the deployment
+        # landed in is the first with no row - and that minute is the onset an
+        # absence alert states, worked out from the last row that arrived.
+        published=scrape_outage is None or not scrape_outage.covers(minute),
     )
 
 
@@ -2094,7 +2125,6 @@ def _serve_one_account_page(
     the_flag_ships_the_slow_feature: bool = False,
     the_flag_ships_the_statement: bool = False,
     the_flag_ships_the_incremental_write: bool = False,
-    the_flag_stops_publishing: bool = False,
     statement_period: StatementPeriod | None = None,
     the_pricing_call_was_slow: bool = False,
     rollout_entropy: random.Random | None = None,
@@ -2152,16 +2182,6 @@ def _serve_one_account_page(
     whole of what that scenario stages. See `target_app.integrity` for the job
     that does find it.
 
-    `the_flag_stops_publishing` is on this path even less than that one, and is
-    named here for exactly the same purpose: to be kept off it. What that flag
-    withholds is the shop's own telemetry, which a request neither reads nor
-    writes, so every request below is a well shop's request. It matters that it
-    is named rather than left out, because the minutes it withholds are still
-    generated and their log lines are still served - so a flag that also shipped
-    the summary would have the shop's logs reporting failures over precisely the
-    minutes no metric covers, and the corroboration the whole mode rests on
-    would say the opposite of what it is there to say.
-
     At most one of them is true at a time, and that is a property of the
     scenarios rather than something checked here. Shipping two at once would
     not be a second scenario, it would be one scenario staging two faults: the
@@ -2200,7 +2220,6 @@ def _serve_one_account_page(
         the_flag_ships_the_slow_feature
         or the_flag_ships_the_statement
         or the_flag_ships_the_incremental_write
-        or the_flag_stops_publishing
     )
     # The third thing the one flag can ship. Same cohort as the monthly summary
     # and the same shoppers break it - a month with nothing bought in it has no

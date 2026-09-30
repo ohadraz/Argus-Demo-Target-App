@@ -26,6 +26,7 @@ from target_app.generator import (
     PricingSlowdown,
     ProviderOutage,
     Scaling,
+    ScrapeOutage,
     SlowDeployment,
 )
 from target_app.history import (
@@ -244,6 +245,11 @@ class ActiveScenario:
     # is precisely the act of making the second agree with an earlier first.
     cache_outage: CacheOutage | None = None
     cache_endpoint: CacheEndpoint | None = None
+    # The stretch the platform was not collecting the shop's metrics over,
+    # for the one scenario whose condition is that there is no reading rather
+    # than that a reading moved. `None` everywhere else, which leaves every
+    # other scenario publishing every minute it generates.
+    scrape_outage: ScrapeOutage | None = None
     # The stretch the slower revision has been the one deployed, for the one
     # scenario whose condition is which revision is running. `None` everywhere
     # else, which leaves every other scenario's latency exactly where it was -
@@ -482,6 +488,31 @@ class ScenarioState:
             )
             return
 
+        if scenario.stops_publishing_telemetry:
+            # No flag, and nothing wrong with the shop at all - which is what
+            # separates this from every other deployed-configuration scenario
+            # here. The revision changed the *name* of the metrics port, so the
+            # platform stopped selecting the shop as a scrape target while the
+            # shop went on serving that endpoint to nobody. Nothing it does
+            # differs; what differs is that no one is writing any of it down.
+            #
+            # Backdated like the others, so the incident is diagnosable the
+            # instant this returns - and here the backdating is what makes it
+            # an incident at all, since an absence rule fires on a gap held
+            # long enough that it cannot be one collection that went astray.
+            self._remember_where_the_flags_are_now()
+            self._active = ActiveScenario(
+                scenario=scenario,
+                seeded_at=now,
+                process_started_at=now - SETTLED_UPTIME,
+                scrape_outage=ScrapeOutage(
+                    began_at=now - timedelta(
+                        minutes=get_scenario_settings().onset_backdate_minutes
+                    )
+                ),
+            )
+            return
+
         if scenario.cache_is_misconfigured:
             # No flag, no process, and nothing wrong with the cache either -
             # it is up and answering whoever dials it correctly. What is staged
@@ -686,20 +717,21 @@ class ScenarioState:
         # otherwise see the change arrive after the incident it caused.
         #
         # The onset above is moved back and the provider's own entry is not, so
-        # the two disagree by exactly that much in every scenario. Most can
-        # afford it: their incident is dated by a departure the metrics show, a
-        # change a few minutes either side of it still reads as the one that
-        # caused it, and no conclusion turns on the order.
+        # the two disagree by exactly that much in every scenario staged by a
+        # flag. Most can afford it: their incident is dated by a departure the
+        # metrics show, a change a few minutes either side of it still reads as
+        # the one that caused it, and no conclusion turns on the order.
         #
-        # Two cannot. The drifting total is dated a week back by the shop's own
+        # The drifting total cannot. It is dated a week back by the shop's own
         # check, so an unbackdated entry would sit a week from the onset and a
-        # consumer looking around the onset would find an empty window. The
-        # blind spot is dated by the last reading before the shop went quiet,
-        # and there the order is the whole question: an entry recorded after the
-        # rows stop says the flag cannot be what stopped them, which is both a
-        # sound reading and the opposite of what this scenario stages. Left
-        # alone, the fixture argues against its own incident.
-        if scenario.drifts_the_monthly_total or scenario.stops_publishing_telemetry:
+        # consumer looking around the onset would find an empty window.
+        #
+        # The incident dated by an absence has the sharpest version of this
+        # problem - an entry recorded after the rows stop says the change cannot
+        # be what stopped them - and it is not answered here, because that
+        # scenario stages no flag at all. Its change is a deployment, and the
+        # history a deployment lands in is the platform's.
+        if scenario.drifts_the_monthly_total:
             self._backdate_the_flag_history(
                 [self._flags_for(scenario).name], onset, now
             )
@@ -908,7 +940,18 @@ class ScenarioState:
         if active is None:
             return at
 
-        if active.cache_outage is not None:
+        if active.scrape_outage is not None:
+            # The fourth thing a rollback ends, and the only one where what
+            # comes back is the evidence rather than the service. The shop was
+            # well throughout; returning the deployment returns the port's old
+            # name, the platform finds the target again, and the rows resume
+            # from that minute. The minutes in between stay missing, because
+            # nothing collected them and nothing keeps them.
+            self._active = replace(
+                active,
+                scrape_outage=replace(active.scrape_outage, ended_at=at),
+            )
+        elif active.cache_outage is not None:
             self._active = replace(
                 active,
                 cache_outage=replace(active.cache_outage, ended_at=at),
@@ -1166,35 +1209,28 @@ class ScenarioState:
     def the_minute_the_shop_went_quiet(self) -> datetime | None:
         """The first minute the shop published no metrics, or `None`.
 
-        `None` for every scenario but one, for the reason the drifting write path
-        is `None` everywhere else: the shop has one feature flag and several
-        scenarios behind it, so what the flag is doing is the scenario's to say.
-        A shop that is reporting has no such minute, and nothing should be paged
-        about silence that is not happening.
+        `None` for every scenario but one. A shop that is being collected from
+        has no such minute, and nothing should be paged about silence that is
+        not happening.
 
-        Read off the flag's own timeline rather than stored, so a flag somebody
-        has just put back is already reflected: the publishing stopped the minute
-        the flag went on, and a second record of that would be one that comes to
-        disagree with the first.
+        Read off the outage rather than stored separately, so a deployment
+        somebody has just rolled back is already reflected: the collecting
+        stopped the minute the revision landed, and a second record of that
+        would be one that comes to disagree with the first.
 
-        Truncated to the minute, and it is the minute of the flip rather than the
-        one before it - the same boundary `FlagTimeline.was_on_during` draws, and
-        therefore the same minute the generator withholds. The two have to agree:
-        this is the minute the alert states as its onset, and a consumer looking
-        for the last row before it would otherwise find one that is missing, or
-        one too many.
+        Truncated to the minute, and it is the minute the revision landed in
+        rather than the one before it - the same boundary `ScrapeOutage.covers`
+        draws, and therefore the same minute the generator withholds. The two
+        have to agree: this is the minute the alert states as its onset, and a
+        consumer looking for the last row before it would otherwise find one
+        that is missing, or one too many.
         """
         active = self._active
 
-        if active is None or not active.scenario.stops_publishing_telemetry:
+        if active is None or active.scrape_outage is None:
             return None
 
-        timeline = self.timeline_now()
-
-        if timeline is None:
-            return None
-
-        return timeline.turned_on_at.replace(second=0, microsecond=0)
+        return active.scrape_outage.began_at.replace(second=0, microsecond=0)
 
     def observe_the_flags(self) -> list[FlagMoment]:
         """Reads both flags and records any that have moved since the last look.
@@ -1520,6 +1556,19 @@ class ScenarioState:
             # one, so there is never a recovery to hold the window open around.
             # A reset is what stops it, which is a person deciding to stop it.
             return None, utc_now()
+
+        if active is not None and active.scenario.stops_publishing_telemetry:
+            # No flag here either, and what ends it is the rollback the two
+            # below are ended by - settled the same way, and for a reason
+            # neither of them has. There is no level to watch come back down:
+            # what returns is the rows themselves, so the settling minutes are
+            # the only evidence the mitigation worked at all. A window frozen at
+            # the rollback would end on the last blind minute and show a shop
+            # still unseen.
+            if active.scrape_outage is None or active.scrape_outage.ended_at is None:
+                return None, utc_now()
+
+            return None, min(utc_now(), _settled_at(active.scrape_outage.ended_at))
 
         if active is not None and active.scenario.cache_is_misconfigured:
             # No flag here either. What ends this one is the rollback, settled
