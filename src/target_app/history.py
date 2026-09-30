@@ -80,15 +80,19 @@ def record_the_change_as_having_happened_at(
     and with the same justification: an audit log that cannot be written is right
     for a real provider and wrong for a demo, because a demo needs a past.
 
-    Every other scenario here gets its past by backdating its *telemetry* - the
+    Most scenarios here get their past by backdating their *telemetry* - the
     incident is recorded as having begun a few minutes before it was staged, and
-    the flag change in the provider is a few seconds newer than that. Nobody
-    notices, because nobody is comparing a minute to a minute. One scenario cannot
-    be staged that way: silent data corruption is found by a weekly job, so its
-    onset is a week old, and a flag change a week newer than the onset is not a
-    rounding error - it is the one piece of evidence naming the cause, sitting
-    outside every window a consumer would look in. So the change is recorded when
-    the change happened.
+    the flag change in the provider is that same few minutes newer. They can
+    afford it: the incident is dated by a departure the metrics show, and a
+    change landing either side of that minute still reads as the one that caused
+    it. Two cannot be staged that way. Silent data corruption is found by a
+    weekly job, so its onset is a week old, and a flag change a week newer than
+    the onset is not a rounding error - it is the one piece of evidence naming
+    the cause, sitting outside every window a consumer would look in. The
+    monitoring blind spot is dated by the last reading before the shop went
+    quiet, and there the order is the whole question: a change recorded after
+    the rows stop is a change that cannot have stopped them. So for those two
+    the change is recorded when the change happened.
 
     `since` is what keeps this to the staging toggles. A demo's log may hold
     changes from before this scenario was staged, and those happened when they

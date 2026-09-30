@@ -682,17 +682,24 @@ class ScenarioState:
         # The alternative is an audience watching a flat graph for five minutes
         # before anything is worth alerting on.
         onset = now - _how_long_ago_this_one_began(scenario)
-        # And the provider's log backdated with it, for the one scenario whose
-        # onset is days rather than minutes old.
+        # And the provider's log backdated with it, wherever a reader would
+        # otherwise see the change arrive after the incident it caused.
         #
-        # Every other scenario leaves this alone, and can: its flag change is
-        # recorded a few seconds after an onset a few minutes old, and nobody
-        # comparing a minute to a minute notices. Here the two would be a week
-        # apart, and the flag change is the only evidence naming the cause - so a
-        # consumer looking for what changed around the onset would find an empty
-        # window and the incident would be unanswerable. Recorded when it
-        # happened, which is also simply the truth.
-        if scenario.drifts_the_monthly_total:
+        # The onset above is moved back and the provider's own entry is not, so
+        # the two disagree by exactly that much in every scenario. Most can
+        # afford it: their incident is dated by a departure the metrics show, a
+        # change a few minutes either side of it still reads as the one that
+        # caused it, and no conclusion turns on the order.
+        #
+        # Two cannot. The drifting total is dated a week back by the shop's own
+        # check, so an unbackdated entry would sit a week from the onset and a
+        # consumer looking around the onset would find an empty window. The
+        # blind spot is dated by the last reading before the shop went quiet,
+        # and there the order is the whole question: an entry recorded after the
+        # rows stop says the flag cannot be what stopped them, which is both a
+        # sound reading and the opposite of what this scenario stages. Left
+        # alone, the fixture argues against its own incident.
+        if scenario.drifts_the_monthly_total or scenario.stops_publishing_telemetry:
             self._backdate_the_flag_history(
                 [self._flags_for(scenario).name], onset, now
             )
