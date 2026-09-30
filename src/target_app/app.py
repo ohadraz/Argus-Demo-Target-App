@@ -53,6 +53,7 @@ from target_app.settings import (
     get_unleash_settings,
     the_deployed_replica_count,
 )
+from target_app.single_flight import SingleFlight
 from target_app.state import ScenarioState
 
 # How much history the generated channels serve. Six hours, because that is
@@ -76,6 +77,11 @@ GENERATED_SPAN_MINUTES = 360
 # enough back to be outside the incident and plainly not its cause, close
 # enough to be in a history a responder is looking at.
 _A_PREVIOUS_DEPLOY_AGO = timedelta(hours=4)
+
+# What stops forty readers each rebuilding the same window - see
+# `_generated_minutes`. Keyed on the active scenario, so a reset that swaps one
+# for another is never served a window the scenario before it was building.
+_the_window_being_built: SingleFlight[list[GeneratedMinute]] = SingleFlight()
 
 
 def to_bucket_id(moment: datetime) -> str:
@@ -1773,12 +1779,38 @@ def _the_revision_history() -> list[ArgoCdRevisionHistory]:
 
 
 def _generated_minutes() -> list[GeneratedMinute]:
-    """The generated window, run up to whatever instant the scenario has
-    reached.
+    """The generated window, built once however many readers want it at once.
 
-    That instant is `now` while the incident is live and for a settling period
-    after it recovers, and stops moving afterwards - which is how a finished
-    scenario stops without being cleared.
+    Both telemetry endpoints come through here, and a flag change invalidates
+    every minute in the window at once - the memoised minutes are keyed on the
+    timeline, so a revert leaves nothing to reuse. Before this gate each reader
+    then rebuilt all 360 of them itself, GIL-serialised behind the others:
+    measured at 1.32s for one reader, 4.78s for eight and 15.38s for forty,
+    which is FastAPI's whole threadpool and past the read tier's ten-second
+    budget. The shop times out exactly when an incident is being watched,
+    because the polling that watches it is the load.
+
+    Shared by build rather than remembered by minute, which is what keeps the
+    reconciliation honest - see `single_flight`. The whole window goes through
+    the gate, partial minute and all: waiters get one that is at most a build
+    old against a verification loop that looks every ten seconds, where a window
+    remembered per minute would report a flag reverted at :30 as still on until
+    the minute turned.
+    """
+    return _the_window_being_built.do(state.active_scenario_id, _the_window_now)
+
+
+def _the_window_now() -> list[GeneratedMinute]:
+    """The window as it stands, read and generated from scratch.
+
+    Run up to whatever instant the scenario has reached: `now` while the
+    incident is live and for a settling period after it recovers, and frozen
+    afterwards - which is how a finished scenario stops without being cleared.
+
+    Everything the gate above is around, including the two provider reads. They
+    are the reason it cannot be a plain mutex: a mutex makes each waiter take
+    its own turn at the same work, and forty turns at two blocking reads with a
+    five-second timeout is a worse outage than the one it was put there to fix.
     """
     window = state.generated_window()
 
