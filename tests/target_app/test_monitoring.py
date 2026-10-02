@@ -533,3 +533,27 @@ def test_the_payload_says_the_list_is_a_snapshot() -> None:
 
     assert "what disagreed when this check ran" in summary
     assert "a later check will name more" in summary
+
+
+def test_a_cache_finding_reaches_the_receiver_and_not_only_the_payload() -> None:
+    # The gap this closes was a real one: every other case here builds a payload
+    # with `an_alert_for`, and `fire_alert` is what the endpoint actually calls.
+    # It accepted the reconciliation finding and the absent-since minute and not
+    # these three, so the shop's one way of paging about a stale cache raised a
+    # TypeError - past every test in this file, because none of them went through
+    # the sender.
+    post = an_accepting_receiver()
+
+    fire_alert(
+        STATE_DIVERGENCE,
+        settings=a_settings(),
+        post=post,
+        stale=a_cache_finding(90),
+        promoted_at=A_PROMOTION,
+        address_of=an_address_for
+    )
+    delivered = post.call_args.kwargs["json"]["alerts"][0]
+
+    assert delivered["labels"]["alertname"] == "CachedSpendTotalsAreStale"
+    assert delivered["annotations"]["stale_entry_keys"].startswith("io-shop:summary:")
+    assert delivered["annotations"]["onset"] == "2026-08-29T08:30:00Z"

@@ -494,9 +494,17 @@ def fire_alert(
     now: Callable[[], datetime] = utc_now,
     finding: Reconciliation | None = None,
     unheard_from_since: datetime | None = None,
+    stale: CacheReconciliation | None = None,
+    promoted_at: datetime | None = None,
+    address_of: AddressOf = str,
 ) -> dict[str, Any]:
     """Posts the firing alert to the configured webhook and returns what came
     back, so a caller can report the incident it started.
+
+    Every finding `an_alert_for` can build a payload from is a parameter here,
+    because this is the only way anything outside the process reaches it: the
+    check runs in-process and has no endpoint of its own, so a finding this
+    signature cannot carry is a finding nothing can ever page about.
 
     A non-2xx answer is a failure to deliver, not a delivered alert: something
     is listening at that URL but did not accept the alert, and reporting that as
@@ -508,7 +516,10 @@ def fire_alert(
     try:
         response = post(
             url,
-            json=an_alert_for(scenario_id, now(), finding, unheard_from_since),
+            json=an_alert_for(
+                scenario_id, now(), finding, unheard_from_since, stale,
+                promoted_at, address_of
+            ),
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
