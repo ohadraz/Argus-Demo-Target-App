@@ -27,6 +27,7 @@ from io_shop.summary_cache import (
     CacheEndpoint,
     CacheUnreachable,
     LookUpSummary,
+    SummaryEntry,
     cached_summary,
 )
 from io_shop.visits import record_visit
@@ -59,6 +60,13 @@ class RenderedPage:
     scenario: this is a page that *succeeded* while something underneath it was
     broken, so a reader sees it in the logs without seeing it in the error rate.
 
+    `cache_was_stale` is the same shape of thing for the quieter fault: the
+    cache answered, held an entry, and the entry did not cover the purchases the
+    shopper now has. The page is correct either way because the figure was
+    worked out instead of read - but a copy that has stopped keeping up with the
+    ledger shows in no error rate and no latency, so it is said here rather than
+    passed over in silence.
+
     `pricing_delay` is the same shape of thing for the same reason: the words of
     a pricing call that took longer than the shop thinks worth passing over. The
     page was correct and the shopper was charged the right amount; what a reader
@@ -71,6 +79,7 @@ class RenderedPage:
     failure: str | None
     served_from_cache: bool = False
     cache_failure: str | None = None
+    cache_was_stale: bool = False
     statement: MonthlyStatement | None = None
     basket_total_cents: int | None = None
     pricing_delay: str | None = None
@@ -120,7 +129,7 @@ def serve_account_page(account: Account,
     here that knows the calendar is whoever handled the request.
     """
     try:
-        figure_cents, from_cache, cache_failure = _the_figure_for(
+        figure_cents, from_cache, cache_failure, cache_was_stale = _the_figure_for(
             account, use_monthly_summary, look_up_summary, cache_endpoint,
             use_typical_spend
         )
@@ -142,6 +151,7 @@ def serve_account_page(account: Account,
                         failure=None,
                         served_from_cache=from_cache,
                         cache_failure=cache_failure,
+                        cache_was_stale=cache_was_stale,
                         statement=statement,
                         basket_total_cents=basket.total_cents,
                         pricing_delay=basket.slow_call)
@@ -167,15 +177,33 @@ def _the_statement_for(account: Account,
     return render_monthly_statement(account, period)
 
 
+def _covers_the_purchases(entry: SummaryEntry, account: Account) -> bool:
+    """Whether this entry was worked out over the purchases the shopper now has.
+
+    An entry carries the figure *and* the number of purchases behind it, and
+    that second field is what tells a frozen entry from a current one: a copy
+    that stopped being written to counts the purchases that existed when it
+    stopped, and the ledger has moved on since. It is the same test the shop's
+    own check applies - see `io_shop.cache_reconciliation`, where an entry short
+    of purchases is a copy that fell behind rather than a figure miscomputed.
+
+    Counted rather than summed, deliberately. The account already holds its
+    purchases, so this costs a length; adding their prices up would be the walk
+    of the whole history that the cache exists to save, and a cache that had to
+    recompute the answer to decide whether to use it would not be a cache.
+    """
+    return entry.items_counted == len(account.purchases)
+
+
 def _the_figure_for(
     account: Account,
     use_monthly_summary: bool,
     look_up_summary: LookUpSummary | None,
     cache_endpoint: CacheEndpoint | None,
     use_typical_spend: bool
-) -> tuple[int, bool, str | None]:
-    """The figure to show, whether it came from the cache, and what the cache
-    said if it could not be reached.
+) -> tuple[int, bool, str | None, bool]:
+    """The figure to show, whether it came from the cache, what the cache said
+    if it could not be reached, and whether what it held had fallen behind.
 
     The cache is asked first and is allowed to fail. Whatever it does - answers
     with a figure, answers with nothing, or cannot be reached at all - this
@@ -183,15 +211,25 @@ def _the_figure_for(
     fallback the whole scenario rests on: the page is correct either way, and
     the only thing the cache decides is how long getting here took.
 
+    An entry that does not cover the purchases behind it is passed over exactly
+    as a miss is. Nothing in this shop expires an entry, so an entry trusted on
+    sight is an entry trusted forever - and the moment whatever writes to the
+    cache stops keeping up with the ledger, every shopper holding one is served
+    a frozen figure until somebody empties the cache by hand. Recomputing costs
+    this one request the walk it was trying to avoid and puts the page back in
+    step with the purchases, which never moved.
+
     A cache failure is returned rather than raised onward, because it is not
-    this request's failure. The request succeeded.
+    this request's failure. The request succeeded. A stale entry is returned the
+    same way and for the same reason - the page is right, and the copy under it
+    is not, which is a fact worth a line even though nothing here failed.
     """
     if look_up_summary is None or cache_endpoint is None:
         return render_spend_summary(
             account,
             use_monthly_summary=use_monthly_summary,
             use_typical_spend=use_typical_spend
-        ), False, None
+        ), False, None, False
 
     cache_failure: str | None = None
 
@@ -200,14 +238,16 @@ def _the_figure_for(
     except CacheUnreachable as unreachable:
         found, cache_failure = None, str(unreachable)
 
-    if found is not None:
-        return found.amount_cents, True, cache_failure
+    was_stale = found is not None and not _covers_the_purchases(found, account)
+
+    if found is not None and not was_stale:
+        return found.amount_cents, True, cache_failure, False
 
     return render_spend_summary(
         account,
         use_monthly_summary=use_monthly_summary,
         use_typical_spend=use_typical_spend
-    ), False, cache_failure
+    ), False, cache_failure, was_stale
 
 
 def _where_it_was_raised(error: BaseException) -> str:
