@@ -195,17 +195,26 @@ FOUNDATIONAL_INTEGRITY = ScenarioFamily(
     id="foundational-integrity",
     name="Foundational integrity",
     taxonomy=(
-        "Silent data corruption (FM-26) and monitoring blind spot (FM-27), "
-        "inside foundational integrity - 12% of incidents"
+        "Silent data corruption (FM-26), monitoring blind spot (FM-27), "
+        "control-plane failure (FM-30) and state divergence (FM-31), inside "
+        "foundational integrity - 12% of incidents"
     ),
     blurb=(
-        "Nothing fails and nothing slows, and no rule watching a series will "
-        "ever fire. What separates these from every other family is that "
-        "something of the incident outlives its own cause: putting the change "
-        "back stops the next wrong total and repairs none of the ones before "
-        "it, and restores the shop's sight without restoring the minutes it "
-        "was blind for. One is a shop that wrote the wrong thing down; the "
-        "other is a shop that wrote nothing down at all."
+        "What is wrong here is the ground the rest of it stands on: what the "
+        "shop recorded, whether it recorded anything at all, or whether the "
+        "platform a fix has to travel through will act. In three of them "
+        "nothing fails and nothing slows, and no rule watching a series will "
+        "ever fire - and something of the incident outlives its own cause, so "
+        "putting the change back stops the next wrong total and repairs none of "
+        "the ones before it, restores the shop's sight without restoring the "
+        "minutes it was blind for, and discards the stale figures without "
+        "mending the replication that produced them. One is a shop that wrote "
+        "the wrong thing down; one wrote nothing down at all; one wrote "
+        "everything correctly and is reading it back from a copy that stopped "
+        "keeping up. The fourth is the only one here whose pages really do "
+        "fail, and what is foundational about it is not the shop: the platform "
+        "that every mitigation but one goes through has stopped answering, so "
+        "the incident is ordinary and the means of ending it are gone."
     ),
 )
 HALF_ROLLED_OUT = ScenarioFamily(
@@ -467,6 +476,34 @@ class Scenario:
     fix to the write path and a one-off repair of the data, and the repair is
     nobody's to run without being asked.
 
+    `cache_failed_over` stages the thirteenth generated kind, and the only one
+    where nothing the shop did is wrong at all. The summary cache lost its
+    primary and a standby that had stopped receiving updates three hours earlier
+    was promoted in its place. So the cache now serves, as current, the figures
+    it held when replication broke: a shopper who has bought anything since sees
+    a monthly total frozen before those purchases, printed beside the purchases
+    themselves. The ledger is untouched and correct, every page renders, nothing
+    throws and no series moves.
+
+    It is `drifts_the_monthly_total`'s mirror, and the pair is the reason both
+    are worth having. There the authoritative copy is the wrong one - the stored
+    total was mis-written and re-reading it will not help - and no mitigation can
+    repair it. Here the authority never moved and the *copy* is wrong, so there
+    is a complete fix and Argus can perform it: discard the entries the check
+    named, and the page works the figure out from the purchases as it does for
+    any shopper the cache has nothing for. Which copy is lying is the whole
+    diagnosis, and a reader who confuses the two reaches an action that repairs
+    nothing.
+
+    The set of wrong entries grows while the incident runs. An entry is stale
+    from the moment its shopper buys something after replication broke, and the
+    shop takes an order every `SOMEBODY_BUYS_EVERY` - so the count climbs, and
+    the keys an alert carries are what was stale when the check ran rather than
+    what is stale now. That is what a promoted stale replica really does, and it
+    is why discarding ends the incident without resolving it: the entries named
+    are gone and rebuild correctly, and nothing has repaired the replication that
+    let a lagging replica be promoted.
+
     `stops_publishing_telemetry` stages the twelfth generated kind, and the only
     one where what is wrong is the shop's own account of itself. The flag turns
     off telemetry publishing. The shop serves every request correctly, its logs
@@ -544,6 +581,7 @@ class Scenario:
     ships_the_statement: bool = False
     stops_publishing_telemetry: bool = False
     control_plane_is_down: bool = False
+    cache_failed_over: bool = False
     # The deploy a *generated* scenario stages, for the one whose cause is a
     # change rather than a state. An authored scenario carries its deploys on
     # its minutes; a generated one has no minutes to hang them on, and a
@@ -705,6 +743,15 @@ CONTROL_PLANE_UNREACHABLE = "control-plane-unreachable"
 # answer than it is there, and the reason for the name is different: nothing is
 # wrong with the shop at all, so there is no condition of the shop's to name.
 MONITORING_BLIND_SPOT = "monitoring-blind-spot"
+# Named for the event rather than for the state, which is the opposite choice to
+# `silent-data-corruption` beside it and made for the same reason. There the
+# state is named because a flag caused it and naming the cause would put the
+# answer in the id. Here the cause is the whole of what has to be worked out -
+# the figures are wrong, and whether that is a bad write, a bad read or a store
+# that fell behind is the question - so the id names the failover, which is the
+# one thing about this incident the shop's operator would have known at the time
+# and nobody investigating the page can see.
+STATE_DIVERGENCE = "cache-failed-over"
 
 SCENARIOS: dict[str, Scenario] = {
     FEATURE_FLAG_TOGGLE: Scenario(
@@ -1101,6 +1148,47 @@ SCENARIOS: dict[str, Scenario] = {
             path="deploy",
             initiated_by="kuki",
         ),
+    ),
+    STATE_DIVERGENCE: Scenario(
+        id=STATE_DIVERGENCE,
+        title="A cache serving figures the ledger has moved past",
+        description=(
+            "Io's account page reads a cache before it works out what a shopper "
+            "has spent this month, and recomputes from the purchase ledger "
+            "whenever the cache has nothing for them. That cache lost its "
+            "primary, and the standby promoted in its place had stopped "
+            "receiving updates three hours before the promotion. So it now "
+            "serves, as current, every figure it was holding when replication "
+            "broke. A shopper who has bought anything since reads a monthly "
+            "total that stops before those purchases - printed on the same page "
+            "as the purchases themselves, which are read from the ledger and are "
+            "correct. Nothing is wrong with the ledger, nothing is wrong with "
+            "the code, and no change went out: no flag moved, no revision "
+            "deployed, no process restarted. Every page returns 200. Nothing "
+            "throws, so the error rate never moves; nothing waits, so no "
+            "quantile moves; the cache is answering as fast as it ever did, "
+            "because serving a stale figure costs exactly what serving a fresh "
+            "one costs. The heap is flat, the shop is the right size and the "
+            "process has been up for hours. No rule fires and nobody is paged. "
+            "What finds it is a job of Io's own, which re-adds every shopper's "
+            "purchases and compares the result against what the cache holds: it "
+            "fires an alert carrying how many entries disagree out of how many "
+            "it checked, the widest gap, the keys of the entries themselves, and "
+            "two instants - the promotion, which is when the shop started "
+            "serving wrong figures, and the oldest purchase no stale figure "
+            "accounts for, which is when replication broke three hours earlier. "
+            "The count climbs while the incident runs, because an entry goes "
+            "stale the moment its shopper buys something. Discarding the named "
+            "entries is a complete fix for them: the cache holds nothing for "
+            "those shoppers, so their pages work the figure out from the ledger "
+            "and are right. It does not touch the promoted standby, which is "
+            "still the cache being served, or the replication that let a lagging "
+            "replica be promoted - so the condition can produce the same "
+            "incident again, and what is owed at the end is a change to how the "
+            "cache fails over."
+        ),
+        family=FOUNDATIONAL_INTEGRITY,
+        cache_failed_over=True,
     ),
     MONITORING_BLIND_SPOT: Scenario(
         id=MONITORING_BLIND_SPOT,

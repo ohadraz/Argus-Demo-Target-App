@@ -6,6 +6,7 @@ from unittest.mock import create_autospec
 import httpx
 import pytest
 
+from io_shop.cache_reconciliation import CacheReconciliation, StaleSummary
 from io_shop.spend_reconciliation import DisagreeingAccount, Reconciliation
 from target_app.monitoring import (
     AlertNotDelivered,
@@ -19,6 +20,7 @@ from target_app.scenarios import (
     MONITORING_BLIND_SPOT,
     RESOURCE_LEAK,
     SILENT_DATA_CORRUPTION,
+    STATE_DIVERGENCE,
 )
 
 """What the shop's monitoring promises about the alert it raises.
@@ -381,3 +383,153 @@ def test_a_finding_outranks_an_absence() -> None:
     )
 
     assert alert["alerts"][0]["labels"]["alertname"] == "SpendTotalsDoNotReconcile"
+
+
+# The cache's own finding. Built here rather than driven through the staging, so
+# a case can say exactly how many entries disagree and by how much.
+A_PROMOTION = datetime(2026, 8, 29, 8, 30, 0, tzinfo=UTC)
+A_PURCHASE_THE_COPIES_MISSED = datetime(2026, 8, 29, 5, 2, 17, tzinfo=UTC)
+
+
+def a_stale_entry(index: int,
+                  gap_cents: int = 1200,
+                  items_short: int = 1) -> StaleSummary:
+    return StaleSummary(
+        shopper_id=f"shopper-{index}",
+        gap_cents=gap_cents,
+        items_short=items_short,
+        oldest_missing_purchase_at=A_PURCHASE_THE_COPIES_MISSED
+    )
+
+
+def a_cache_finding(entries: int,
+                    checked: int = SOME_ACCOUNTS_CHECKED) -> CacheReconciliation:
+    return CacheReconciliation(
+        entries_checked=checked,
+        entries_that_disagree=tuple(a_stale_entry(index) for index in range(entries))
+    )
+
+
+def an_address_for(shopper_id: str) -> str:
+    return f"io-shop:summary:{shopper_id}"
+
+
+def test_a_population_of_stale_cached_figures_fires_its_own_rule() -> None:
+    # Its own rule and not the totals one. The same comparison against the
+    # authoritative copy says rewrite data; this one says discard a copy, and a
+    # responder who reads one name for the other reaches for the wrong repair.
+    alert = an_alert_for(
+        STATE_DIVERGENCE,
+        DONT_CARE_INSTANT,
+        stale=a_cache_finding(90),
+        promoted_at=A_PROMOTION,
+        address_of=an_address_for
+    )
+
+    assert alert["alerts"][0]["labels"]["alertname"] == "CachedSpendTotalsAreStale"
+
+
+def test_a_handful_of_stale_entries_is_not_worth_waking_anybody_for() -> None:
+    # One entry out of step is a cache doing what caches do between a write and
+    # an invalidation.
+    alert = an_alert_for(
+        STATE_DIVERGENCE,
+        DONT_CARE_INSTANT,
+        stale=a_cache_finding(2),
+        promoted_at=A_PROMOTION,
+        address_of=an_address_for
+    )
+
+    assert alert["alerts"][0]["labels"]["alertname"] != "CachedSpendTotalsAreStale"
+
+
+def test_the_onset_is_the_promotion_and_not_when_the_copies_froze() -> None:
+    # Two instants, and they are different events. Nobody was served a wrong
+    # figure until the promotion, however long the copy had been behind.
+    alert = an_alert_for(
+        STATE_DIVERGENCE,
+        DONT_CARE_INSTANT,
+        stale=a_cache_finding(90),
+        promoted_at=A_PROMOTION,
+        address_of=an_address_for
+    )
+    annotations = alert["alerts"][0]["annotations"]
+
+    assert annotations["onset"] == "2026-08-29T08:30:00Z"
+    assert annotations["divergence_began"] == "2026-08-29T05:02:17Z"
+
+
+def test_every_stale_entry_is_named_by_the_address_the_cache_stores_it_under() -> None:
+    # The one field here that is acted on rather than read, and the reason it is
+    # addresses rather than shopper ids: a consumer composing a key would be
+    # guessing at a format nobody published to it.
+    alert = an_alert_for(
+        STATE_DIVERGENCE,
+        DONT_CARE_INSTANT,
+        stale=a_cache_finding(90),
+        promoted_at=A_PROMOTION,
+        address_of=an_address_for
+    )
+    named = alert["alerts"][0]["annotations"]["stale_entry_keys"].split(",")
+
+    assert len(named) == 90
+    assert named[0] == "io-shop:summary:shopper-0"
+
+
+def test_the_count_and_the_list_check_each_other() -> None:
+    # A list of exact strings in a payload is a list that can arrive truncated,
+    # and a truncated one would read as a smaller incident rather than a fault.
+    alert = an_alert_for(
+        STATE_DIVERGENCE,
+        DONT_CARE_INSTANT,
+        stale=a_cache_finding(90),
+        promoted_at=A_PROMOTION,
+        address_of=an_address_for
+    )
+    annotations = alert["alerts"][0]["annotations"]
+
+    assert len(annotations["stale_entry_keys"].split(",")) == int(
+        annotations["stale_entries_found"]
+    )
+
+
+def test_the_summary_says_which_copy_is_wrong() -> None:
+    # The whole of what separates this from the alert beside it, and the whole of
+    # what decides the response.
+    alert = an_alert_for(
+        STATE_DIVERGENCE,
+        DONT_CARE_INSTANT,
+        stale=a_cache_finding(90),
+        promoted_at=A_PROMOTION,
+        address_of=an_address_for
+    )
+    summary = alert["alerts"][0]["annotations"]["summary"]
+
+    assert "90 of 400" in summary
+    assert "purchases are correct" in summary
+    assert "cached copies are behind" in summary
+
+
+def test_a_shop_with_nothing_stale_is_not_paged_about_its_cache() -> None:
+    alert = an_alert_for(FEATURE_FLAG_TOGGLE, DONT_CARE_INSTANT, stale=None)
+
+    assert alert["alerts"][0]["labels"]["alertname"] != "CachedSpendTotalsAreStale"
+    assert "stale_entry_keys" not in alert["alerts"][0]["annotations"]
+
+
+def test_the_payload_says_the_list_is_a_snapshot() -> None:
+    # Nothing is putting the copies right, so the set grows while the incident
+    # runs. A consumer that read the list as the whole of the fault would
+    # discard what was named and report the incident closed with figures still
+    # going stale behind it.
+    alert = an_alert_for(
+        STATE_DIVERGENCE,
+        DONT_CARE_INSTANT,
+        stale=a_cache_finding(90),
+        promoted_at=A_PROMOTION,
+        address_of=an_address_for
+    )
+    summary = alert["alerts"][0]["annotations"]["summary"]
+
+    assert "what disagreed when this check ran" in summary
+    assert "a later check will name more" in summary

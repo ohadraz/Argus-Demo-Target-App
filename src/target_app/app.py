@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from target_app import console
+from target_app.cache_entries import the_key_for
 from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.generator import (
     BASELINE_MEMORY_BYTES,
@@ -1395,7 +1396,18 @@ def raise_alert() -> AlertRaised:
             # the same reason: a monitoring stack notices a series has stopped
             # without being told which incident is on, and on a shop that is
             # publishing there is no such minute to report.
-            unheard_from_since=state.the_minute_the_shop_went_quiet()
+            unheard_from_since=state.the_minute_the_shop_went_quiet(),
+            # And what the same job found when it asked the cache in front of
+            # those totals the same question. Asked whatever is staged, as the
+            # two above are: a shop whose cache agrees reports nothing, and a
+            # shop with no cache has nothing to compare.
+            stale=state.the_cache_check_found(),
+            promoted_at=state.promoted_at,
+            # How this deployment's cache addresses an entry. Handed to the
+            # monitoring rather than composed there, because the key format
+            # belongs to whatever keeps the cache, and the alert is the only
+            # thing that can tell a consumer what to act on.
+            address_of=the_key_for
         )
     except AlertNotDelivered as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
@@ -1853,6 +1865,12 @@ def _the_window_now() -> list[GeneratedMinute]:
         provider_outage=active.provider_outage if active else None,
         cache_endpoint=active.cache_endpoint if active else None,
         cache_outage=active.cache_outage if active else None,
+        # When a lagging standby was put in front of shoppers, which reaches the
+        # window as one log line in that minute and nothing else. It is the only
+        # corroboration this incident has in a channel anybody collects: no
+        # series moves, because serving a stale figure costs what serving a fresh
+        # one costs, so without this the alert's onset is one party's word.
+        promoted_at=active.promoted_at if active else None,
         slow_rollout=_the_rollout_in(scenario, timeline),
         slow_deployment=active.deploy_slowdown if active else None,
         pricing_slowdown=active.pricing_slowdown if active else None,

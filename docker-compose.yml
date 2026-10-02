@@ -134,6 +134,47 @@ services:
            ON CONFLICT (environment, feature_name) DO NOTHING"
     restart: "no"
 
+  # The rendered-summary cache the account page reads before it works a
+  # shopper's spend figure out.
+  #
+  # Until one scenario needed what a cache *holds* rather than how fast it
+  # answers, there was nothing here: the cache was arithmetic in the generator
+  # and `deploy/values-production.yaml` named an address nothing ever dialled.
+  # One scenario now speaks the real protocol to this container, and every other
+  # scenario's cache stays computed - so no window, recording or graded fix
+  # moves.
+  cache:
+    image: redis:7-alpine
+    networks:
+      default:
+        aliases:
+          # The hostname the deployment names, resolving for the first time.
+          # `values-production.yaml` was written as a cluster's configuration
+          # would be, with a Kubernetes service's FQDN, and that stays untouched
+          # - the deployed address and the port a healthy shop dials differ by
+          # one digit on purpose, which is what `cache-misconfigured` stages. An
+          # alias makes the fiction real without editing the fact.
+          - cache.io-shop.svc.cluster.local
+    ports:
+      # Published because what discards an entry runs on the host rather than in
+      # this network, and reaches the cache the same way it reaches anything
+      # else: over a port, by an address it was configured with. 6379 is the
+      # port a working shop dials (`settings.LAST_KNOWN_GOOD_CACHE_PORT`), and
+      # the deployed 6380 is nowhere - a shop pointed at it is refused, which is
+      # the whole of that scenario's fault.
+      - "6379:6379"
+    # No volume, and that is the choice rather than an omission. Every other
+    # stateful service here keeps one so its data belongs to the compose project;
+    # a cache is the one store whose contents must *not* outlive the run that
+    # staged them. An entry surviving into the next run is a stale figure nobody
+    # staged, found by the integrity check, and reported as an incident of its
+    # own.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
   target-service:
     build:
       context: .
@@ -156,6 +197,14 @@ services:
       # is the recorded toggle the seed exists to avoid.
       fallback-flag-seed:
         condition: service_completed_successfully
+      # Not because the shop needs a cache - it recomputes when the cache holds
+      # nothing or cannot be reached, and that fallback is load-bearing rather
+      # than defensive. What must not race is the *staging*: seeding a scenario
+      # writes entries, and a seed arriving before the cache accepts
+      # connections would stage a shop with no stale figures in it and an alert
+      # describing some.
+      cache:
+        condition: service_healthy
     environment:
       UNLEASH_BASE_URL: "http://unleash:4242"
       UNLEASH_PROJECT: "default"

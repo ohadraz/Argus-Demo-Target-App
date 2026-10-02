@@ -10,9 +10,19 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
+from io_shop.cache_reconciliation import (
+    CacheReconciliation,
+    reconcile_cached_summaries
+)
 from io_shop.spend_reconciliation import Reconciliation
 from io_shop.summary_cache import CacheEndpoint
 from io_shop.visits import forget_every_visit
+from target_app.cache_entries import (
+    a_client_for,
+    discard_every_entry,
+    forget_every_cached_summary,
+    write_entries
+)
 from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.generator import (
     SETTLED_UPTIME,
@@ -33,7 +43,11 @@ from target_app.history import (
     forget_the_changes_to,
     record_the_change_as_having_happened_at,
 )
-from target_app.integrity import what_the_check_found
+from target_app.integrity import (
+    the_accounts_the_check_examines,
+    the_figures_the_promoted_standby_holds,
+    what_the_check_found
+)
 from target_app.scenarios import (
     FALLBACK_FLAG,
     FEATURE_FLAG,
@@ -245,6 +259,17 @@ class ActiveScenario:
     # is precisely the act of making the second agree with an earlier first.
     cache_outage: CacheOutage | None = None
     cache_endpoint: CacheEndpoint | None = None
+    # When a standby that had stopped receiving updates was promoted in front of
+    # shoppers, for the one scenario whose condition is what the cache holds
+    # rather than whether it answers. `None` everywhere else.
+    #
+    # The moment the shop began serving stale figures, and deliberately not the
+    # moment they froze - the entries stopped keeping up when replication broke,
+    # which is earlier and is the figure the stale share derives from. Two
+    # instants, because the incident's start and the fault's start are genuinely
+    # different here, and an alert carrying only one of them would leave a
+    # reader unable to say which.
+    promoted_at: datetime | None = None
     # The stretch the platform was not collecting the shop's metrics over,
     # for the one scenario whose condition is that there is no reading rather
     # than that a reading moved. `None` everywhere else, which leaves every
@@ -530,6 +555,45 @@ class ScenarioState:
                     began_at=now - timedelta(
                         minutes=get_scenario_settings().onset_backdate_minutes
                     )
+                ),
+            )
+            return
+
+        if scenario.cache_failed_over:
+            # No flag, no process, no deployment, and nothing unreachable: the
+            # cache is up, answering at the address the deployment names, and as
+            # fast as it ever was. What is staged is what it *holds* - the
+            # figures it had when replication broke, promoted in front of
+            # shoppers when the primary was lost.
+            #
+            # The only scenario that writes to a real store, and the one place
+            # that does the writing. Every other scenario's cache is arithmetic
+            # in the generator, which is what keeps their windows, recordings and
+            # graded fixes exactly where they were.
+            #
+            # Cleared before it is written so a restage is not staged on top of
+            # the last one's entries. A failure to reach the cache is raised
+            # rather than tolerated - unlike the reset, which tolerates it,
+            # because a scenario staged with no stale entries and an alert
+            # describing ninety of them is a fixture contradicting itself.
+            self._remember_where_the_flags_are_now()
+
+            with a_client_for(the_working_cache_endpoint()) as cache:
+                discard_every_entry(cache)
+                write_entries(cache, the_figures_the_promoted_standby_holds(now))
+
+            self._active = ActiveScenario(
+                scenario=scenario,
+                seeded_at=now,
+                process_started_at=now - SETTLED_UPTIME,
+                cache_endpoint=the_working_cache_endpoint(),
+                # When shoppers started reading stale figures, which is not when
+                # the figures froze. Backdated like every other onset so the
+                # incident is diagnosable the instant this returns; the entries
+                # froze three hours before the check runs regardless, so the
+                # share that disagrees does not move with this.
+                promoted_at=now - timedelta(
+                    minutes=get_scenario_settings().onset_backdate_minutes
                 ),
             )
             return
@@ -1184,6 +1248,45 @@ class ScenarioState:
         """
         return what_the_check_found(self._the_drifting_write_path(), utc_now())
 
+    def the_cache_check_found(self) -> CacheReconciliation | None:
+        """What the same job reports about the cache in front of those totals.
+
+        `None` for every scenario but one, and that is what keeps every other
+        shop from being asked a question it has no cache to answer. Where a
+        scenario does stage a cache without staging a failover, there is nothing
+        frozen in it and the comparison would find every entry in agreement -
+        but asking at all would mean reading a store over the network on the way
+        to every alert, for an answer known in advance.
+
+        Worked out at the moment it is asked, as the totals check is, and for a
+        sharper reason: this finding *grows*. An entry goes stale as soon as its
+        shopper buys again, so the count a reader sees is the count when they
+        asked - and an alert raised twice carries two different lists, both
+        correct when they were made.
+
+        The entries themselves are read from the staging rather than from the
+        store. What the cache holds and what was written into it are the same
+        thing for the whole of this scenario, because nothing rewrites an entry -
+        and a check that read the store back would report Argus's own discard as
+        a shrinking incident while the walk was still running.
+        """
+        active = self._active
+
+        if active is None or not active.scenario.cache_failed_over:
+            return None
+
+        now = utc_now()
+
+        return reconcile_cached_summaries(
+            the_accounts_the_check_examines(None, now),
+            the_figures_the_promoted_standby_holds(now)
+        )
+
+    @property
+    def promoted_at(self) -> datetime | None:
+        """When a lagging standby was put in front of shoppers, where one was."""
+        return self._active.promoted_at if self._active else None
+
     def _the_drifting_write_path(self) -> FlagTimeline | None:
         """The stretch the cheaper write path has been live over, or `None`.
 
@@ -1313,6 +1416,19 @@ class ScenarioState:
         # reset that left it behind would hand the next run a heap it did not
         # start.
         forget_every_visit()
+        # And whatever the shop left in its summary cache, for the same reason
+        # and with a sharper consequence. A staged entry is a figure that
+        # disagrees with the purchase ledger on purpose; one surviving a reset is
+        # the same figure with nothing staged to explain it, and the next run's
+        # integrity check reports it as an incident of its own - on a shop
+        # nobody broke, in a scenario that never wrote to the cache at all.
+        #
+        # The whole keyspace rather than the active scenario's keys, because an
+        # abandoned run is exactly how an entry outlives the record of who wrote
+        # it. A cache that cannot be reached is left alone and that is not a
+        # failure: the shop treats an unreachable cache as an ordinary day, and
+        # one that never answered is holding nothing this reset could clear.
+        forget_every_cached_summary()
         # The platform's arrangement with the application goes back too. A
         # rollback suspends automated sync and a withdrawal puts it back, but a
         # run abandoned between the two leaves it off - and the next scenario

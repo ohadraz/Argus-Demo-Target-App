@@ -2193,3 +2193,87 @@ def test_a_scenario_that_is_not_this_one_publishes_every_minute() -> None:
     )
 
     assert all(minute.published for minute in ordinary)
+
+
+def test_a_promoted_stale_cache_leaves_every_judged_series_flat() -> None:
+    """The incident no rule can fire on: nothing departs, in any series.
+
+    Halves rather than extremes, because what a detector looks for is a level
+    that moved and not a minute that was noisy. A window whose second half sits
+    where its first half sat has no onset in it to find, which is the whole
+    claim this scenario rests on - and the reason the shop has to tell anybody
+    about it at all.
+    """
+    now = datetime(2026, 3, 11, 12, 0, tzinfo=UTC)
+    # Exactly what staging this scenario puts on the active record: a cache that
+    # is up and answering, a process that has been up for hours, and nothing
+    # else - no flag, no outage, no deployment, no leak.
+    minutes = generate(
+        None,
+        now,
+        60,
+        process_started_at=now - timedelta(hours=6),
+        cache_endpoint=CacheEndpoint(host="cache.io-shop.svc.cluster.local", port=6379)
+    )[:-1]
+    half = len(minutes) // 2
+
+    for series in (
+        "error_rate", "p50_ms", "p95_ms", "p99_ms",
+        "memory_used_bytes", "cpu_used_cores", "cache_hit_ratio"
+    ):
+        before = [getattr(minute, series) for minute in minutes[:half]]
+        after = [getattr(minute, series) for minute in minutes[half:]]
+        settled = sum(before) / len(before)
+        later = sum(after) / len(after)
+
+        assert abs(later - settled) <= max(settled, later) * 0.25, (
+            f"{series} moved across the window - {settled} then {later} - so this "
+            f"incident would be visible to a rule watching a series, and it must "
+            f"not be"
+        )
+
+
+def test_a_promotion_is_said_once_in_the_minute_it_happened() -> None:
+    """The only corroboration this incident has in a channel anybody collects.
+
+    No series moves when a lagging replica is promoted - serving a stale figure
+    costs exactly what serving a fresh one costs - so without this line the
+    alert's stated onset is one party's word for itself. The shop writes it for
+    its own reasons, the way any cache client reports losing a server, and it
+    knows nothing about the figures being wrong.
+    """
+    now = datetime(2026, 3, 11, 12, 0, tzinfo=UTC)
+    promoted_at = now - timedelta(minutes=12)
+    minutes = generate(
+        None,
+        now,
+        30,
+        process_started_at=now - timedelta(hours=6),
+        cache_endpoint=CacheEndpoint(host="cache.io-shop.svc.cluster.local", port=6379),
+        promoted_at=promoted_at
+    )
+    said = [
+        (minute.minute_id, line)
+        for minute in minutes
+        for line in minute.log_lines
+        if "reconnected to a new primary" in line
+    ]
+
+    assert len(said) == 1, "a failover happens once and is reported once"
+    assert said[0][0] == promoted_at.strftime(AS_A_MINUTE_ID)
+
+
+def test_a_shop_whose_cache_never_failed_over_says_nothing_about_a_primary() -> None:
+    now = datetime(2026, 3, 11, 12, 0, tzinfo=UTC)
+    minutes = generate(
+        None,
+        now,
+        30,
+        process_started_at=now - timedelta(hours=6),
+        cache_endpoint=CacheEndpoint(host="cache.io-shop.svc.cluster.local", port=6379)
+    )
+
+    assert not [
+        line for minute in minutes for line in minute.log_lines
+        if "new primary" in line
+    ]

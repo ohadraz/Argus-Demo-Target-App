@@ -11,9 +11,15 @@ from target_app.generator import FlagTimeline
 from target_app.integrity import (
     SOMEBODY_BUYS_EVERY,
     THE_CHECK_RUNS_EVERY,
+    THE_STANDBY_FELL_BEHIND,
     the_accounts_the_check_examines,
+    the_figures_the_promoted_standby_holds,
     what_the_check_found,
 )
+
+# One instant for the failover claims below, so the arithmetic in each is about
+# the staging rather than about when the suite happened to run.
+A_FIXED_INSTANT = datetime(2026, 3, 11, 12, 0, tzinfo=UTC)
 
 """The shop's data-integrity job, and the fault it is here to find.
 
@@ -226,3 +232,64 @@ def test_the_lifetime_figure_beside_it_is_still_right() -> None:
         sum(purchase.price_cents for purchase in account.purchases)
         // len(account.purchases)
     )
+
+
+def test_the_promoted_standby_holds_an_entry_for_every_account_checked() -> None:
+    # The stale ones have to be a subset. An account that has bought nothing
+    # since replication broke is holding a figure that is still right, and a
+    # finding that reported the whole cache wrong would be describing a
+    # different incident.
+    held = the_figures_the_promoted_standby_holds(A_FIXED_INSTANT)
+
+    assert len(held) == len(the_accounts_the_check_examines(None, A_FIXED_INSTANT))
+
+
+def test_the_stale_share_is_the_lag_divided_by_how_often_the_shop_sells() -> None:
+    # The arithmetic a reader checks the alert against, and the reason the lag
+    # is three hours rather than a week: at a week every account has bought and
+    # the share saturates, which makes discarding the named entries
+    # indistinguishable from discarding the cache.
+    held = the_figures_the_promoted_standby_holds(A_FIXED_INSTANT)
+    live = {
+        account.shopper_id: account
+        for account in the_accounts_the_check_examines(None, A_FIXED_INSTANT)
+    }
+    stale = [
+        shopper for shopper, entry in held.items()
+        if entry.amount_cents != live[shopper].total_this_month_cents
+    ]
+
+    assert len(stale) == THE_STANDBY_FELL_BEHIND // SOMEBODY_BUYS_EVERY
+
+
+def test_a_stale_entry_is_short_the_purchases_made_since_replication_broke() -> None:
+    # Not a corrupted figure and not an invented one: this shop's own correct
+    # answer, from earlier. So the gap is exactly what was bought in between.
+    broke_at = A_FIXED_INSTANT - THE_STANDBY_FELL_BEHIND
+    held = the_figures_the_promoted_standby_holds(A_FIXED_INSTANT)
+
+    for account in the_accounts_the_check_examines(None, A_FIXED_INSTANT):
+        since = [
+            purchase for purchase in account.purchases
+            if purchase.recorded_at > broke_at
+        ]
+        entry = held[account.shopper_id]
+
+        assert account.total_this_month_cents - entry.amount_cents == sum(
+            purchase.price_cents for purchase in since
+        )
+        assert len(account.purchases) - entry.items_counted == len(since)
+
+
+def test_an_account_that_has_not_bought_since_still_agrees() -> None:
+    broke_at = A_FIXED_INSTANT - THE_STANDBY_FELL_BEHIND
+    held = the_figures_the_promoted_standby_holds(A_FIXED_INSTANT)
+    quiet = [
+        account for account in the_accounts_the_check_examines(None, A_FIXED_INSTANT)
+        if all(purchase.recorded_at <= broke_at for purchase in account.purchases)
+    ]
+
+    assert quiet, "the staging needs accounts on both sides of the break"
+
+    for account in quiet:
+        assert held[account.shopper_id].amount_cents == account.total_this_month_cents

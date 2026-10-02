@@ -15,7 +15,7 @@ of the shop.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from functools import lru_cache
 from typing import Any
@@ -24,6 +24,7 @@ import httpx
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from io_shop.cache_reconciliation import CacheReconciliation
 from io_shop.spend_reconciliation import Reconciliation
 from target_app.integrity import THE_CHECK_RUNS_EVERY
 from target_app.scenarios import (
@@ -68,6 +69,15 @@ _TOTALS_DO_NOT_RECONCILE = "SpendTotalsDoNotReconcile"
 # stack has this rule and it is the last shape of alert this shop could not
 # raise.
 _METRICS_ABSENT = "MetricsAbsent"
+# The third rule here not written against a value, and the one that fires on a
+# disagreement between two copies rather than on either copy alone. Named for the
+# cached figures rather than for the totals, because `SpendTotalsDoNotReconcile`
+# above is the same comparison made against the authoritative copy and the two
+# must never be confused: there the stored figure is wrong and rewriting data is
+# the only repair, here the stored figure is right and the copy in front of it is
+# stale. A responder who reads one name for the other reaches for the wrong one
+# of those.
+_CACHED_TOTALS_ARE_STALE = "CachedSpendTotalsAreStale"
 
 # How long the shop has to go unheard-from before that is an incident rather
 # than a gap.
@@ -89,6 +99,16 @@ _LONG_ENOUGH_TO_BE_AN_ABSENCE = timedelta(minutes=2)
 # real shop lives with and far below what this scenario stages.
 _ENOUGH_TOTALS_TO_PAGE = 25
 
+# And how many stale cached figures the shop pages somebody for.
+#
+# Its own figure rather than the one above reused, because the two are findings
+# about different things and a shop could reasonably tolerate different amounts
+# of each. The same reasoning sets it: one entry out of step is a cache doing
+# what caches do between a write and an invalidation, and what is worth waking
+# somebody for is a population of them - which is what says the thing feeding the
+# cache is wrong rather than one entry being briefly behind.
+_ENOUGH_STALE_ENTRIES_TO_PAGE = 25
+
 # Which annotation carries the minute the writing went wrong.
 #
 # Its own annotation and not a sentence to be parsed out of the summary, because
@@ -98,6 +118,30 @@ _ENOUGH_TOTALS_TO_PAGE = 25
 # be sharing one field when one of them needs a timestamp.
 _THE_ONSET_ANNOTATION = "onset"
 _THE_SUMMARY_ANNOTATION = "summary"
+
+# Which annotation carries the addresses of the entries found stale, and which
+# carries the instant they stopped keeping up.
+#
+# The addresses are here because the job had to address the cache to compare it,
+# so it already holds them, and because how an entry is addressed is the shop's
+# own business - a consumer that composed one from a shopper id would be
+# guessing at a format nobody published to it. Comma-separated in one annotation
+# rather than one annotation each: an alert envelope carries a flat map of
+# strings, and a consumer reading `entry.1`, `entry.2` would be parsing a list
+# out of key names.
+#
+# They are also the one field here that is acted on rather than read. Everything
+# else in this payload describes the incident; this says exactly which entries
+# are wrong, and anything acting on fewer or more than these is acting beyond
+# what the check established.
+_THE_STALE_ENTRIES_ANNOTATION = "stale_entry_keys"
+_THE_STALE_COUNT_ANNOTATION = "stale_entries_found"
+# And when the copies stopped keeping up, which is not the onset. The onset is
+# when shoppers began reading stale figures; this is when the figures froze, and
+# it is earlier. Carried separately because a reader given one of them cannot
+# derive the other, and because the gap between them is itself the finding - a
+# copy that had been behind for hours before anybody was served from it.
+_THE_DIVERGENCE_BEGAN_ANNOTATION = "divergence_began"
 
 # What a hundredth of the shop's currency is called when a figure is said in
 # whole units. The gap is carried in cents everywhere else, because that is what a
@@ -190,10 +234,16 @@ class AlertNotDelivered(Exception):
     """
 
 
+AddressOf = Callable[[str], str]
+
+
 def an_alert_for(scenario_id: str | None,
                  at: datetime,
                  finding: Reconciliation | None = None,
-                 unheard_from_since: datetime | None = None) -> dict[str, Any]:
+                 unheard_from_since: datetime | None = None,
+                 stale: CacheReconciliation | None = None,
+                 promoted_at: datetime | None = None,
+                 address_of: AddressOf = str) -> dict[str, Any]:
     """The firing alert, in Grafana Alertmanager's own webhook shape.
 
     Deliberately the vendor's shape, field nesting included: the consumer parses
@@ -213,6 +263,18 @@ def an_alert_for(scenario_id: str | None,
     finding, it is ignored entirely when absent, which is what keeps a shop that
     is reporting from being paged about silence.
 
+    `stale` is what the same job found when it asked the cache the same question,
+    and `address_of` spells a shopper's entry the way the cache stores it. The
+    spelling is handed in rather than composed here: this module reports what was
+    found, and how an entry is addressed belongs to whatever keeps the cache. The
+    default spells a shopper as itself, which is what a shop with no cache in
+    front of its totals would say.
+
+    `promoted_at` is when the stale copy was put in front of shoppers, and it is
+    the onset of that incident. The finding's own oldest missing purchase is
+    earlier and is not the onset - it is when the copy stopped keeping up, which
+    is a fact about the copy rather than about the incident.
+
     It is checked against the dwell rather than taken on trust. A rule of this
     kind that fired the moment a sample was late would fire most days, so an
     absence younger than `_LONG_ENOUGH_TO_BE_AN_ABSENCE` is a miss and not an
@@ -227,6 +289,36 @@ def an_alert_for(scenario_id: str | None,
         return _one_firing_alert(
             _TOTALS_DO_NOT_RECONCILE, _what_the_check_found_said(finding), at,
             onset=finding.oldest_affected_purchase_at
+        )
+
+    if stale is not None and len(stale.entries_that_disagree) >= (
+        _ENOUGH_STALE_ENTRIES_TO_PAGE
+    ):
+        return _one_firing_alert(
+            _CACHED_TOTALS_ARE_STALE,
+            _what_the_cache_check_found_said(stale, promoted_at),
+            at,
+            # The promotion, which is when shoppers began reading stale figures.
+            # Deliberately not the oldest missing purchase, which is earlier and
+            # is when the copies stopped keeping up - that goes in its own
+            # annotation below. An onset is when the incident began, and nobody
+            # was served a wrong figure until the promotion.
+            onset=promoted_at,
+            also={
+                _THE_STALE_ENTRIES_ANNOTATION: ",".join(
+                    address_of(entry.shopper_id)
+                    for entry in stale.entries_that_disagree
+                ),
+                _THE_STALE_COUNT_ANNOTATION: str(len(stale.entries_that_disagree)),
+                **(
+                    {
+                        _THE_DIVERGENCE_BEGAN_ANNOTATION:
+                            stale.oldest_missing_purchase_at.strftime(TIMESTAMP_FORMAT)
+                    }
+                    if stale.oldest_missing_purchase_at is not None
+                    else {}
+                ),
+            }
         )
 
     if (
@@ -275,7 +367,8 @@ def _what_the_silence_said(unheard_from_since: datetime, at: datetime) -> str:
 def _one_firing_alert(alertname: str,
                       summary: str,
                       at: datetime,
-                      onset: datetime | None = None) -> dict[str, Any]:
+                      onset: datetime | None = None,
+                      also: Mapping[str, str] | None = None) -> dict[str, Any]:
     """One firing alert in the vendor's envelope, with whatever it can say.
 
     `startsAt` is when the rule fired, always, for every alert this shop sends.
@@ -290,6 +383,11 @@ def _one_firing_alert(alertname: str,
         # finding. A consumer reading an onset it can parse and act on must not
         # also have to decide whether a blank one means "now".
         annotations[_THE_ONSET_ANNOTATION] = onset.strftime(TIMESTAMP_FORMAT)
+
+    # Whatever else this particular rule has to say that a consumer acts on
+    # rather than reads. Absent for every rule that has nothing of the kind,
+    # which is all of them but one.
+    annotations.update(also or {})
 
     return {
         "status": "firing",
@@ -336,6 +434,56 @@ def _what_the_check_found_said(finding: Reconciliation) -> str:
         f"{finding.largest_gap_cents / _CENTS_IN_A_UNIT:,.2f}, and {since}. "
         f"Found by the spend-integrity check, which runs every "
         f"{THE_CHECK_RUNS_EVERY.days} days, so the fault is up to that old."
+    )
+
+
+def _what_the_cache_check_found_said(stale: CacheReconciliation,
+                                     promoted_at: datetime | None) -> str:
+    """The cache finding in the words a responder is paged with.
+
+    Says which copy is wrong, in as many words, because that is the whole of what
+    separates this from the alert beside it and the whole of what decides the
+    response. A responder who reads "totals do not reconcile" and acts on it
+    repairs data; one who reads this discards a copy and leaves the data alone.
+
+    Two instants, said as two, with the gap between them spelled out. A reader
+    given only the onset would think the figures started being wrong when
+    shoppers started seeing them, and would look for a change at that minute -
+    where the thing that actually went wrong happened hours earlier and left no
+    mark on any series.
+
+    Money in whole units to two places, as the check beside it does, because a
+    person reads this. The cents stay cents in the annotations a consumer reads.
+    """
+    missing_since = stale.oldest_missing_purchase_at
+    behind = (
+        f"the oldest purchase none of them account for was recorded at "
+        f"{missing_since.strftime(TIMESTAMP_FORMAT)}, which is when the copies "
+        f"stopped keeping up"
+        if missing_since is not None
+        else "nothing in the purchase histories says when the copies stopped "
+             "keeping up"
+    )
+    served = (
+        f", and they were being served from {promoted_at.strftime(TIMESTAMP_FORMAT)}"
+        if promoted_at is not None
+        else ""
+    )
+
+    most = stale.largest_items_short
+    purchases = "purchase" if most == 1 else "purchases"
+
+    return (
+        f"{len(stale.entries_that_disagree)} of {stale.entries_checked} cached "
+        f"spend figures disagree with the purchases behind them. The purchases "
+        f"are correct and the cached copies are behind: the widest gap is "
+        f"{stale.largest_gap_cents / _CENTS_IN_A_UNIT:,.2f}, the most any one "
+        f"figure is missing is {most} {purchases}, and {behind}{served}. "
+        f"Discarding the entries listed will send those pages back to the "
+        f"purchase ledger, which never moved. The list is what disagreed when "
+        f"this check ran: nothing is putting the copies right, so a figure goes "
+        f"stale as soon as its shopper buys again and a later check will name "
+        f"more."
     )
 
 

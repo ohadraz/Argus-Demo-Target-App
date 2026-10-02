@@ -37,6 +37,7 @@ from datetime import UTC, datetime, timedelta
 from io_shop.accounts import Account, Purchase
 from io_shop.purchase_ledger import record_a_purchase
 from io_shop.spend_reconciliation import Reconciliation, reconcile_monthly_totals
+from io_shop.summary_cache import SummaryEntry
 from target_app.generator import FlagTimeline
 
 # How often the shop re-adds its shoppers' purchases and compares the sum to the
@@ -96,6 +97,83 @@ _THE_GRID_BEGINS = datetime(2026, 1, 1, tzinfo=UTC)
 # largest gap has to be the size of something somebody could have bought.
 _CHEAPEST_PURCHASE_CENTS = 500
 _DEAREST_PURCHASE_CENTS = 9000
+
+
+# How long ago replication to the standby broke, counted from the instant the
+# check is run rather than from the failover.
+#
+# Two instants matter in this incident and this is the earlier one. Replication
+# broke, so the standby stopped receiving updates and its entries froze; some
+# time later the primary was lost and that frozen copy was promoted, which is
+# when shoppers began reading the stale figures. The entries hold what they held
+# at the break whichever minute the promotion happened in, so this is the figure
+# the stale share is derived from and the promotion is not.
+#
+# Three hours, and the figure is answerable rather than arbitrary. The shop takes
+# an order every `SOMEBODY_BUYS_EVERY`, so the accounts holding a frozen figure
+# are the ones that have bought since replication broke: three hours over two
+# minutes is ninety of the two hundred and forty the check examines, which a
+# reader can divide out from constants this module already publishes.
+#
+# It is deliberately not a week. A week is 10,080 minutes, which saturates - every
+# account has bought, every entry is stale, and discarding the entries the
+# evidence named becomes indistinguishable from discarding the whole cache. The
+# value of naming a set is that it is narrower than the store, and at a hundred
+# per cent it is not.
+THE_STANDBY_FELL_BEHIND = timedelta(hours=3)
+
+
+def the_figures_the_promoted_standby_holds(now: datetime) -> dict[str, SummaryEntry]:
+    """What the cache serves after the failover, per shopper.
+
+    A standby that stopped receiving updates holds what it had at that moment, so
+    a stale entry is not a corrupted figure or an invented one - it is *this
+    shop's own correct answer, from earlier*. Which is why it is worked out by
+    asking the same question at the earlier instant rather than by perturbing the
+    current one: an entry nobody could have computed is a fault no promotion
+    produces, and a reader checking the arithmetic would find a number the ledger
+    never held.
+
+    Every active account gets an entry, which is what makes the stale ones a
+    subset rather than the whole. An account that has bought nothing since
+    replication broke is holding a figure that is still right, and the check has
+    to find those in agreement or the finding would say the cache is entirely
+    wrong when it is not.
+
+    The entries are what the cache holds *now* and do not change as the incident
+    runs - nothing rewrites them, because a promoted standby has no one feeding
+    it and this fixture has no cache write path. What changes is how many of them
+    disagree, since an account goes stale the moment it buys again.
+
+    Worked out from each shopper's real purchases, counting only those recorded
+    at or before the break, rather than by asking what the check would have found
+    three hours ago. The two are not the same question here and the difference is
+    the fixture's doing: an account is derived over a reach-back window that
+    slides with the instant asked for, and its prices come from a sequence seeded
+    on the shopper, so a window that drops its oldest purchase and gains a newer
+    one returns the very same total. Asked the earlier question, almost every
+    account agrees with itself and there is no incident to find. Asked this one,
+    a shopper who has bought since the break is short exactly those purchases,
+    which is what a frozen copy actually holds.
+    """
+    broke_at = now - THE_STANDBY_FELL_BEHIND
+
+    return {
+        account.shopper_id: _the_total_as_it_stood_at(account, broke_at)
+        for account in the_accounts_the_check_examines(None, now)
+    }
+
+
+def _the_total_as_it_stood_at(account: Account, moment: datetime) -> SummaryEntry:
+    """This shopper's month, counting only what had been bought by `moment`."""
+    counted = [
+        purchase for purchase in account.purchases if purchase.recorded_at <= moment
+    ]
+
+    return SummaryEntry(
+        amount_cents=sum(purchase.price_cents for purchase in counted),
+        items_counted=len(counted)
+    )
 
 
 def what_the_check_found(drifting_write_path: FlagTimeline | None,

@@ -16,6 +16,16 @@ dependencies = [
     # through uvicorn's extras today, and a direct import of a dependency
     # nobody asked for is one that disappears when an unrelated extra changes.
     "pyyaml>=6.0",
+    # Speaking to the summary cache, for the one scenario that stages what the
+    # cache *holds* rather than how fast it answers. Every other scenario's
+    # cache is still arithmetic, so this is reached on one staged path and
+    # nowhere else.
+    #
+    # Without `hiredis`. That extra is a C parser and buys throughput this
+    # fixture has no use for, and a wheel carrying a compiled extension is one
+    # Windows Smart App Control has refused before - at the cost of a whole
+    # stack, for a speed-up nothing here would notice.
+    "redis>=5.0",
     "uvicorn[standard]>=0.30",
 ]
 

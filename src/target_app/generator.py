@@ -1056,7 +1056,8 @@ def generate(timeline: FlagTimeline | None,
              autoscaler: LiveAutoscaler | None = None,
              ships_the_statement: bool = False,
              ships_the_incremental_write: bool = False,
-             scrape_outage: ScrapeOutage | None = None) -> list[GeneratedMinute]:
+             scrape_outage: ScrapeOutage | None = None,
+             promoted_at: datetime | None = None) -> list[GeneratedMinute]:
     """Every minute from `span_minutes` ago up to and including the one in
     progress, once any of it has happened.
 
@@ -1239,6 +1240,7 @@ def generate(timeline: FlagTimeline | None,
             ships_the_statement=ships_the_statement,
             ships_the_incremental_write=ships_the_incremental_write,
             scrape_outage=scrape_outage,
+            promoted_at=promoted_at,
         )
         for offset in range(span_minutes, 0, -1)
     ]
@@ -1274,6 +1276,7 @@ def generate(timeline: FlagTimeline | None,
                 ships_the_statement=ships_the_statement,
                 ships_the_incremental_write=ships_the_incremental_write,
                 scrape_outage=scrape_outage,
+                promoted_at=promoted_at,
             )
         )
 
@@ -1311,6 +1314,7 @@ def _a_whole_minute(
     ships_the_statement: bool = False,
     ships_the_incremental_write: bool = False,
     scrape_outage: ScrapeOutage | None = None,
+    promoted_at: datetime | None = None,
 ) -> GeneratedMinute:
     """One minute that has finished, generated once and then remembered.
 
@@ -1359,6 +1363,7 @@ def _a_whole_minute(
         ships_the_statement=ships_the_statement,
         ships_the_incremental_write=ships_the_incremental_write,
         scrape_outage=scrape_outage,
+        promoted_at=promoted_at,
     )
 
 
@@ -1385,6 +1390,7 @@ def _generate_minute(
     ships_the_statement: bool = False,
     ships_the_incremental_write: bool = False,
     scrape_outage: ScrapeOutage | None = None,
+    promoted_at: datetime | None = None,
 ) -> GeneratedMinute:
     minute_id = minute.strftime(TIMESTAMP_FORMAT)
     entropy = random.Random(minute_id)
@@ -1637,7 +1643,7 @@ def _generate_minute(
                 decoy_flag, decoy_timeline,
             ),
             heap=_heap_lines_for(minute_id, minute, heap_bytes, pressure, lifetime),
-            cache=_cache_lines_for(minute_id, outcomes),
+            cache=_cache_lines_for(minute_id, outcomes, minute, promoted_at),
             pricing=_pricing_lines_for(minute_id, outcomes),
         ),
         # Whole minutes, and deliberately not the share-of-minute arithmetic the
@@ -1681,7 +1687,10 @@ def _how_much_the_cache_carried(outcomes: list[_ServedPage]) -> float | None:
     )
 
 
-def _cache_lines_for(minute_id: str, outcomes: list[_ServedPage]) -> tuple[str, ...]:
+def _cache_lines_for(minute_id: str,
+                     outcomes: list[_ServedPage],
+                     minute: datetime | None = None,
+                     promoted_at: datetime | None = None) -> tuple[str, ...]:
     """What the shop said about its cache this minute.
 
     Quiet while it is answering with things the shop can read, for the reason
@@ -1703,6 +1712,26 @@ def _cache_lines_for(minute_id: str, outcomes: list[_ServedPage]) -> tuple[str, 
         served.cache_failure for served in outcomes if served.cache_failure is not None
     ]
     said: list[str] = []
+
+    # A third thing that can be said about a cache, and the only one here that is
+    # not a failure of it. The client lost its connection and reconnected, which
+    # is what every cache client logs when a server goes away and another answers
+    # in its place. Said once, in the minute it happened.
+    #
+    # It is the whole of what corroborates this incident's onset in a channel
+    # anybody already collects. Nothing else about a promoted stale replica
+    # reaches the telemetry at all - the series do not move, because serving a
+    # figure that is wrong costs exactly what serving a right one costs - so a
+    # reader who has the alert's stated onset and nothing else has one party's
+    # word for it. This is the shop's own account of the same instant, written
+    # for its own reasons and carrying no idea that the figures are now wrong.
+    if promoted_at is not None and minute is not None and (
+        minute <= promoted_at < minute + timedelta(minutes=1)
+    ):
+        said.append(
+            f"{minute_id} WARN io-shop: summary cache connection lost, "
+            f"reconnected to a new primary"
+        )
 
     if unreachable:
         said.append(
@@ -2334,7 +2363,8 @@ def _the_two_revisions_crossed(rollout_entropy: random.Random | None,
 
 def _the_cache_answering(cache_entropy: random.Random | None,
                          share_of_minute_without_the_cache: float,
-                         could_hold_this_figure: bool = True) -> LookUpSummary | None:
+                         could_hold_this_figure: bool = True,
+                         really_held_in: LookUpSummary | None = None) -> LookUpSummary | None:
     """The cache, as this request finds it.
 
     `None` where the deployment configured no cache at all, which is what every
@@ -2357,6 +2387,26 @@ def _the_cache_answering(cache_entropy: random.Random | None,
 
     Both draws are taken either way, so that a request skipping the cache
     cannot shift the sequence for the requests after it.
+
+    `really_held_in` is a cache that actually exists, and it is how the one
+    scenario about what a cache *holds* is staged. Everywhere else the entry is
+    `_A_CACHED_ENTRY`, one constant standing for "the figure, already worked
+    out" - which is all a scenario about latency needs, since none of them care
+    what any entry says. A promoted replica serving figures the ledger has moved
+    past is the opposite: the contents are the entire fault, and there has to be
+    something addressable holding a wrong value for discarding it to be an
+    action that can be taken and counted.
+
+    Both draws are still taken when one is supplied, and still in this order.
+    Whether the store holds a figure is then a fact of the store rather than a
+    draw - but the draw is spent regardless, because the invariant above is
+    about the sequence the *next* request sees, and a path that consumed fewer
+    would quietly move every window staged after it.
+
+    Reachability still comes from the draw rather than from the store, so a
+    scenario can stage a real cache and an outage of it at once, and so that
+    losing the cache stays the one thing it has always been here - a share of a
+    minute, not a connection that happened to fail.
     """
     if cache_entropy is None:
         return None
@@ -2367,6 +2417,9 @@ def _the_cache_answering(cache_entropy: random.Random | None,
     def look_up(shopper_id: str) -> CacheAnswer:
         if unreachable:
             return CacheAnswer(reached=False)
+
+        if really_held_in is not None:
+            return really_held_in(shopper_id)
 
         return CacheAnswer(
             reached=True,
