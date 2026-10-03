@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from typing import Any
 
-import httpx
+import httpx2
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -39,7 +39,7 @@ from target_app.scenarios import (
     utc_now,
 )
 
-HttpPost = Callable[..., httpx.Response]
+HttpPost = Callable[..., httpx2.Response]
 
 # The receiver runs the whole incident - investigation, mitigation, and the
 # verification wait after the action - before it answers, so this waits far
@@ -490,7 +490,7 @@ def _what_the_cache_check_found_said(stale: CacheReconciliation,
 def fire_alert(
     scenario_id: str | None,
     settings: MonitoringSettings | None = None,
-    post: HttpPost = httpx.post,
+    post: HttpPost = httpx2.post,
     now: Callable[[], datetime] = utc_now,
     finding: Reconciliation | None = None,
     unheard_from_since: datetime | None = None,

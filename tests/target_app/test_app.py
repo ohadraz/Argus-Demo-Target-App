@@ -9,7 +9,7 @@ from unittest.mock import Mock
 
 import pytest
 from fastapi.testclient import TestClient
-from httpx import Response
+from httpx2 import Response
 
 from io_shop.visits import (
     forget_every_visit,

@@ -40,7 +40,7 @@ def _a_waiters_own(failure: BaseException) -> BaseException:
 
     What this copies is the type and the arguments, and nothing an exception
     carries outside them. That is safe for what the build here can raise -
-    `FlagProviderUnavailable`, whose whole payload is its message, and httpx's
+    `FlagProviderUnavailable`, whose whole payload is its message, and httpx2's
     errors, whose `request` nobody downstream reads. It is not safe in general,
     and anybody lifting this class somewhere else has to check: an exception
     that carries a *fact* on an attribute comes back from here with that

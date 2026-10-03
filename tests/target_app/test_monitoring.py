@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from unittest.mock import create_autospec
 
-import httpx
+import httpx2
 import pytest
 
 from io_shop.cache_reconciliation import CacheReconciliation, StaleSummary
@@ -50,11 +50,11 @@ def a_settings(webhook_url: str = "http://argus.test/webhooks/alerts") -> Monito
 
 
 def an_accepting_receiver(incident_id: str = "dont-care-incident") -> object:
-    post = create_autospec(httpx.post)
-    post.return_value = httpx.Response(
+    post = create_autospec(httpx2.post)
+    post.return_value = httpx2.Response(
         202,
         json={"incident_id": incident_id},
-        request=httpx.Request("POST", "http://argus.test/webhooks/alerts"),
+        request=httpx2.Request("POST", "http://argus.test/webhooks/alerts"),
     )
     return post
 
@@ -132,8 +132,8 @@ def test_the_incident_the_receiver_opened_is_reported_back() -> None:
 
 
 def test_an_unreachable_receiver_is_not_reported_as_an_alert_raised() -> None:
-    post = create_autospec(httpx.post)
-    post.side_effect = httpx.ConnectError("connection refused")
+    post = create_autospec(httpx2.post)
+    post.side_effect = httpx2.ConnectError("connection refused")
 
     with pytest.raises(AlertNotDelivered):
         fire_alert(FEATURE_FLAG_TOGGLE, settings=a_settings(), post=post)
@@ -142,11 +142,11 @@ def test_an_unreachable_receiver_is_not_reported_as_an_alert_raised() -> None:
 def test_a_receiver_that_rejects_the_alert_is_not_reported_as_an_alert_raised() -> None:
     # Something is listening, and it did not take the alert. An incident nobody
     # is handling would otherwise look handled.
-    post = create_autospec(httpx.post)
-    post.return_value = httpx.Response(
+    post = create_autospec(httpx2.post)
+    post.return_value = httpx2.Response(
         500,
         json={"detail": "boom"},
-        request=httpx.Request("POST", "http://argus.test/webhooks/alerts"),
+        request=httpx2.Request("POST", "http://argus.test/webhooks/alerts"),
     )
 
     with pytest.raises(AlertNotDelivered):

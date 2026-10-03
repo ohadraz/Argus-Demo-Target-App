@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-import httpx
+import httpx2
 
 from target_app.settings import UnleashSettings, get_unleash_settings
 
@@ -48,18 +48,18 @@ class FlagClient:
     why they take two different tokens.
 
     The `client` is injected so callers can supply their own transport; it
-    defaults to a plain `httpx.Client` with a short timeout, because every call
+    defaults to a plain `httpx2.Client` with a short timeout, because every call
     here sits in the path of a request someone is waiting on.
     """
 
     def __init__(
         self,
         settings: UnleashSettings | None = None,
-        client: httpx.Client | None = None,
+        client: httpx2.Client | None = None,
         evaluation_lag_allowance_seconds: float = _EVALUATION_LAG_ALLOWANCE_SECONDS,
     ) -> None:
         self._settings = settings or get_unleash_settings()
-        self._client = client or httpx.Client(timeout=5.0)
+        self._client = client or httpx2.Client(timeout=5.0)
         self._evaluation_lag_allowance_seconds = evaluation_lag_allowance_seconds
 
     @property
@@ -146,7 +146,7 @@ class FlagClient:
         # failure; every other error still raises.
         self._post_allowing(
             f"/api/admin/projects/{self._settings.project}/environments",
-            allowed_statuses=(httpx.codes.CONFLICT,),
+            allowed_statuses=(httpx2.codes.CONFLICT,),
             json={"environment": self._settings.environment},
         )
 
@@ -195,7 +195,7 @@ class FlagClient:
             # optional, and a revived flag is the same flag.
             response = self._post_allowing(
                 f"/api/admin/projects/{self._settings.project}/features",
-                allowed_statuses=(httpx.codes.CONFLICT,),
+                allowed_statuses=(httpx2.codes.CONFLICT,),
                 json={
                     "name": self._settings.flag,
                     "type": "release",
@@ -203,7 +203,7 @@ class FlagClient:
                 },
             )
 
-            if response.status_code == httpx.codes.CONFLICT:
+            if response.status_code == httpx2.codes.CONFLICT:
                 self._post(f"/api/admin/archive/revive/{self._settings.flag}")
 
             existing = self._find_flag()
@@ -272,10 +272,10 @@ class FlagClient:
             response = self._client.get(
                 url, headers={"Authorization": self._settings.admin_token}
             )
-        except httpx.HTTPError as error:
+        except httpx2.HTTPError as error:
             raise FlagProviderUnavailable(f"could not reach {url}: {error}") from error
 
-        if response.status_code == httpx.codes.NOT_FOUND:
+        if response.status_code == httpx2.codes.NOT_FOUND:
             return None
 
         self._raise_for_status(response, url)
@@ -296,17 +296,17 @@ class FlagClient:
             if isinstance(environment, dict)
         )
 
-    def _get(self, path: str, headers: dict[str, str] | None = None) -> httpx.Response:
+    def _get(self, path: str, headers: dict[str, str] | None = None) -> httpx2.Response:
         url = f"{self._settings.base_url}{path}"
         try:
             response = self._client.get(url, headers=headers)
-        except httpx.HTTPError as error:
+        except httpx2.HTTPError as error:
             raise FlagProviderUnavailable(f"could not reach {url}: {error}") from error
 
         self._raise_for_status(response, url)
         return response
 
-    def _post(self, path: str, json: dict[str, object] | None = None) -> httpx.Response:
+    def _post(self, path: str, json: dict[str, object] | None = None) -> httpx2.Response:
         return self._post_allowing(path, allowed_statuses=(), json=json)
 
     def _post_allowing(
@@ -314,7 +314,7 @@ class FlagClient:
         path: str,
         allowed_statuses: tuple[int, ...],
         json: dict[str, object] | None = None,
-    ) -> httpx.Response:
+    ) -> httpx2.Response:
         """POSTs, treating the named error statuses as success.
 
         For the requests whose failure mode *is* the desired state - adding
@@ -326,7 +326,7 @@ class FlagClient:
             response = self._client.post(
                 url, headers={"Authorization": self._settings.admin_token}, json=json
             )
-        except httpx.HTTPError as error:
+        except httpx2.HTTPError as error:
             raise FlagProviderUnavailable(f"could not reach {url}: {error}") from error
 
         if response.status_code in allowed_statuses:
@@ -335,20 +335,20 @@ class FlagClient:
         self._raise_for_status(response, url)
         return response
 
-    def _delete(self, path: str) -> httpx.Response:
+    def _delete(self, path: str) -> httpx2.Response:
         url = f"{self._settings.base_url}{path}"
         try:
             response = self._client.delete(
                 url, headers={"Authorization": self._settings.admin_token}
             )
-        except httpx.HTTPError as error:
+        except httpx2.HTTPError as error:
             raise FlagProviderUnavailable(f"could not reach {url}: {error}") from error
 
         self._raise_for_status(response, url)
         return response
 
     @staticmethod
-    def _raise_for_status(response: httpx.Response, url: str) -> None:
+    def _raise_for_status(response: httpx2.Response, url: str) -> None:
         if response.is_error:
             raise FlagProviderUnavailable(
                 f"{url} answered {response.status_code}: {response.text[:200]}"
