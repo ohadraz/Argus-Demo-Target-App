@@ -14,6 +14,14 @@ the shop holding two answers to the same question. Nothing here notices if that
 happens - see `io_shop.spend_reconciliation`, which is the shop's own check on
 exactly this.
 
+Whichever path a purchase is recorded through, the account this module hands back
+is a true summary of the purchases on it. The paths differ in how the month's
+figure is arrived at - added to, or summed from the history - and not in whether
+it ends up written down. Nothing downstream derives it: every reader of the
+month, from `io_shop.spend_summary` to the monthly statement, reads the stored
+field, so a path that left it behind would be serving a figure the purchases
+disagree with.
+
 Which path a purchase is recorded through arrives here already decided, exactly
 as the choice of figure does on the read side - see `io_shop.spend_summary`.
 Nothing in this module reads a flag, and nothing in it knows a rollout is
@@ -53,20 +61,29 @@ def record_purchase(account: Account, purchase: Purchase) -> Account:
 
 def record_purchase_deriving_the_month(account: Account,
                                        purchase: Purchase) -> Account:
-    """The same account, without the month's total being moved.
+    """The same account, with the month's total summed from the purchases.
 
-    One total to carry instead of two, which is the saving: a month is not
-    something the shop has to keep a figure for. Every purchase says which month
-    it falls in, so what a shopper has spent this month adds up from the history
-    whenever anybody wants it - exactly as the lifetime average is derived from the
-    purchases rather than read off the account (see
-    `io_shop.spend_summary.average_spend_per_item`). Keeping a second copy of a
-    figure the purchases already hold is the work this path exists to drop.
+    One total carried forward instead of two, which is the saving: the month is
+    not a figure this path has to keep adding to, because every purchase says
+    which month it falls in and the history can be asked. What it does not mean is
+    that the field goes unwritten. Nothing downstream re-derives the month - the
+    account page, the monthly statement and the shop's own reconciliation all read
+    the stored figure - so the sum worked out here is written back, and the record
+    this path leaves behind says the same thing its purchases do.
+
+    Summing a month rather than a lifetime is what makes that affordable: the
+    arithmetic covers the current month's purchases and not the whole of a
+    shopper's past.
     """
+    purchases = (*account.purchases, purchase)
+
     return replace(
         account,
-        purchases=(*account.purchases, purchase),
-        total_cents=account.total_cents + purchase.price_cents
+        purchases=purchases,
+        total_cents=account.total_cents + purchase.price_cents,
+        total_this_month_cents=sum(
+            written.price_cents for written in purchases if written.in_current_month
+        )
     )
 
 
