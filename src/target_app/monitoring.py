@@ -143,6 +143,20 @@ _THE_STALE_COUNT_ANNOTATION = "stale_entries_found"
 # copy that had been behind for hours before anybody was served from it.
 _THE_DIVERGENCE_BEGAN_ANNOTATION = "divergence_began"
 
+# Which annotation a rule says what it looked at in, and what the three rules
+# here that looked at something other than a series say.
+#
+# Set by those three alone. A threshold rule says nothing, which is what a
+# threshold rule in any real stack does - and a consumer reading silence has to
+# take it for the common case, so there is nothing for one to add. What these
+# three know and no series carries is that their subject was never a series: the
+# spend check compared stored totals against the records behind them, the cache
+# check compared two copies, and the absence rule noticed there were no figures
+# at all. A window holding no departure contradicts none of the three, and only
+# the rule is in a position to say so.
+_THE_CLAIM_ANNOTATION = "claim"
+_A_FINDING_OF_THE_RULES_OWN = "own-finding"
+
 # What a hundredth of the shop's currency is called when a figure is said in
 # whole units. The gap is carried in cents everywhere else, because that is what a
 # price is stored in; an alert is read by a person, and a person reads money.
@@ -288,7 +302,8 @@ def an_alert_for(scenario_id: str | None,
     ):
         return _one_firing_alert(
             _TOTALS_DO_NOT_RECONCILE, _what_the_check_found_said(finding), at,
-            onset=finding.oldest_affected_purchase_at
+            onset=finding.oldest_affected_purchase_at,
+            reports_its_own_finding=True
         )
 
     if stale is not None and len(stale.entries_that_disagree) >= (
@@ -304,6 +319,7 @@ def an_alert_for(scenario_id: str | None,
             # annotation below. An onset is when the incident began, and nobody
             # was served a wrong figure until the promotion.
             onset=promoted_at,
+            reports_its_own_finding=True,
             also={
                 _THE_STALE_ENTRIES_ANNOTATION: ",".join(
                     address_of(entry.shopper_id)
@@ -329,7 +345,8 @@ def an_alert_for(scenario_id: str | None,
             _METRICS_ABSENT,
             _what_the_silence_said(unheard_from_since, at),
             at,
-            onset=unheard_from_since
+            onset=unheard_from_since,
+            reports_its_own_finding=True
         )
 
     alertname, summary = _WHAT_FIRED.get(scenario_id or "", _BY_DEFAULT)
@@ -368,6 +385,7 @@ def _one_firing_alert(alertname: str,
                       summary: str,
                       at: datetime,
                       onset: datetime | None = None,
+                      reports_its_own_finding: bool = False,
                       also: Mapping[str, str] | None = None) -> dict[str, Any]:
     """One firing alert in the vendor's envelope, with whatever it can say.
 
@@ -375,6 +393,12 @@ def _one_firing_alert(alertname: str,
     For a rule watching a series that is also roughly when the service departed
     its baseline; for the integrity check it is a week later than the fault, which
     is exactly why the onset is carried separately and not inferred from this.
+
+    `reports_its_own_finding` is how a rule says its subject was never a series.
+    False by default, because a threshold rule's subject is a series and a rule
+    with nothing unusual to say about itself should say nothing - an annotation
+    on every alert this shop sends would be a field a consumer has to read to
+    learn the ordinary case.
     """
     annotations = {_THE_SUMMARY_ANNOTATION: summary}
 
@@ -383,6 +407,13 @@ def _one_firing_alert(alertname: str,
         # finding. A consumer reading an onset it can parse and act on must not
         # also have to decide whether a blank one means "now".
         annotations[_THE_ONSET_ANNOTATION] = onset.strftime(TIMESTAMP_FORMAT)
+
+    if reports_its_own_finding:
+        # Absent rather than spelled the other way for the ordinary rule, which
+        # is the same judgement the onset above is given. A consumer defaulting a
+        # silence is a consumer that goes on working when a rule nobody here
+        # wrote fires, and every such rule is watching a series.
+        annotations[_THE_CLAIM_ANNOTATION] = _A_FINDING_OF_THE_RULES_OWN
 
     # Whatever else this particular rule has to say that a consumer acts on
     # rather than reads. Absent for every rule that has nothing of the kind,

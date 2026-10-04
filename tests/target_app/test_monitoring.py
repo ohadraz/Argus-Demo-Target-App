@@ -557,3 +557,58 @@ def test_a_cache_finding_reaches_the_receiver_and_not_only_the_payload() -> None
     assert delivered["labels"]["alertname"] == "CachedSpendTotalsAreStale"
     assert delivered["annotations"]["stale_entry_keys"].startswith("io-shop:summary:")
     assert delivered["annotations"]["onset"] == "2026-08-29T08:30:00Z"
+
+# How long the shop has published nothing by the time the absence rule is asked.
+# Longer than the dwell the rule requires, because a younger silence is a missed
+# scrape and the rule says so rather than paging about it.
+A_SILENCE_NOBODY_CAN_CALL_A_MISSED_SCRAPE = timedelta(minutes=6)
+
+
+def test_the_spend_check_says_its_subject_was_never_a_series() -> None:
+    # The one thing about this alert a consumer cannot work out for itself. The
+    # check compared stored totals against the records behind them, so a window
+    # holding no departure contradicts it in no way at all - and a consumer that
+    # read a flat window as a refutation would close this incident as a false
+    # alarm.
+    alert = an_alert_for(SILENT_DATA_CORRUPTION, SOME_INSTANT, a_finding(240))
+
+    assert alert["alerts"][0]["annotations"]["claim"] == "own-finding"
+
+
+def test_the_cache_check_says_its_subject_was_never_a_series() -> None:
+    # The same for the second of the three, and for the same reason: it compared
+    # two copies of a figure, neither of which any series carries.
+    alert = an_alert_for(
+        STATE_DIVERGENCE,
+        DONT_CARE_INSTANT,
+        stale=a_cache_finding(90),
+        promoted_at=A_PROMOTION,
+        address_of=an_address_for
+    )
+
+    assert alert["alerts"][0]["annotations"]["claim"] == "own-finding"
+
+
+def test_the_absence_rule_says_its_subject_was_never_a_series() -> None:
+    # The third, and the one where it is least obvious and matters most. This
+    # rule is about there being no series to read, so a window with no departure
+    # in it is not evidence against the alarm - it is the alarm's own subject,
+    # and reading it as a refutation would close exactly the incident that says
+    # the readings are gone.
+    alert = an_alert_for(
+        MONITORING_BLIND_SPOT,
+        SOME_INSTANT,
+        unheard_from_since=SOME_INSTANT - A_SILENCE_NOBODY_CAN_CALL_A_MISSED_SCRAPE
+    )
+
+    assert alert["alerts"][0]["annotations"]["claim"] == "own-finding"
+
+
+def test_a_threshold_rule_says_nothing_about_what_it_looked_at() -> None:
+    # Every other rule this shop has, and the silence is the point. A threshold
+    # rule's subject is a series, which is what a consumer defaulting a silence
+    # already assumes - so an annotation here would be a field saying the
+    # ordinary thing on every alert the shop ever sends.
+    alert = an_alert_for(FEATURE_FLAG_TOGGLE, DONT_CARE_INSTANT)
+
+    assert "claim" not in alert["alerts"][0]["annotations"]
