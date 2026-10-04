@@ -28,26 +28,23 @@ from io_shop.accounts import Account, Purchase
 
 
 def record_purchase(account: Account, purchase: Purchase) -> Account:
-    """The account with this purchase written into it, and both totals moved.
+    """The account with this purchase written into it, and its total moved.
 
-    How a purchase has always been recorded. Each total is added to rather than
-    worked out again: the account already carries what has been spent, and a sale
-    changes it by exactly the price of the thing sold.
+    How a purchase is recorded. The lifetime total is added to rather than worked
+    out again: the account already carries what has been spent, and a sale changes
+    it by exactly the price of the thing sold.
 
-    The month is the part worth reading twice. A purchase counts towards the
-    month's total only if it falls in the month being counted, so that addition is
-    conditional where the lifetime one is not - and a shopper backfilling an older
-    order leaves this month's figure exactly where it was.
+    The month is no longer carried. Every purchase says whether it falls in the
+    current month, so what a shopper has spent this month adds up from the history
+    whenever anybody wants it - exactly as the lifetime average is derived from the
+    purchases rather than read off the account. A second copy of a figure the
+    purchases already hold is a copy that has to be kept in step, and the cheapest
+    way to keep it in step is not to keep it.
     """
     return replace(
         account,
         purchases=(*account.purchases, purchase),
-        total_cents=account.total_cents + purchase.price_cents,
-        total_this_month_cents=(
-            account.total_this_month_cents + purchase.price_cents
-            if purchase.in_current_month
-            else account.total_this_month_cents
-        )
+        total_cents=account.total_cents + purchase.price_cents
     )
 
 
