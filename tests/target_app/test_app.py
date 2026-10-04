@@ -39,6 +39,7 @@ from target_app.app import (
 from target_app.flags import FlagClient
 from target_app.generator import BASELINE_MEMORY_BYTES, SETTLED_UPTIME
 from target_app.monitoring import an_alert_for
+from target_app.prometheus import QUERIES
 from target_app.scenarios import (
     AUTOSCALER_FLAPPING,
     CACHE_MISCONFIGURED,
@@ -147,7 +148,7 @@ def the_newest_minute(client: TestClient) -> dict:
     this_minute = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M")
 
     while True:
-        buckets = client.get("/metrics").json()
+        buckets = client.get("/scenario/metrics").json()
 
         assert buckets
 
@@ -182,7 +183,7 @@ def the_minute_of(client: TestClient, restarted: Response) -> dict:
     deadline = time.monotonic() + A_MINUTE_BECOMES_READABLE_SECONDS
 
     while True:
-        buckets = client.get("/metrics").json()
+        buckets = client.get("/scenario/metrics").json()
         covering = [
             bucket for bucket in buckets if bucket["bucket_id"].startswith(came_back)
         ]
@@ -491,7 +492,7 @@ def test_resetting_ends_the_outage(client: TestClient) -> None:
 
     assert reset.status_code == 200
     assert client.get("/scenario/status").json()["active_scenario"] is None
-    assert client.get("/metrics").json() == []
+    assert client.get("/scenario/metrics").json() == []
 
 
 def a_staged_cache_misconfiguration(client: TestClient) -> None:
@@ -634,7 +635,7 @@ def a_staged_slow_rollout(client: TestClient) -> None:
 
 
 def the_shops_window(client: TestClient) -> list[dict]:
-    buckets = client.get("/metrics").json()
+    buckets = client.get("/scenario/metrics").json()
 
     assert buckets
 
@@ -1442,7 +1443,7 @@ def test_the_paused_rollout_moves_the_error_rate_and_not_the_quantiles(
 ) -> None:
     a_staged_paused_rollout(client)
 
-    buckets = client.get("/metrics").json()
+    buckets = client.get("/scenario/metrics").json()
     split = buckets[-2]
     quiet = a_typical_quiet_minute(buckets)
 
@@ -1694,7 +1695,7 @@ def test_the_deployed_drift_fails_no_request(client: TestClient) -> None:
     # measures.
     a_staged_deployed_drift(client)
 
-    buckets = client.get("/metrics").json()
+    buckets = client.get("/scenario/metrics").json()
 
     assert buckets
     assert all(bucket["error_rate"] < 0.05 for bucket in buckets)
@@ -1804,7 +1805,7 @@ def test_the_shop_goes_on_reporting_its_own_telemetry(
     # incident would end for that reason instead of this one.
     a_staged_unreachable_control_plane(client)
 
-    buckets = client.get("/metrics")
+    buckets = client.get("/scenario/metrics")
 
     assert buckets.status_code == 200
     assert buckets.json() != []
@@ -1830,3 +1831,78 @@ def test_the_console_offers_it_under_the_foundational_integrity_family(
     }
 
     assert offered[CONTROL_PLANE_UNREACHABLE] == "foundational-integrity"
+
+
+QUERY_RANGE_PATH = "/prometheus/api/v1/query_range"
+
+
+def a_range_query(client: TestClient, query: str, start: str, end: str) -> Response:
+    return client.get(
+        QUERY_RANGE_PATH,
+        params={"query": query, "start": start, "end": end, "step": "60s"}
+    )
+
+
+def a_minutes_end(bucket: dict) -> str:
+    started = datetime.strptime(bucket["bucket_id"], TIMESTAMP_FORMAT).replace(tzinfo=UTC)
+
+    return str((started + timedelta(minutes=1)).timestamp())
+
+
+def test_the_prometheus_stand_in_answers_what_the_rows_say(client: TestClient) -> None:
+    # The stand-in's whole licence: a consumer reading through it reads the
+    # numbers the rows hold. Finished minutes only - the one in progress is
+    # still moving between the two reads.
+    a_staged_leak(client)
+    rows = client.get("/scenario/metrics").json()[:-1]
+
+    answered = a_range_query(
+        client, QUERIES["memory_used_bytes"],
+        start=a_minutes_end(rows[0]), end=a_minutes_end(rows[-1])
+    )
+
+    assert answered.status_code == 200
+    assert answered.json()["status"] == "success"
+    assert [
+        value for _, value in answered.json()["data"]["result"][0]["values"]
+    ] == [str(row["memory_used_bytes"]) for row in rows]
+
+
+def test_the_prometheus_stand_in_refuses_a_query_it_does_not_know(
+    client: TestClient
+) -> None:
+    refused = a_range_query(client, "up", start="0", end="60")
+
+    assert refused.status_code == 400
+    assert refused.json()["status"] == "error"
+    assert refused.json()["errorType"] == "bad_data"
+
+
+def test_the_prometheus_stand_in_refuses_a_request_missing_a_parameter(
+    client: TestClient
+) -> None:
+    refused = client.get(QUERY_RANGE_PATH, params={"query": QUERIES["error_rate"]})
+
+    assert refused.status_code == 400
+    assert refused.json()["errorType"] == "bad_data"
+
+
+def test_the_prometheus_stand_in_answers_nothing_staged_with_no_series(
+    client: TestClient
+) -> None:
+    answered = a_range_query(
+        client, QUERIES["error_rate"], start="0", end=str(time.time())
+    )
+
+    assert answered.status_code == 200
+    assert answered.json()["data"]["result"] == []
+
+
+def test_the_scrape_endpoint_is_prometheus_text(client: TestClient) -> None:
+    a_staged_leak(client)
+
+    scraped = client.get("/metrics")
+
+    assert scraped.status_code == 200
+    assert scraped.headers["content-type"].startswith("text/plain; version=0.0.4")
+    assert "# TYPE process_resident_memory_bytes gauge" in scraped.text

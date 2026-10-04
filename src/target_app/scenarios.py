@@ -507,7 +507,7 @@ class Scenario:
     `stops_publishing_telemetry` stages the twelfth generated kind, and the only
     one where what is wrong is the shop's own account of itself. The flag turns
     off telemetry publishing. The shop serves every request correctly, its logs
-    go on reporting every minute, and `/metrics` carries rows up to the minute
+    go on reporting every minute, and `/scenario/metrics` carries rows up to the minute
     the flag moved and none at or after it. Nothing throws, nothing waits, and
     no series moves - because for those minutes there is no series.
 

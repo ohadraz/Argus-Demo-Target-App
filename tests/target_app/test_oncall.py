@@ -79,7 +79,7 @@ def test_the_incident_begins_when_somebody_was_paged() -> None:
 
 def test_the_incident_ends_at_the_last_minute_the_shop_was_troubled() -> None:
     # The telemetry says when it was over, and the window it is read from does
-    # not: `/metrics` answers a rolling ninety minutes whether the shop is well
+    # not: `/scenario/metrics` answers a rolling ninety minutes whether the shop is well
     # or not, so an incident read to the newest bucket never ends.
     some_trouble = timedelta(minutes=6)
 

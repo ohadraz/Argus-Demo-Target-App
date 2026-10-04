@@ -23,7 +23,7 @@ worked out again - see `_a_whole_minute`. It is an optimisation and nothing
 more: the answer is the same either way, because the property above says it
 must be. What it buys is the window's length. A six-hour window is 360 minutes
 and every one of them renders account pages for real, so recomputing the lot on
-every `/metrics` and every `/logs` call made the window a cost rather than a
+every `/scenario/metrics` and every `/logs` call made the window a cost rather than a
 setting - and the window has to be six hours, because that is what a responder
 actually asks this service for.
 """
@@ -58,7 +58,7 @@ TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # How many account pages are actually rendered per minute to measure that
 # minute. The reported request volume is far larger, and deliberately so:
 # rendering the reported volume for real would mean hundreds of thousands of
-# calls per `/metrics` request across the metrics window, to produce the same
+# calls per `/scenario/metrics` request across the metrics window, to produce the same
 # rate a sample produces. This is what a sampled measurement is.
 #
 # The size is a noise decision, not a cost one. A sample of 50 resolves the
@@ -1029,7 +1029,7 @@ class GeneratedMinute:
     # are built from these minutes, so a minute dropped here would take its log
     # lines with it - and a shop whose logs went quiet alongside its metrics is
     # a shop that is down, which is a different incident and the one thing this
-    # scenario must not look like. `/metrics` drops the unpublished minutes;
+    # scenario must not look like. `/scenario/metrics` drops the unpublished minutes;
     # `/logs` serves them exactly as it serves every other minute.
     published: bool = True
 
@@ -1196,7 +1196,7 @@ def generate(timeline: FlagTimeline | None,
     the platform stopped selecting the shop as a target while the shop went on
     serving the same endpoint to nobody. Every minute is still generated, and
     the minutes inside the outage are marked unpublished - which is what
-    `/metrics` drops and what `/logs` ignores, so the shop goes on saying it is
+    `/scenario/metrics` drops and what `/logs` ignores, so the shop goes on saying it is
     well over exactly the minutes no series covers.
 
     Marked rather than omitted, and that is the whole shape of the thing: both
@@ -1337,7 +1337,7 @@ def _a_whole_minute(
 
     What this is worth: a six-hour window is 360 minutes, and the account pages
     behind it are rendered for real. Regenerating all of them on every
-    `/metrics` and every `/logs` call was most of what an e2e run spent its
+    `/scenario/metrics` and every `/logs` call was most of what an e2e run spent its
     time doing.
     """
     return _generate_minute(
@@ -2494,7 +2494,7 @@ def _the_provider_answering(refusing: bool) -> AskTheProvider:
 
     A function rather than a client, because the shop is rendered two hundred
     times a minute across a ninety-minute window and a socket per render would
-    be tens of thousands of requests for one read of `/metrics`. What is real is
+    be tens of thousands of requests for one read of `/scenario/metrics`. What is real is
     the shape of the answer and what Io does with it - the status comes back
     here and the failure is composed in the shop, where a client's is.
     """

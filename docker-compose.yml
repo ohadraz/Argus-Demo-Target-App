@@ -226,6 +226,10 @@ services:
       # depends on anything listening there: an alert nobody accepts is reported
       # as undelivered and the staged incident carries on regardless.
       MONITORING_ALERT_WEBHOOK_URL: "http://host.docker.internal:8000/webhooks/alerts"
+      # Whether the Prometheus stand-in serves the minute still in progress: 0
+      # does, as every push's run wants; the nightly passes 1, so the path a
+      # real source produces - a minute reported once it is over - is walked too.
+      PROMETHEUS_REPORTING_LAG_MINUTES: "${PROMETHEUS_REPORTING_LAG_MINUTES:-0}"
       # A second listener, on TLS, for clients that will not speak anything
       # else - PagerDuty's SDK refuses a base URL that is not `https://`. Same
       # process as the plain one, because everything this service knows about a

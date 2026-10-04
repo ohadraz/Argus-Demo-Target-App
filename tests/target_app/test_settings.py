@@ -3,9 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from target_app.settings import (
     VALUES_FILE,
+    PrometheusSettings,
     the_declared_autoscaler,
     the_deployed_cache_endpoint,
 )
@@ -115,3 +117,19 @@ def test_a_file_with_no_autoscaler_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(KeyError):
         the_declared_autoscaler(values)
+
+
+def test_the_prometheus_stand_in_serves_the_minute_in_progress_by_default(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 0 is every push's run, which must stay as fast as the shop always was.
+    monkeypatch.delenv("PROMETHEUS_REPORTING_LAG_MINUTES", raising=False)
+
+    assert PrometheusSettings().reporting_lag_minutes == 0
+
+
+def test_the_prometheus_stand_in_refuses_a_lag_it_cannot_serve() -> None:
+    # A minute either is reported while it runs or once it is over; two minutes
+    # late is a source nothing here stands in for.
+    with pytest.raises(ValidationError):
+        PrometheusSettings(reporting_lag_minutes=2)

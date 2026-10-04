@@ -5,7 +5,7 @@ in for Argo CD: same wire shape, same field names, so the adapter reading it is
 the same code that would read the real thing. Anything renamed here would be a
 lie the adapter has to be written around.
 
-Over a minute `/metrics` still reports, charges are derived from that very
+Over a minute `/scenario/metrics` still reports, charges are derived from that very
 minute, so takings and telemetry cannot disagree: a minute in which a third of
 requests failed is a minute in which a third of the orders never happened. That
 is the whole point of the endpoint - an incident that breaks the shop has to show

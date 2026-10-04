@@ -652,7 +652,7 @@ function keepFollowing(element, render) {
 async function refresh() {
   try {
     renderCatalog(await json('/scenario/catalog'));
-    const buckets = await json('/metrics');
+    const buckets = await json('/scenario/metrics');
     keepFollowing(document.getElementById('metrics-scroll'),
                   () => renderMetrics(buckets));
     const lines = await json('/logs');

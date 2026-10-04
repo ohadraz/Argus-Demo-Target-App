@@ -12,7 +12,7 @@ second request - and then meet a real account that requires it.
 
 The incident is bounded by two different things, and that is deliberate. It
 begins when the shop's monitoring paged somebody, because that is the first
-moment anyone could have responded; it ends at the last minute `/metrics`
+moment anyone could have responded; it ends at the last minute `/scenario/metrics`
 reports as troubled, because that is when the shop was well again. The
 acknowledgements are authored - the demo needs somebody to have picked it up -
 and they are placed after the page, never after the breakage.

@@ -8,11 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from target_app import console
+from target_app import console, prometheus
 from target_app.cache_entries import the_key_for
 from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.generator import (
@@ -50,6 +50,7 @@ from target_app.scenarios import (
     scenario_span_minutes,
 )
 from target_app.settings import (
+    get_prometheus_settings,
     get_scenario_settings,
     get_unleash_settings,
     the_deployed_replica_count,
@@ -1458,8 +1459,67 @@ def logs() -> list[str]:
     return _authored_log_lines(active.scenario, active.seeded_at)
 
 
-@app.get("/metrics", response_model=list[MetricBucket])
-def metrics() -> list[MetricBucket]:
+@app.get("/scenario/metrics", response_model=list[MetricBucket])
+def scenario_metrics() -> list[MetricBucket]:
+    """The active scenario's minutes, one row each - the shop's own view.
+
+    What the console draws and what a test reads to know what the shop did.
+    A consumer standing where a responder stands reads the same minutes through
+    the Prometheus stand-in below instead, in Prometheus's own shape.
+    """
+    return _the_buckets()
+
+
+@app.get("/metrics")
+def metrics() -> PlainTextResponse:
+    """What Prometheus would scrape off this shop: text exposition, current
+    values of the series the stand-in's queries name.
+    """
+    return PlainTextResponse(
+        prometheus.an_exposition([bucket.model_dump() for bucket in _the_buckets()]),
+        media_type=prometheus.EXPOSITION_CONTENT_TYPE
+    )
+
+
+@app.get("/prometheus/api/v1/query_range")
+def prometheus_query_range(query: str | None = Query(None),
+                           start: str | None = Query(None),
+                           end: str | None = Query(None),
+                           step: str | None = Query(None)) -> JSONResponse:
+    """Stands in for Prometheus's `GET /api/v1/query_range`.
+
+    Answers the fixed set of expressions in `prometheus.QUERIES`, from the
+    minutes `/scenario/metrics` serves, value for value. A request Prometheus
+    would refuse - a parameter missing or unreadable, an expression this does
+    not know - is refused in Prometheus's error envelope, with its status.
+    """
+    try:
+        if query is None or start is None or end is None or step is None:
+            raise prometheus.BadData("query, start, end and step are all required")
+
+        data = prometheus.a_matrix(
+            [bucket.model_dump() for bucket in _the_buckets()],
+            query,
+            prometheus.read_time(start),
+            prometheus.read_time(end),
+            prometheus.read_step(step),
+            now=datetime.now(UTC),
+            reporting_lag_minutes=get_prometheus_settings().reporting_lag_minutes
+        )
+    except prometheus.BadData as error:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": prometheus.ERROR,
+                "errorType": prometheus.BAD_DATA,
+                "error": str(error)
+            }
+        )
+
+    return JSONResponse(content={"status": prometheus.SUCCESS, "data": data})
+
+
+def _the_buckets() -> list[MetricBucket]:
     active = state.active
 
     if active is None:
@@ -1538,7 +1598,7 @@ def stripe_charges(
     page would leave that path untested until a real account was in front of
     it.
 
-    Takings over a minute `/metrics` still reports come from that minute, so an
+    Takings over a minute `/scenario/metrics` still reports come from that minute, so an
     incident that breaks the shop shows up in the money. Over a minute older
     than the metrics reach they are the shop's ordinary trade, because Stripe
     does not expire charges and a stand-in that answered an old window empty
@@ -1572,7 +1632,7 @@ def stripe_charges(
     window_end = datetime.fromtimestamp(created_lte or created_gte, tz=UTC)
 
     page, has_more = a_page_of_charges(
-        metrics(), window_start, window_end, limit, starting_after
+        _the_buckets(), window_start, window_end, limit, starting_after
     )
 
     return StripeList(data=page, has_more=has_more)
@@ -1597,7 +1657,7 @@ def pagerduty_incident(incident_id: str) -> dict[str, Any]:
     active = state.active
     incident = an_incident(
         incident_id,
-        metrics(),
+        _the_buckets(),
         active.alerted_at if active is not None else None
     )
 
@@ -1657,7 +1717,7 @@ def pagerduty_user(user_id: str) -> dict[str, Any]:
 def registered_service(service: str) -> RegisteredServiceResponse:
     """What the organisation's service registry records about one service.
 
-    Unlike `/logs`, `/metrics` and the Argo CD stand-in, this does not answer
+    Unlike `/logs`, `/scenario/metrics` and the Argo CD stand-in, this does not answer
     from the staged scenario: the registry says what calls what, which is a fact
     about how the shop is built rather than about what is wrong with it today. It
     answers the same thing with nothing seeded, which is exactly right - the
@@ -1689,7 +1749,7 @@ def argocd_application(application: str) -> ArgoCdApplication:
     """Stands in for Argo CD's `GET /api/v1/applications/{name}`.
 
     Answers from whichever scenario is seeded, whatever application it is asked
-    about - exactly as `/logs` and `/metrics` do - but echoes the requested name
+    about - exactly as `/logs` and `/scenario/metrics` do - but echoes the requested name
     back in `metadata.name`, because a real Argo CD identifies the application it
     was asked for and an adapter is entitled to rely on that.
 

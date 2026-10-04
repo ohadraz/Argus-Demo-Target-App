@@ -168,6 +168,21 @@ class ScenarioSettings(BaseSettings):
     drift_backdate_days: int = Field(default=7, gt=0)
 
 
+class PrometheusSettings(BaseSettings):
+    """How the shop's Prometheus stand-in reports its minutes.
+
+    `reporting_lag_minutes` is whether the minute still in progress is served:
+    0 serves it, as the shop always has; 1 serves a minute only once it has
+    ended, as a source that reads a minute when it is over does. 0 by default,
+    because that is the run every push makes; the nightly sets 1, so the slower
+    path a real source produces is still walked end to end.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="PROMETHEUS_", extra="ignore")
+
+    reporting_lag_minutes: int = Field(default=0, ge=0, le=1)
+
+
 def the_deployed_cache_endpoint(values_file: Path = VALUES_FILE) -> CacheEndpoint:
     """Where the deployment says the cache is.
 
@@ -266,3 +281,8 @@ def get_unleash_settings() -> UnleashSettings:
 @lru_cache
 def get_scenario_settings() -> ScenarioSettings:
     return ScenarioSettings()
+
+
+@lru_cache
+def get_prometheus_settings() -> PrometheusSettings:
+    return PrometheusSettings()
