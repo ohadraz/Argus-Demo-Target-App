@@ -285,6 +285,15 @@ class ActiveScenario:
     # running it cost anything. A rollback ends the stretch and leaves the
     # entry, which is what the history is for.
     deploy_slowdown: SlowDeployment | None = None
+    # The stretch the revision that stopped carrying the month has been the one
+    # deployed, for the one scenario whose drift a deployment shipped. `None`
+    # everywhere else - the flag scenario's drift is read off the flag's own
+    # timeline, and every other shop keeps its totals in step.
+    #
+    # In the flag's shape because the integrity check asks a write path's
+    # stretch two things only - when it went live and when it stopped - and
+    # asks them the same way whichever change it was. A rollback sets the end.
+    drifting_revision: FlagTimeline | None = None
     # The stretch the fleet has spent split across two revisions, for the one
     # scenario whose condition is that a deployment did not finish. `None`
     # everywhere else, which is what keeps every other scenario's fleet on one
@@ -617,6 +626,28 @@ class ScenarioState:
                     began_at=now - timedelta(
                         minutes=get_scenario_settings().onset_backdate_minutes
                     )
+                ),
+            )
+            return
+
+        if scenario.drifts_from_a_deployment:
+            # The flag scenario's drift with no flag: the revision this scenario
+            # names writes every purchase through the path that skips the month,
+            # so the drift began when it landed and lasts until it is returned.
+            #
+            # Backdated as far as the flag scenario's, for the same reason - the
+            # onset has to be older than the metrics reach - and the deploy
+            # history reads its landing from here, so the entry and the oldest
+            # affected purchase sit at the same instant. No flag history is
+            # touched: a flag change at that minute would make this the flag
+            # scenario with a deployment beside it.
+            self._remember_where_the_flags_are_now()
+            self._active = ActiveScenario(
+                scenario=scenario,
+                seeded_at=now,
+                process_started_at=now - SETTLED_UPTIME,
+                drifting_revision=FlagTimeline(
+                    turned_on_at=now - _how_long_ago_this_one_began(scenario)
                 ),
             )
             return
@@ -1026,6 +1057,15 @@ class ScenarioState:
                 active,
                 deploy_slowdown=replace(active.deploy_slowdown, ended_at=at),
             )
+        elif active.drifting_revision is not None:
+            # The one a rollback ends least of. Purchases from here on
+            # are written through the path that keeps the month, so the drift
+            # stops growing; every total already written short stays short,
+            # because a rollback changes what runs and not what it wrote.
+            self._active = replace(
+                active,
+                drifting_revision=replace(active.drifting_revision, turned_off_at=at),
+            )
         elif active.paused_rollout is not None:
             # The third thing a rollback ends, and the one it ends for a
             # different reason than the other two. There the revision carried
@@ -1306,6 +1346,9 @@ class ScenarioState:
 
         if active is None or not active.scenario.drifts_the_monthly_total:
             return None
+
+        if active.drifting_revision is not None:
+            return active.drifting_revision
 
         return self.timeline_now()
 
@@ -1707,6 +1750,19 @@ class ScenarioState:
                 return None, utc_now()
 
             return None, min(utc_now(), _settled_at(active.deploy_slowdown.ended_at))
+
+        if active is not None and active.drifting_revision is not None:
+            # No flag, and nothing in the window to settle. Every minute is flat
+            # whether the revision is running or not, so there is no recovery to
+            # hold the window open around - it runs up to now until the rollback
+            # and stops a settling period after it, only so that the scenario is
+            # reported complete the way every rollback scenario is.
+            if active.drifting_revision.turned_off_at is None:
+                return None, utc_now()
+
+            return None, min(
+                utc_now(), _settled_at(active.drifting_revision.turned_off_at)
+            )
 
         if active is not None and active.scenario.rollout_is_paused:
             # No flag, and what ends it is the same rollback the two scenarios

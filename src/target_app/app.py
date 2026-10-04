@@ -1742,8 +1742,15 @@ def _the_revision_history() -> list[ArgoCdRevisionHistory]:
         return []
 
     if active.scenario.deploy is not None:
-        landed = active.seeded_at - timedelta(
-            minutes=get_scenario_settings().onset_backdate_minutes
+        # Where the revision's own stretch is staged, it says when the revision
+        # landed - a week back for the drift, which is the instant the oldest
+        # affected purchase dates. Every other deploy landed a few minutes ago.
+        landed = (
+            active.drifting_revision.turned_on_at
+            if active.drifting_revision is not None
+            else active.seeded_at - timedelta(
+                minutes=get_scenario_settings().onset_backdate_minutes
+            )
         )
 
         return [

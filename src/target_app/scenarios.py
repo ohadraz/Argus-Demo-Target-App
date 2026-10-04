@@ -619,7 +619,20 @@ class Scenario:
             or self.autoscaler_flaps
             or self.rollout_is_paused
             or self.stops_publishing_telemetry
+            or self.drifts_from_a_deployment
         )
+
+    @property
+    def drifts_from_a_deployment(self) -> bool:
+        """Whether the monthly total's drift was shipped by a revision rather than
+        turned on by a flag.
+
+        Read off the two things the scenario already says rather than declared
+        beside them: the drift, and a deploy to carry it. The flag scenario has the
+        first and not the second, and a third field that could disagree with both
+        would be a fixture able to stage an incident nobody could have caused.
+        """
+        return self.drifts_the_monthly_total and self.deploy is not None
 
     @property
     def healthy_flag_state(self) -> bool:
@@ -704,6 +717,19 @@ THE_COMMIT_THAT_DROPPED_THE_MONTHLY_ROLLUP = (
     "83cf54d6c49fa0371449e045b59209eb97507ce9"
 )
 THE_COMMIT_BEFORE_THE_ROLLUP_WENT = "f61363044ee33fc1b8d3a3b519bcc6a1f2ef7648"
+# The same fault reached by a deployment rather than a flag: the revision that
+# stopped `record_purchase` itself moving the monthly total, with no flag
+# consulted, and the one before it. Served through the deploy history like the
+# pairs above the flag scenario's, and on a branch of its own that is never
+# merged, as the month-boundary pair is - main still carries the fault behind
+# the flag, which is what the fix corpus patches, and a deployed revision only
+# has to be a commit the change channel can compare against.
+THE_COMMIT_THAT_STOPPED_CARRYING_THE_MONTH = (
+    "26f1d7e2c82ce2abff8f9b6424dc226f4f37fed2"
+)
+THE_COMMIT_BEFORE_THE_MONTH_STOPPED_BEING_CARRIED = (
+    "4c810f22894e612ced87f5ee3f3062dfeb785050"
+)
 FALLBACK_DISABLED = "fallback-disabled"
 FLAG_TOGGLE_RED_HERRING = "flag-toggle-red-herring"
 COMPETING_FLAG_CHANGES = "competing-flag-changes"
@@ -730,6 +756,11 @@ HALF_FINISHED_ROLLOUT = "half-finished-rollout"
 # name would put the answer in the id of the one incident whose cause nothing in
 # the telemetry can reach.
 SILENT_DATA_CORRUPTION = "silent-data-corruption"
+# The same incident with a deployment where the flag was, and named for the data
+# for the same reason: saying "deployment" in the id would put the answer in it,
+# and the answer - which change to undo - is the one thing this scenario exists
+# to ask.
+MONTHLY_TOTALS_FALLING_BEHIND = "monthly-totals-falling-behind"
 # Named for the platform rather than for the incident, unlike every scenario
 # above it. What breaks the shop here is an ordinary flag change; what the
 # scenario stages is that four of the five things Argus could do about one are
@@ -1117,6 +1148,40 @@ SCENARIOS: dict[str, Scenario] = {
         ),
         family=FOUNDATIONAL_INTEGRITY,
         drifts_the_monthly_total=True,
+    ),
+    MONTHLY_TOTALS_FALLING_BEHIND: Scenario(
+        id=MONTHLY_TOTALS_FALLING_BEHIND,
+        title="Totals that stopped keeping up, shipped",
+        description=(
+            "The scenario above, with one difference. Nobody switched a flag: "
+            "a revision went out that records a purchase without moving the "
+            "shopper's monthly total at all, on the same reasoning - a month "
+            "can be added up from the purchases whenever anybody wants it - and "
+            "it is the revision every purchase has been written through since. "
+            "Every account page renders, the lifetime figure is right and the "
+            "monthly one beside it is low. No series moves, no rule fires and "
+            "nobody is paged, until Io's weekly check re-adds every shopper's "
+            "purchases and fires an alert carrying how many totals disagree, "
+            "the widest gap, and the oldest purchase that gap can be made of. "
+            "That purchase dates the incident, and what sits at that minute is "
+            "a deployment in the Argo CD history - and nothing in the flag "
+            "history at all. So putting a flag back answers nothing here, and "
+            "a walk that reaches for one has learned the scenario above rather "
+            "than the mode. Returning the deployment stops the next purchase "
+            "being mis-recorded and repairs not one of those already written; "
+            "a restart changes nothing. The revision sits on a branch of its "
+            "own, so the shop's main branch still carries the fault behind the "
+            "flag - and a fix to main's write path is the same fix."
+        ),
+        family=FOUNDATIONAL_INTEGRITY,
+        drifts_the_monthly_total=True,
+        deploy=ScenarioDeploy(
+            revision=THE_COMMIT_THAT_STOPPED_CARRYING_THE_MONTH,
+            previous_revision=THE_COMMIT_BEFORE_THE_MONTH_STOPPED_BEING_CARRIED,
+            repo_url="https://github.com/ohadraz/Argus-Demo-Target-App",
+            path="deploy",
+            initiated_by="kuki"
+        )
     ),
     CONTROL_PLANE_UNREACHABLE: Scenario(
         id=CONTROL_PLANE_UNREACHABLE,

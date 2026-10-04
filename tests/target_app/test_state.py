@@ -23,6 +23,7 @@ from target_app.scenarios import (
     FLAG_TOGGLE_RED_HERRING,
     HALF_FINISHED_ROLLOUT,
     MONITORING_BLIND_SPOT,
+    MONTHLY_TOTALS_FALLING_BEHIND,
     PRICING_SERVICE_DEGRADED,
     RESOURCE_LEAK,
     SCENARIOS,
@@ -1508,6 +1509,90 @@ def test_restarting_the_shop_leaves_the_finding_exactly_where_it_was() -> None:
     # same wrong totals. Nothing else in this fixture behaves this way - a restart
     # reclaims a heap, and here it reclaims nothing.
     state = a_state_with_the_totals_drifting()
+    before = state.the_integrity_check_found()
+
+    state.restart_the_shop()
+
+    assert state.the_integrity_check_found() == before
+
+
+def a_state_with_the_drift_deployed(
+    flags: Mock | None = None,
+    backdate_the_flag_history: Mock | None = None,
+) -> ScenarioState:
+    """A shop with the deploy-caused drift staged.
+
+    Its flag reports off, because this scenario moves none: the write path that
+    skips the month is the deployed revision's, and the check reads its stretch
+    off the deployment rather than off any flag.
+    """
+    state = a_scenario_state(
+        flags or a_flag_client_reporting(False),
+        backdate_the_flag_history=backdate_the_flag_history,
+    )
+    state.seed(SCENARIOS[MONTHLY_TOTALS_FALLING_BEHIND])
+
+    return state
+
+
+def test_the_deployed_drift_is_backdated_as_far_as_the_flag_one() -> None:
+    # The same claim as the flag scenario's: an onset inside the metrics' reach
+    # could be measured from the series, and only the data may date this.
+    state = a_state_with_the_drift_deployed()
+
+    age = utc_now() - state.active.drifting_revision.turned_on_at
+
+    assert age.days >= get_scenario_settings().drift_backdate_days
+
+
+def test_staging_the_deployed_drift_moves_no_flag() -> None:
+    # A flag moved at the onset would make this the flag scenario with a
+    # deployment beside it, and a flag revert would have something to undo.
+    flags = a_flag_client_reporting(False)
+
+    a_state_with_the_drift_deployed(flags)
+
+    flags.enable.assert_not_called()
+
+
+def test_staging_the_deployed_drift_writes_no_flag_history() -> None:
+    backdate = Mock()
+
+    a_state_with_the_drift_deployed(backdate_the_flag_history=backdate)
+
+    backdate.assert_not_called()
+
+
+def test_the_check_finds_the_totals_the_deployed_revision_left_behind() -> None:
+    state = a_state_with_the_drift_deployed()
+
+    assert state.the_integrity_check_found().anything_disagrees
+
+
+def test_rolling_the_deployment_back_ends_the_write_path_s_stretch() -> None:
+    # Recovery in the only terms the mode has, and the check's half of it - no
+    # purchase after the end joining the drift - is `test_integrity`'s, asked of
+    # the same stretch. What is asked here is that a rollback is what ends it.
+    state = a_state_with_the_drift_deployed()
+
+    rolled_back_at = state.roll_the_deployment_back()
+
+    assert state.active.drifting_revision.turned_off_at == rolled_back_at
+
+
+def test_rolling_the_deployment_back_repairs_nothing() -> None:
+    state = a_state_with_the_drift_deployed()
+    before = state.the_integrity_check_found()
+
+    state.roll_the_deployment_back()
+
+    after = state.the_integrity_check_found()
+    assert after.anything_disagrees
+    assert after.oldest_affected_purchase_at == before.oldest_affected_purchase_at
+
+
+def test_restarting_a_shop_with_the_drift_deployed_changes_nothing() -> None:
+    state = a_state_with_the_drift_deployed()
     before = state.the_integrity_check_found()
 
     state.restart_the_shop()

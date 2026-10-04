@@ -46,10 +46,12 @@ from target_app.scenarios import (
     CPU_SATURATION,
     HALF_FINISHED_ROLLOUT,
     MONTHLY_STATEMENT_PANEL,
+    MONTHLY_TOTALS_FALLING_BEHIND,
     PRICING_SERVICE_DEGRADED,
     RESOURCE_LEAK,
     SILENT_DATA_CORRUPTION,
     SLOW_CANARY_ROLLOUT,
+    THE_COMMIT_THAT_STOPPED_CARRYING_THE_MONTH,
     TIMESTAMP_FORMAT,
     UPSTREAM_DEPENDENCY_FAILURE,
 )
@@ -1618,6 +1620,84 @@ def test_a_shop_with_nothing_wrong_with_its_totals_is_paged_about_its_own_fault(
 
     assert fired["labels"]["alertname"] == "HighMemoryUsage"
     assert "onset" not in fired["annotations"]
+
+
+def a_staged_deployed_drift(client: TestClient) -> None:
+    seeded = client.post(
+        "/scenario/seed", json={"scenario_id": MONTHLY_TOTALS_FALLING_BEHIND}
+    )
+
+    assert seeded.status_code == 200
+
+
+def the_onset_paged_with(client: TestClient) -> datetime:
+    """The onset the integrity check's alert states, as an instant."""
+    fired = an_alert_for(
+        MONTHLY_TOTALS_FALLING_BEHIND,
+        datetime.now(UTC),
+        app_module.state.the_integrity_check_found(),
+    )["alerts"][0]
+
+    return datetime.strptime(
+        fired["annotations"]["onset"], TIMESTAMP_FORMAT
+    ).replace(tzinfo=UTC)
+
+
+def test_the_console_offers_the_deployed_drift_beside_the_flag_one(
+    client: TestClient
+) -> None:
+    offered = {
+        scenario["id"]: scenario["family"]
+        for scenario in client.get("/scenario/catalog").json()["scenarios"]
+    }
+
+    assert offered[MONTHLY_TOTALS_FALLING_BEHIND] == "foundational-integrity"
+
+
+def test_the_deploy_history_names_the_revision_that_stopped_carrying_the_month(
+    client: TestClient
+) -> None:
+    a_staged_deployed_drift(client)
+
+    history = client.get("/argocd/io-shop").json()["status"]["history"]
+
+    assert history[-1]["revision"] == THE_COMMIT_THAT_STOPPED_CARRYING_THE_MONTH
+
+
+def test_the_revision_landed_at_the_minute_the_alert_dates(
+    client: TestClient
+) -> None:
+    # What makes the deploy the evidence: a consumer looking for what changed
+    # at or just before the stated onset finds this entry and nothing else. The
+    # first mis-recorded purchase is somebody's next order after the landing,
+    # so the two are within a couple of minutes and in that order.
+    a_staged_deployed_drift(client)
+
+    landed = datetime.strptime(
+        client.get("/argocd/io-shop").json()["status"]["history"][-1]["deployedAt"],
+        TIMESTAMP_FORMAT
+    ).replace(tzinfo=UTC)
+    onset = the_onset_paged_with(client)
+
+    assert landed <= onset < landed + timedelta(minutes=5)
+
+
+def test_the_deployed_drift_is_paged_about_a_week_late(client: TestClient) -> None:
+    a_staged_deployed_drift(client)
+
+    assert datetime.now(UTC) - the_onset_paged_with(client) > timedelta(days=6)
+
+
+def test_the_deployed_drift_fails_no_request(client: TestClient) -> None:
+    # Nothing the generator is handed differs from a quiet shop's, which is the
+    # point: the revision changes what is written down and nothing anybody
+    # measures.
+    a_staged_deployed_drift(client)
+
+    buckets = client.get("/metrics").json()
+
+    assert buckets
+    assert all(bucket["error_rate"] < 0.05 for bucket in buckets)
 
 
 def a_staged_unreachable_control_plane(client: TestClient) -> None:
