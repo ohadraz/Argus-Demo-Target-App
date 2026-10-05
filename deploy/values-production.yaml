@@ -31,16 +31,19 @@ autoscaling:
   scaleDownStabilizationSeconds: 0
 
 # The ports the shop serves on, each selected by name rather than number.
+#
+# Every port is named for the protocol it carries, then what it is for:
+# `<protocol>[-<purpose>]`. The platform's convention, applied estate-wide.
 ports:
   web:
     port: 8000
-    portName: web
+    portName: http
   admin:
     port: 8081
-    portName: admin
+    portName: http-admin
   metrics:
     port: 9090
-    portName: metrics
+    portName: http-metrics
 
 # Where the rendered-summary cache lives.
 #
