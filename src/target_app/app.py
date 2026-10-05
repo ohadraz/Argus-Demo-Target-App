@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from io_shop.endpoints import the_shops_routes
 from pydantic import BaseModel, Field
 
 from target_app import console, prometheus
@@ -591,11 +592,6 @@ class ArgoCdRollback(BaseModel):
     id: int
     prune: bool = False
     dryRun: bool = False
-
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1442,8 +1438,7 @@ def _the_scenario_now() -> ScenarioStatus:
     )
 
 
-@app.get("/logs", response_model=list[str])
-def logs() -> list[str]:
+def _the_log_lines() -> list[str]:
     active = state.active
 
     if active is None:
@@ -1470,15 +1465,19 @@ def scenario_metrics() -> list[MetricBucket]:
     return _the_buckets()
 
 
-@app.get("/metrics")
-def metrics() -> PlainTextResponse:
+def _the_exposition() -> str:
     """What Prometheus would scrape off this shop: text exposition, current
     values of the series the stand-in's queries name.
     """
-    return PlainTextResponse(
-        prometheus.an_exposition([bucket.model_dump() for bucket in _the_buckets()]),
-        media_type=prometheus.EXPOSITION_CONTENT_TYPE
-    )
+    return prometheus.an_exposition([bucket.model_dump() for bucket in _the_buckets()])
+
+
+# The shop's own routes, answering from the figures this rig generates for it.
+app.include_router(the_shops_routes(
+    log_lines=_the_log_lines,
+    exposition=_the_exposition,
+    exposition_content_type=prometheus.EXPOSITION_CONTENT_TYPE
+))
 
 
 @app.get("/prometheus/api/v1/query_range")
