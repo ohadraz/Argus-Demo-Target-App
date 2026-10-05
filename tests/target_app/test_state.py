@@ -44,6 +44,16 @@ from target_app.state import (
 )
 
 
+def present[T](value: T | None) -> T:
+    """`value`, which the case staged and so cannot be `None`.
+
+    Said once rather than as an `assert` before every read, so a case reads as
+    what it checks rather than as the narrowing it took to get there.
+    """
+    assert value is not None, "Expected a value the case staged, and found None."
+    return value
+
+
 @pytest.fixture(autouse=True)
 def a_shop_that_has_just_started() -> None:
     """Every case begins with the shop holding nothing.
@@ -165,7 +175,7 @@ def test_seeding_backdates_the_onset_so_an_incident_already_exists() -> None:
     state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
 
     backdate = get_scenario_settings().onset_backdate_minutes
-    age_seconds = (utc_now() - state.active.timeline.turned_on_at).total_seconds()
+    age_seconds = (utc_now() - present(present(state.active).timeline).turned_on_at).total_seconds()
     assert age_seconds >= backdate * 60
 
 
@@ -174,7 +184,7 @@ def test_a_generated_scenario_has_no_end_while_its_flag_is_on() -> None:
     state = a_scenario_state(flags)
     state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
 
-    assert state.timeline_now().turned_off_at is None
+    assert present(state.timeline_now()).turned_off_at is None
 
 
 def test_a_flag_turned_off_by_anyone_ends_the_incident() -> None:
@@ -187,7 +197,7 @@ def test_a_flag_turned_off_by_anyone_ends_the_incident() -> None:
 
     flags.is_enabled.return_value = False
 
-    assert state.timeline_now().turned_off_at is not None
+    assert present(state.timeline_now()).turned_off_at is not None
 
 
 def test_the_incident_stays_ended_once_it_has_ended() -> None:
@@ -198,8 +208,8 @@ def test_the_incident_stays_ended_once_it_has_ended() -> None:
     state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
     flags.is_enabled.return_value = False
 
-    first = state.timeline_now().turned_off_at
-    second = state.timeline_now().turned_off_at
+    first = present(state.timeline_now()).turned_off_at
+    second = present(state.timeline_now()).turned_off_at
 
     assert first == second
 
@@ -219,10 +229,10 @@ def test_a_flag_switched_back_on_starts_the_incident_again() -> None:
     state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
 
     flags.is_enabled.return_value = False
-    ended = state.timeline_now()
+    ended = present(state.timeline_now())
 
     flags.is_enabled.return_value = True
-    live_again = state.timeline_now()
+    live_again = present(state.timeline_now())
 
     assert ended.turned_off_at is not None
     assert live_again.turned_off_at is None
@@ -242,7 +252,7 @@ def test_an_incident_started_again_does_not_freeze_the_window() -> None:
 
     flags.is_enabled.return_value = True
 
-    _, up_to = state.generated_window()
+    _, up_to = present(state.generated_window())
     a_generous_allowance_seconds = 5
 
     assert (utc_now() - up_to).total_seconds() < a_generous_allowance_seconds
@@ -364,7 +374,7 @@ def test_a_live_incident_generates_up_to_now() -> None:
     state = a_scenario_state(flags)
     state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
 
-    _, up_to = state.generated_window()
+    _, up_to = present(state.generated_window())
 
     a_generous_allowance_seconds = 5
     assert (utc_now() - up_to).total_seconds() < a_generous_allowance_seconds
@@ -379,7 +389,7 @@ def test_a_recovering_incident_still_generates_up_to_now() -> None:
     flags.is_enabled.return_value = False
     state.timeline_now()
 
-    _, up_to = state.generated_window()
+    _, up_to = present(state.generated_window())
 
     a_generous_allowance_seconds = 5
     assert (utc_now() - up_to).total_seconds() < a_generous_allowance_seconds
@@ -397,12 +407,13 @@ def test_a_settled_incident_stops_advancing() -> None:
 
     settle = timedelta(minutes=CLEAN_MINUTES_SHOWN_AFTER_RECOVERY)
     long_ago = utc_now() - settle - timedelta(minutes=1)
+    active = present(state.active)
     state._active = replace(
-        state.active, timeline=replace(state.active.timeline, turned_off_at=long_ago)
+        active, timeline=replace(present(active.timeline), turned_off_at=long_ago)
     )
 
     assert state.phase() == COMPLETE
-    _, up_to = state.generated_window()
+    _, up_to = present(state.generated_window())
     assert up_to == the_first_whole_minute_after(long_ago) + settle
 
 
@@ -427,16 +438,17 @@ def test_a_revert_on_a_minute_boundary_still_leaves_its_clean_minute_behind() ->
     on_the_boundary = (utc_now() - settle - timedelta(minutes=2)).replace(
         second=0, microsecond=0
     )
+    active = present(state.active)
     state._active = replace(
-        state.active,
+        active,
         timeline=replace(
-            state.active.timeline,
+            present(active.timeline),
             turned_on_at=on_the_boundary - timedelta(minutes=5),
             turned_off_at=on_the_boundary,
         ),
     )
 
-    timeline, up_to = state.generated_window()
+    timeline, up_to = present(state.generated_window())
     a_span_reaching_either_side_of_the_revert = 10
     minutes = {
         minute.minute_id: minute
@@ -474,7 +486,7 @@ def the_clean_whole_minutes_in(state: ScenarioState, after: datetime) -> list[st
     period, because the settling period is the thing being checked - a count
     computed from it would agree with it however wrong it was.
     """
-    timeline, up_to = state.generated_window()
+    timeline, up_to = present(state.generated_window())
     a_span_reaching_either_side_of_the_revert = 10
     first_clean_minute = the_first_whole_minute_after(after).strftime(TIMESTAMP_FORMAT)
 
@@ -515,10 +527,11 @@ def test_a_frozen_window_holds_enough_clean_minutes_to_confirm_a_mitigation() ->
         reverted_at = (utc_now() - long_enough_ago_to_have_frozen).replace(
             second=seconds_into_the_minute, microsecond=0
         )
+        active = present(state.active)
         state._active = replace(
-            state.active,
+            active,
             timeline=replace(
-                state.active.timeline,
+                present(active.timeline),
                 turned_on_at=reverted_at - timedelta(minutes=5),
                 turned_off_at=reverted_at
             )
@@ -600,7 +613,7 @@ def test_the_fallback_incident_ends_when_its_flag_goes_back_on() -> None:
 
     fallback_flags.is_enabled.return_value = True
 
-    assert state.timeline_now().turned_off_at is not None
+    assert present(state.timeline_now()).turned_off_at is not None
 
 
 def test_the_fallback_incident_is_still_running_while_its_flag_is_off() -> None:
@@ -610,7 +623,7 @@ def test_the_fallback_incident_is_still_running_while_its_flag_is_off() -> None:
 
     state.seed(SCENARIOS[FALLBACK_DISABLED])
 
-    assert state.timeline_now().turned_off_at is None
+    assert present(state.timeline_now()).turned_off_at is None
 
 
 def test_a_coincidental_flag_toggle_does_not_end_when_the_flag_is_reverted() -> None:
@@ -623,7 +636,7 @@ def test_a_coincidental_flag_toggle_does_not_end_when_the_flag_is_reverted() -> 
 
     flags.is_enabled.return_value = False
 
-    assert state.timeline_now().turned_off_at is None
+    assert present(state.timeline_now()).turned_off_at is None
     assert state.phase() == RUNNING
 
 
@@ -695,7 +708,7 @@ def test_a_reverted_decoy_is_stamped_on_the_next_read() -> None:
 
     flags.is_enabled.return_value = False
 
-    assert state.decoy_timeline_now().turned_off_at is not None
+    assert present(state.decoy_timeline_now()).turned_off_at is not None
 
 
 def test_a_decoy_put_back_where_it_broke_nothing_is_stamped_as_moved_again() -> None:
@@ -711,10 +724,10 @@ def test_a_decoy_put_back_where_it_broke_nothing_is_stamped_as_moved_again() -> 
     state.seed(SCENARIOS[COMPETING_FLAG_CHANGES])
 
     flags.is_enabled.return_value = False
-    put_back = state.decoy_timeline_now()
+    put_back = present(state.decoy_timeline_now())
 
     flags.is_enabled.return_value = True
-    moved_again = state.decoy_timeline_now()
+    moved_again = present(state.decoy_timeline_now())
 
     assert put_back.turned_off_at is not None
     assert moved_again.turned_off_at is None
@@ -729,7 +742,7 @@ def test_reverting_the_decoy_leaves_the_incident_running() -> None:
 
     flags.is_enabled.return_value = False
 
-    assert state.timeline_now().turned_off_at is None
+    assert present(state.timeline_now()).turned_off_at is None
     assert state.phase() == RUNNING
 
 
@@ -974,12 +987,12 @@ def test_rolling_the_deployment_back_moves_it_into_recovering() -> None:
 def test_a_rollback_puts_the_shop_back_on_the_address_that_answers() -> None:
     state = a_scenario_state(a_flag_client_reporting(False))
     a_staged_cache_misconfiguration(state)
-    broken = state.active.cache_endpoint
+    broken = present(state.active).cache_endpoint
 
     state.roll_the_deployment_back()
 
-    assert state.active.cache_endpoint != broken
-    assert state.active.cache_outage.ended_at is not None
+    assert present(state.active).cache_endpoint != broken
+    assert present(present(state.active).cache_outage).ended_at is not None
 
 
 def test_a_deployment_reconciles_itself_until_somebody_stops_it() -> None:
@@ -1318,8 +1331,8 @@ def test_a_paused_rollout_splits_the_fleet_the_instant_it_is_staged() -> None:
 
     assert state.active is not None
     assert state.active.paused_rollout is not None
-    assert state.active.paused_rollout.ended_at is None
-    assert state.active.paused_rollout.began_at < utc_now()
+    assert present(present(state.active).paused_rollout).ended_at is None
+    assert present(present(state.active).paused_rollout).began_at < utc_now()
 
 
 def test_a_paused_rollout_configures_a_cache_that_works() -> None:
@@ -1330,7 +1343,7 @@ def test_a_paused_rollout_configures_a_cache_that_works() -> None:
     a_staged_paused_rollout(state)
 
     assert state.active is not None
-    assert state.active.cache_endpoint == the_working_cache_endpoint()
+    assert present(state.active).cache_endpoint == the_working_cache_endpoint()
     assert state.active.cache_outage is None
 
 
@@ -1353,7 +1366,7 @@ def test_rolling_the_deployment_back_converges_the_fleet() -> None:
 
     assert state.active is not None
     assert state.active.paused_rollout is not None
-    assert state.active.paused_rollout.ended_at is not None
+    assert present(present(state.active).paused_rollout).ended_at is not None
     assert state.phase() == RECOVERING
 
 
@@ -1368,7 +1381,7 @@ def test_a_restart_leaves_the_fleet_split() -> None:
 
     assert state.active is not None
     assert state.active.paused_rollout is not None
-    assert state.active.paused_rollout.ended_at is None
+    assert present(present(state.active).paused_rollout).ended_at is None
     assert state.phase() == RUNNING
 
 
@@ -1391,7 +1404,7 @@ def test_withdrawing_the_rollback_splits_the_fleet_again() -> None:
 
     assert state.active is not None
     assert state.active.paused_rollout is not None
-    assert state.active.paused_rollout.ended_at is None
+    assert present(present(state.active).paused_rollout).ended_at is None
     assert state.phase() == RUNNING
 
 
@@ -1402,23 +1415,23 @@ def test_a_withdrawal_starts_a_fresh_stretch_rather_than_reopening_the_old_one(
     # the one thing those minutes are read for.
     state = a_scenario_state(a_flag_client_reporting(False))
     a_staged_paused_rollout(state)
-    began = state.active.paused_rollout.began_at
+    began = present(present(state.active).paused_rollout).began_at
     state.roll_the_deployment_back()
 
     state.withdraw_the_rollback()
 
-    assert state.active.paused_rollout.began_at > began
+    assert present(present(state.active).paused_rollout).began_at > began
 
 
 def test_withdrawing_a_rollback_nobody_took_changes_nothing() -> None:
     state = a_scenario_state(a_flag_client_reporting(False))
     a_staged_paused_rollout(state)
-    began = state.active.paused_rollout.began_at
+    began = present(present(state.active).paused_rollout).began_at
 
     state.withdraw_the_rollback()
 
-    assert state.active.paused_rollout.began_at == began
-    assert state.active.paused_rollout.ended_at is None
+    assert present(present(state.active).paused_rollout).began_at == began
+    assert present(present(state.active).paused_rollout).ended_at is None
 
 
 def test_withdrawing_the_rollback_makes_the_cache_unreachable_again() -> None:
@@ -1427,7 +1440,7 @@ def test_withdrawing_the_rollback_makes_the_cache_unreachable_again() -> None:
     state = a_scenario_state(a_flag_client_reporting(False))
     a_staged_cache_misconfiguration(state)
     assert state.active is not None
-    broken = state.active.cache_endpoint
+    broken = present(state.active).cache_endpoint
     state.roll_the_deployment_back()
 
     state.withdraw_the_rollback()
@@ -1481,7 +1494,7 @@ def test_the_drifting_scenario_is_backdated_by_days_rather_than_minutes() -> Non
     # - would go untested.
     state = a_state_with_the_totals_drifting()
 
-    age = utc_now() - state.active.timeline.turned_on_at
+    age = utc_now() - present(present(state.active).timeline).turned_on_at
 
     assert age.days >= get_scenario_settings().drift_backdate_days
 
@@ -1496,7 +1509,7 @@ def test_staging_it_records_the_flag_change_when_the_change_happened() -> None:
 
     flags, at, since = backdate.call_args.args
     assert flags == [state._flags.name]
-    assert at == state.active.timeline.turned_on_at
+    assert at == present(present(state.active).timeline).turned_on_at
     assert since > at
 
 
@@ -1577,7 +1590,7 @@ def test_the_deployed_drift_is_backdated_as_far_as_the_flag_one() -> None:
     # could be measured from the series, and only the data may date this.
     state = a_state_with_the_drift_deployed()
 
-    age = utc_now() - state.active.drifting_revision.turned_on_at
+    age = utc_now() - present(present(state.active).drifting_revision).turned_on_at
 
     assert age.days >= get_scenario_settings().drift_backdate_days
 
@@ -1614,7 +1627,7 @@ def test_rolling_the_deployment_back_ends_the_write_path_s_stretch() -> None:
 
     rolled_back_at = state.roll_the_deployment_back()
 
-    assert state.active.drifting_revision.turned_off_at == rolled_back_at
+    assert present(present(state.active).drifting_revision).turned_off_at == rolled_back_at
 
 
 def test_rolling_the_deployment_back_repairs_nothing() -> None:
@@ -1664,7 +1677,7 @@ def test_the_minute_reported_is_the_minute_the_deployment_landed() -> None:
 
     assert (
         state.the_minute_the_shop_went_quiet()
-        == state.active.scrape_outage.began_at.replace(second=0, microsecond=0)
+        == present(present(state.active).scrape_outage).began_at.replace(second=0, microsecond=0)
     )
 
 
@@ -1675,7 +1688,7 @@ def test_the_scenario_that_stops_the_publishing_stages_no_flag() -> None:
     # nothing to do with.
     state = a_state_with_the_shop_gone_quiet()
 
-    assert state.active.timeline is None
+    assert present(state.active).timeline is None
 
 
 def test_the_minute_is_old_enough_for_a_rule_to_have_fired_on_it() -> None:
@@ -1684,7 +1697,7 @@ def test_the_minute_is_old_enough_for_a_rule_to_have_fired_on_it() -> None:
     # absence older than a missed scrape.
     state = a_state_with_the_shop_gone_quiet()
 
-    quiet_for = utc_now() - state.the_minute_the_shop_went_quiet()
+    quiet_for = utc_now() - present(state.the_minute_the_shop_went_quiet())
 
     assert quiet_for >= timedelta(minutes=2)
 
@@ -1726,14 +1739,14 @@ def test_the_deliberate_rename_goes_quiet_as_the_blind_spot_does() -> None:
 
     assert (
         state.the_minute_the_shop_went_quiet()
-        == state.active.scrape_outage.began_at.replace(second=0, microsecond=0)
+        == present(present(state.active).scrape_outage).began_at.replace(second=0, microsecond=0)
     )
 
 
 def test_the_deliberate_rename_stages_no_flag() -> None:
     state = a_state_renamed_to_the_convention()
 
-    assert state.active.timeline is None
+    assert present(state.active).timeline is None
 
 
 def test_restarting_the_renamed_shop_leaves_it_unread() -> None:
@@ -1743,7 +1756,7 @@ def test_restarting_the_renamed_shop_leaves_it_unread() -> None:
 
     state.restart_the_shop()
 
-    assert state.active.scrape_outage.ended_at is None
+    assert present(present(state.active).scrape_outage).ended_at is None
 
 
 def test_rolling_the_renamed_shop_back_restores_the_collecting() -> None:
@@ -1753,7 +1766,7 @@ def test_rolling_the_renamed_shop_back_restores_the_collecting() -> None:
 
     state.roll_the_deployment_back()
 
-    assert state.active.scrape_outage.ended_at is not None
+    assert present(present(state.active).scrape_outage).ended_at is not None
 
 
 def test_resetting_the_renamed_shop_leaves_no_minute_to_report() -> None:

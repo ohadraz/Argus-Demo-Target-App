@@ -1652,6 +1652,8 @@ class ScenarioState:
         if not self._scalings or self._scalings[-1].replicas <= sized_for:
             return None
 
+        relieved_at = self._scalings[-1].at
+
         for scaling in reversed(self._scalings):
             if scaling.replicas <= sized_for:
                 break
