@@ -30,20 +30,17 @@ autoscaling:
   targetCpuPercent: 70
   scaleDownStabilizationSeconds: 0
 
-# How the platform finds the shop's metrics.
-#
-# The shop exposes its per-minute figures on this port, and the scrape config
-# selects the target by the port's *name* rather than its number - which is
-# what lets the number move without anything having to be re-pointed at it.
-#
-# The name is therefore load-bearing in a way the number is not. Nothing in the
-# shop reads it: the process serves the same endpoint whatever this says, and a
-# name nothing matches leaves a shop that is publishing perfectly well and a
-# scraper that has stopped collecting it. No request fails, no page slows, and
-# the only sign is that the series stops.
-metrics:
-  port: 9090
-  portName: http-metrics
+# The ports the shop serves on, each selected by name rather than number.
+ports:
+  web:
+    port: 8000
+    portName: web
+  admin:
+    port: 8081
+    portName: admin
+  metrics:
+    port: 9090
+    portName: metrics
 
 # Where the rendered-summary cache lives.
 #
