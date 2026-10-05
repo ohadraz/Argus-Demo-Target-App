@@ -1,0 +1,23 @@
+# How the platform's Prometheus collects the shop's metrics.
+#
+# It selects the shop's Service by label, then the endpoint to scrape on that
+# Service by the port's *name* - never its number - so a port can move without
+# anything here being touched.
+#
+# The name here has to be the one `metrics.portName` in values-production.yaml
+# gives the port. Nothing checks that the two agree: a name that matches no port
+# is not an error to the operator, it is a target list with nothing in it.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: io-shop
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: io-shop
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
