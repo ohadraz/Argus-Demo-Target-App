@@ -1,0 +1,29 @@
+# How the platform's Prometheus collects the shop's metrics.
+#
+# A stand-in for io-shop's manifest, not a real one: no cluster applies this
+# file, and nothing in this repository reads it. It is written as the
+# ServiceMonitor such a cluster would carry, so that how the shop is collected
+# is in the repository beside how it is deployed. Its labels are illustrative.
+#
+# It selects the shop's Service by label, then the endpoint to scrape on that
+# Service by the port's *name* - never its number - so a port can move without
+# anything here being touched.
+#
+# The name here has to be the one `metrics.portName` in values-production.yaml
+# gives the port. Nothing checks that the two agree: a name that matches no port
+# is not an error to the operator, it is a target list with nothing in it, and
+# the shop goes on serving metrics nobody collects.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: io-shop
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: io-shop
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
