@@ -1097,29 +1097,36 @@ class ScenarioState:
         evidence that the rollback worked - which is the one thing those minutes
         are read for.
 
-        Only the paused rollout is put back. The misconfigured cache and the
-        slower revision are left where the rollback left them, and that is a
-        limitation rather than a decision - `tests/e2e/test_withdrawing_an_incident.py`
-        already says the platform stand-in cannot distinguish a deployment put
-        back from one left rolled back, and asserts those two withdrawals
-        against the incident's record instead. This scenario is the first whose
-        condition a withdrawal can be checked against the world, so it is the
-        first that answers for it.
+        Three of the stretches a rollback ends are put back - the misconfigured
+        cache, the slower revision and the paused rollout - so each of those
+        incidents is back once its mitigation is withdrawn. The scrape outage and
+        the drifting write path are not yet, and that is a limitation rather than
+        a decision.
 
-        Free on a shop with no rollout staged, which is what makes it safe for
-        anybody to call: there is nothing to put back, and the answer is simply
-        when they asked.
+        Free on a shop with nothing a rollback ended, which is what makes it safe
+        for anybody to call: there is nothing to put back, and the answer is
+        simply when they asked.
         """
         at = utc_now()
         active = self._active
 
-        if active is None or active.paused_rollout is None:
+        if active is None:
             return at
 
-        if active.paused_rollout.ended_at is None:
-            return at
-
-        self._active = replace(active, paused_rollout=PausedRollout(began_at=at))
+        if active.cache_outage is not None and active.cache_outage.ended_at is not None:
+            # The shop dials the port the deployed revision names again, and the
+            # cache is as unreachable there as it was before the rollback.
+            self._active = replace(
+                active,
+                cache_outage=CacheOutage(began_at=at),
+                cache_endpoint=the_deployed_cache_endpoint(),
+            )
+        elif (active.deploy_slowdown is not None
+              and active.deploy_slowdown.ended_at is not None):
+            self._active = replace(active, deploy_slowdown=SlowDeployment(began_at=at))
+        elif (active.paused_rollout is not None
+              and active.paused_rollout.ended_at is not None):
+            self._active = replace(active, paused_rollout=PausedRollout(began_at=at))
 
         return at
 

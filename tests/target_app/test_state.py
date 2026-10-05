@@ -1421,6 +1421,42 @@ def test_withdrawing_a_rollback_nobody_took_changes_nothing() -> None:
     assert state.active.paused_rollout.ended_at is None
 
 
+def test_withdrawing_the_rollback_makes_the_cache_unreachable_again() -> None:
+    # The values file still names the wrong port, so putting the deployment back
+    # on the revision that carries it puts the shop back on that port.
+    state = a_scenario_state(a_flag_client_reporting(False))
+    a_staged_cache_misconfiguration(state)
+    assert state.active is not None
+    broken = state.active.cache_endpoint
+    state.roll_the_deployment_back()
+
+    state.withdraw_the_rollback()
+
+    active = state.active
+    assert active is not None and active.cache_outage is not None
+    assert active.cache_endpoint == broken
+    assert active.cache_outage.ended_at is None
+    assert state.phase() == RUNNING
+
+
+def test_withdrawing_the_rollback_slows_the_shop_again() -> None:
+    # The branch still holds the slower code, so putting the deployment back on
+    # it makes every request pay again.
+    state = a_scenario_state(a_flag_client_reporting(False))
+    state.seed(SCENARIOS[BAD_DEPLOYMENT])
+    assert state.active is not None and state.active.deploy_slowdown is not None
+    began = state.active.deploy_slowdown.began_at
+    state.roll_the_deployment_back()
+
+    state.withdraw_the_rollback()
+
+    active = state.active
+    assert active is not None and active.deploy_slowdown is not None
+    assert active.deploy_slowdown.ended_at is None
+    assert active.deploy_slowdown.began_at > began
+    assert state.phase() == RUNNING
+
+
 def a_state_with_the_totals_drifting(
     backdate_the_flag_history: Mock | None = None,
 ) -> ScenarioState:
