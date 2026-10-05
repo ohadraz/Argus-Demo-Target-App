@@ -46,12 +46,14 @@ from target_app.scenarios import (
     CONTROL_PLANE_UNREACHABLE,
     CPU_SATURATION,
     HALF_FINISHED_ROLLOUT,
+    MONITORING_CONFIGURATION_DRIFT,
     MONTHLY_STATEMENT_PANEL,
     MONTHLY_TOTALS_FALLING_BEHIND,
     PRICING_SERVICE_DEGRADED,
     RESOURCE_LEAK,
     SILENT_DATA_CORRUPTION,
     SLOW_CANARY_ROLLOUT,
+    THE_COMMIT_THAT_NAMED_EVERY_PORT_FOR_ITS_PROTOCOL,
     THE_COMMIT_THAT_STOPPED_CARRYING_THE_MONTH,
     TIMESTAMP_FORMAT,
     UPSTREAM_DEPENDENCY_FAILURE,
@@ -1653,6 +1655,50 @@ def test_the_console_offers_the_deployed_drift_beside_the_flag_one(
     }
 
     assert offered[MONTHLY_TOTALS_FALLING_BEHIND] == "foundational-integrity"
+
+
+def test_the_console_offers_the_deliberate_rename_beside_the_blind_spot(
+    client: TestClient
+) -> None:
+    offered = {
+        scenario["id"]: scenario["family"]
+        for scenario in client.get("/scenario/catalog").json()["scenarios"]
+    }
+
+    assert offered[MONITORING_CONFIGURATION_DRIFT] == "foundational-integrity"
+
+
+def test_the_deploy_history_names_the_revision_that_applied_the_convention(
+    client: TestClient
+) -> None:
+    seeded = client.post(
+        "/scenario/seed", json={"scenario_id": MONITORING_CONFIGURATION_DRIFT}
+    )
+    assert seeded.status_code == 200
+
+    history = client.get("/argocd/io-shop").json()["status"]["history"]
+
+    assert history[-1]["revision"] == THE_COMMIT_THAT_NAMED_EVERY_PORT_FOR_ITS_PROTOCOL
+
+
+def test_the_deliberate_rename_publishes_nothing_from_its_onset(
+    client: TestClient
+) -> None:
+    # The window stops rather than empties: the quiet stretch before the
+    # revision is there, and nothing at or after it.
+    client.post(
+        "/scenario/seed", json={"scenario_id": MONITORING_CONFIGURATION_DRIFT}
+    )
+
+    buckets = client.get("/scenario/metrics").json()
+    went_quiet = app_module.state.the_minute_the_shop_went_quiet()
+
+    assert buckets
+    assert all(
+        datetime.strptime(bucket["bucket_id"], TIMESTAMP_FORMAT).replace(tzinfo=UTC)
+        < went_quiet
+        for bucket in buckets
+    )
 
 
 def test_the_deploy_history_names_the_revision_that_stopped_carrying_the_month(

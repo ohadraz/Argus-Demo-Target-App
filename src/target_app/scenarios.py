@@ -666,6 +666,14 @@ CACHE_MISCONFIGURED = "cache-misconfigured"
 # platform that had stopped asking.
 THE_COMMIT_THAT_RENAMED_THE_METRICS_PORT = "9f4ad14582c99c497eb6c2d2af87566cd4493020"
 THE_COMMIT_BEFORE_THE_RENAME = "e283ba3af732fc4285166a060b827b1305cd30d9"
+# The deliberate rename, and its parent. On a branch of their own and never
+# merged, as the month-boundary pair is: `main` carries the stale scrape config
+# the fix corpus patches, and a deployed revision only has to be a commit the
+# change channel can compare against.
+THE_COMMIT_THAT_NAMED_EVERY_PORT_FOR_ITS_PROTOCOL = (
+    "53f02e9f6cb774f7f5869637bcc879941dcbc82d"
+)
+THE_COMMIT_BEFORE_THE_CONVENTION = "f061a97b221b57258899d4b3d82998815008d7bf"
 
 THE_COMMIT_THAT_MOVED_THE_CACHE_PORT = "0d8e826225f0de73958a8a8dd3d867b2ae249e72"
 THE_COMMIT_BEFORE_IT = "544cef36a8eaf45c5b030c3d5c21473d8176cef3"
@@ -774,6 +782,10 @@ CONTROL_PLANE_UNREACHABLE = "control-plane-unreachable"
 # answer than it is there, and the reason for the name is different: nothing is
 # wrong with the shop at all, so there is no condition of the shop's to name.
 MONITORING_BLIND_SPOT = "monitoring-blind-spot"
+# Named for what is wrong, as the blind spot beside it is - the scraper's
+# configuration fell behind the service's. Argus never reads a scenario id, so
+# naming the cause costs nothing here.
+MONITORING_CONFIGURATION_DRIFT = "monitoring-configuration-drift"
 # Named for the event rather than for the state, which is the opposite choice to
 # `silent-data-corruption` beside it and made for the same reason. There the
 # state is named because a flag caused it and naming the cause would put the
@@ -1290,6 +1302,37 @@ SCENARIOS: dict[str, Scenario] = {
         deploy=ScenarioDeploy(
             revision=THE_COMMIT_THAT_RENAMED_THE_METRICS_PORT,
             previous_revision=THE_COMMIT_BEFORE_THE_RENAME,
+            repo_url="https://github.com/ohadraz/Argus-Demo-Target-App",
+            path="deploy",
+            initiated_by="kuki"
+        )
+    ),
+    MONITORING_CONFIGURATION_DRIFT: Scenario(
+        id=MONITORING_CONFIGURATION_DRIFT,
+        title="The shop is renamed to the convention and the scraper is not",
+        description=(
+            "A deployment named every port in 'deploy/values-production.yaml' "
+            "for the protocol it carries - 'web' became 'http', 'admin' "
+            "'http-admin', 'metrics' 'http-metrics' - the platform's "
+            "convention, applied on purpose and across the estate. The scrape "
+            "config in 'deploy/scrape.yaml' was not changed with it, and it "
+            "selects the target by the old name, so from the minute the "
+            "revision landed the platform stopped collecting from a shop that "
+            "went on serving exactly as before. Everything a responder sees is "
+            "what the blind spot shows them: the shop trading normally, its "
+            "logs saying so, and `/metrics` carrying no row from that minute "
+            "on. What differs is the diff - a convention applied, not a value "
+            "changed - and so what is owed. Rolling the deployment back would "
+            "restore the collecting and undo work somebody meant; a restart "
+            "changes nothing. What ends it is the scrape config rolled forward "
+            "to the new name, which is a change to a file and nothing Argus "
+            "may make. Until somebody merges it, the shop stays unread."
+        ),
+        family=FOUNDATIONAL_INTEGRITY,
+        stops_publishing_telemetry=True,
+        deploy=ScenarioDeploy(
+            revision=THE_COMMIT_THAT_NAMED_EVERY_PORT_FOR_ITS_PROTOCOL,
+            previous_revision=THE_COMMIT_BEFORE_THE_CONVENTION,
             repo_url="https://github.com/ohadraz/Argus-Demo-Target-App",
             path="deploy",
             initiated_by="kuki"

@@ -23,6 +23,7 @@ from target_app.scenarios import (
     FLAG_TOGGLE_RED_HERRING,
     HALF_FINISHED_ROLLOUT,
     MONITORING_BLIND_SPOT,
+    MONITORING_CONFIGURATION_DRIFT,
     MONTHLY_TOTALS_FALLING_BEHIND,
     PRICING_SERVICE_DEGRADED,
     RESOURCE_LEAK,
@@ -1666,6 +1667,61 @@ def test_resetting_leaves_no_minute_to_report() -> None:
     # The reset restores telemetry publishing, which for this scenario is the
     # whole of what a reset has to undo.
     state = a_state_with_the_shop_gone_quiet()
+
+    state.reset()
+
+    assert state.the_minute_the_shop_went_quiet() is None
+
+
+def a_state_renamed_to_the_convention() -> ScenarioState:
+    """A shop with the monitoring-configuration-drift scenario staged.
+
+    The blind spot's sibling: the same silence, from a rename that was meant.
+    """
+    state = a_scenario_state(a_flag_client_reporting(False))
+    state.seed(SCENARIOS[MONITORING_CONFIGURATION_DRIFT])
+    return state
+
+
+def test_the_deliberate_rename_goes_quiet_as_the_blind_spot_does() -> None:
+    # The pair has to be indistinguishable everywhere but the diff, so the
+    # silence is the blind spot's own: dated the same way, by the same outage.
+    state = a_state_renamed_to_the_convention()
+
+    assert (
+        state.the_minute_the_shop_went_quiet()
+        == state.active.scrape_outage.began_at.replace(second=0, microsecond=0)
+    )
+
+
+def test_the_deliberate_rename_stages_no_flag() -> None:
+    state = a_state_renamed_to_the_convention()
+
+    assert state.active.timeline is None
+
+
+def test_restarting_the_renamed_shop_leaves_it_unread() -> None:
+    # The renamed port comes back with the process, so nothing about the
+    # collecting changes.
+    state = a_state_renamed_to_the_convention()
+
+    state.restart_the_shop()
+
+    assert state.active.scrape_outage.ended_at is None
+
+
+def test_rolling_the_renamed_shop_back_restores_the_collecting() -> None:
+    # The scenario does not pretend a rollback fails. It works, and what makes
+    # it the wrong answer is the convention it undoes.
+    state = a_state_renamed_to_the_convention()
+
+    state.roll_the_deployment_back()
+
+    assert state.active.scrape_outage.ended_at is not None
+
+
+def test_resetting_the_renamed_shop_leaves_no_minute_to_report() -> None:
+    state = a_state_renamed_to_the_convention()
 
     state.reset()
 
