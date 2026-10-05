@@ -297,10 +297,14 @@ def _the_cheaper_path_was_live_at(at: datetime,
     reach. The two are two minutes apart here, which is how long it takes somebody
     to buy something.
     """
-    if drifting_write_path is None or at <= drifting_write_path.turned_on_at:
+    if drifting_write_path is None:
         return False
 
-    if drifting_write_path.turned_off_at is None:
-        return True
-
-    return at < drifting_write_path.turned_off_at
+    # Every stretch it was live over, not only the latest: a revision put back
+    # after a rollback writes short again, and what it wrote short the first time
+    # stays short.
+    return any(
+        stretch.turned_on_at < at
+        and (stretch.turned_off_at is None or at < stretch.turned_off_at)
+        for stretch in (*drifting_write_path.earlier, drifting_write_path)
+    )

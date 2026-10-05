@@ -1470,6 +1470,52 @@ def test_withdrawing_the_rollback_slows_the_shop_again() -> None:
     assert state.phase() == RUNNING
 
 
+def test_withdrawing_the_rollback_keeps_the_minutes_before_it() -> None:
+    # The minutes the slower revision ran before the rollback are what happened,
+    # and a withdrawal that forgot them would show a shop that was quick until
+    # somebody took the rollback back.
+    state = a_scenario_state(a_flag_client_reporting(False))
+    state.seed(SCENARIOS[BAD_DEPLOYMENT])
+    began = present(present(state.active).deploy_slowdown).began_at
+    a_minute_before_the_rollback = (began + timedelta(minutes=1)).replace(
+        second=0, microsecond=0
+    )
+    state.roll_the_deployment_back()
+
+    state.withdraw_the_rollback()
+
+    slowdown = present(present(state.active).deploy_slowdown)
+    assert slowdown.share_of(a_minute_before_the_rollback, 60) == 1.0
+
+
+def test_withdrawing_the_rollback_stops_the_collecting_again() -> None:
+    # The port goes back to the name the scrape config does not match, and the
+    # minutes nobody collected the first time stay uncollected.
+    state = a_state_with_the_shop_gone_quiet()
+    went_quiet = present(state.the_minute_the_shop_went_quiet())
+    state.roll_the_deployment_back()
+
+    state.withdraw_the_rollback()
+
+    outage = present(present(state.active).scrape_outage)
+    assert outage.ended_at is None
+    assert outage.covers(went_quiet)
+
+
+def test_withdrawing_the_rollback_drifts_the_totals_again() -> None:
+    # The revision that skips the month is running again, and the stretch it
+    # ran the first time still dates when it landed.
+    state = a_state_with_the_drift_deployed()
+    went_live = present(present(state.active).drifting_revision).turned_on_at
+    state.roll_the_deployment_back()
+
+    state.withdraw_the_rollback()
+
+    revision = present(present(state.active).drifting_revision)
+    assert revision.turned_off_at is None
+    assert revision.first_turned_on_at == went_live
+
+
 def a_state_with_the_totals_drifting(
     backdate_the_flag_history: Mock | None = None,
 ) -> ScenarioState:

@@ -173,6 +173,22 @@ def test_putting_the_flag_back_repairs_nothing() -> None:
     )
 
 
+def test_a_write_path_put_back_after_a_rollback_keeps_what_it_wrote_short() -> None:
+    # A rollback withdrawn puts the revision back, and the check reads both
+    # stretches it ran over: the purchases it skipped the month on the first time
+    # are still short, so the oldest of them still dates the change.
+    rolled_back_at = SOME_INSTANT - timedelta(hours=2)
+    rolled_back = what_the_check_found(a_drifting_shop(rolled_back_at), SOME_INSTANT)
+
+    put_back = what_the_check_found(
+        a_drifting_shop(rolled_back_at).again_from(SOME_INSTANT - timedelta(hours=1)),
+        SOME_INSTANT
+    )
+
+    assert put_back.oldest_affected_purchase_at == rolled_back.oldest_affected_purchase_at
+    assert put_back.largest_gap_cents >= rolled_back.largest_gap_cents
+
+
 def test_the_check_reads_the_same_totals_a_restarted_process_would() -> None:
     # A restart is nowhere in this derivation, which is the whole reason it
     # changes nothing: the fault is in what was written down, and a fresh process

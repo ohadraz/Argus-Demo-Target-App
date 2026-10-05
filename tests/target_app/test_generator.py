@@ -2277,3 +2277,51 @@ def test_a_shop_whose_cache_never_failed_over_says_nothing_about_a_primary() -> 
         line for minute in minutes for line in minute.log_lines
         if "new primary" in line
     ]
+
+
+# One clock for a stretch put back after a rollback: the first stretch, the gap
+# the rollback held, and the second stretch opened by withdrawing it.
+FIRST_BEGAN = SOME_NOW - timedelta(minutes=30)
+ROLLED_BACK = SOME_NOW - timedelta(minutes=20)
+PUT_BACK = SOME_NOW - timedelta(minutes=10)
+A_MINUTE_OF_THE_FIRST = datetime(2026, 8, 28, 12, 5, tzinfo=UTC)
+A_MINUTE_BETWEEN = datetime(2026, 8, 28, 12, 15, tzinfo=UTC)
+A_MINUTE_OF_THE_SECOND = datetime(2026, 8, 28, 12, 25, tzinfo=UTC)
+THE_THREE_MINUTES = (A_MINUTE_OF_THE_FIRST, A_MINUTE_BETWEEN, A_MINUTE_OF_THE_SECOND)
+A_WHOLE_MINUTE = 60
+
+
+def test_a_stretch_opened_again_keeps_the_minutes_of_the_one_before() -> None:
+    # What a withdrawn rollback leaves: the condition is back, the minutes the
+    # rollback held are clear, and the minutes before the rollback are what they
+    # were. A stretch that forgot the first would rewrite them as healthy.
+    for first in (
+        CacheOutage(began_at=FIRST_BEGAN, ended_at=ROLLED_BACK),
+        SlowDeployment(began_at=FIRST_BEGAN, ended_at=ROLLED_BACK),
+        PausedRollout(began_at=FIRST_BEGAN, ended_at=ROLLED_BACK),
+    ):
+        again = first.again_from(PUT_BACK)
+
+        assert [
+            again.share_of(minute, A_WHOLE_MINUTE) for minute in THE_THREE_MINUTES
+        ] == [1.0, 0.0, 1.0], type(first).__name__
+
+
+def test_a_silence_begun_again_keeps_the_minutes_nobody_collected_before() -> None:
+    again = ScrapeOutage(began_at=FIRST_BEGAN, ended_at=ROLLED_BACK).again_from(PUT_BACK)
+
+    assert [again.covers(minute) for minute in THE_THREE_MINUTES] == [True, False, True]
+
+
+def test_a_write_path_live_again_keeps_the_stretch_it_ran_before() -> None:
+    again = FlagTimeline(
+        turned_on_at=FIRST_BEGAN, turned_off_at=ROLLED_BACK
+    ).again_from(PUT_BACK)
+
+    assert [
+        again.seconds_on_within(minute, A_WHOLE_MINUTE) for minute in THE_THREE_MINUTES
+    ] == [A_WHOLE_MINUTE, 0, A_WHOLE_MINUTE]
+    assert [again.was_on_during(minute) for minute in THE_THREE_MINUTES] == [
+        True, False, True
+    ]
+    assert again.first_turned_on_at == FIRST_BEGAN

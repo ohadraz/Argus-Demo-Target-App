@@ -1090,18 +1090,12 @@ class ScenarioState:
         pointed the other way. That is what a withdrawal does - Argus undoes a
         mitigation by asking for the revision it found running.
 
-        A fresh stretch rather than the old one reopened, for the reason a flag
-        timeline starts a fresh one: this holds a single began-and-ended pair, so
-        the minutes between the rollback and the withdrawal cannot be expressed
-        as a gap, and claiming the fleet was split throughout would erase the
-        evidence that the rollback worked - which is the one thing those minutes
-        are read for.
-
-        Three of the stretches a rollback ends are put back - the misconfigured
-        cache, the slower revision and the paused rollout - so each of those
-        incidents is back once its mitigation is withdrawn. The scrape outage and
-        the drifting write path are not yet, and that is a limitation rather than
-        a decision.
+        Every condition a rollback ends is put back, as a new stretch that
+        remembers the one the rollback ended. Neither half can go: reopening the
+        old stretch would claim the incident ran through the minutes the rollback
+        worked, which are what says it worked, and a stretch that forgot the old
+        one would rewrite the minutes before the rollback - a window healthy before
+        it, a silence that never happened, totals written short that are not.
 
         Free on a shop with nothing a rollback ended, which is what makes it safe
         for anybody to call: there is nothing to put back, and the answer is
@@ -1113,20 +1107,35 @@ class ScenarioState:
         if active is None:
             return at
 
-        if active.cache_outage is not None and active.cache_outage.ended_at is not None:
+        if active.scrape_outage is not None and active.scrape_outage.ended_at is not None:
+            # The port goes back to the name the scrape config no longer
+            # matches, and the platform stops collecting the shop again.
+            self._active = replace(
+                active, scrape_outage=active.scrape_outage.again_from(at)
+            )
+        elif active.cache_outage is not None and active.cache_outage.ended_at is not None:
             # The shop dials the port the deployed revision names again, and the
             # cache is as unreachable there as it was before the rollback.
             self._active = replace(
                 active,
-                cache_outage=CacheOutage(began_at=at),
+                cache_outage=active.cache_outage.again_from(at),
                 cache_endpoint=the_deployed_cache_endpoint(),
             )
         elif (active.deploy_slowdown is not None
               and active.deploy_slowdown.ended_at is not None):
-            self._active = replace(active, deploy_slowdown=SlowDeployment(began_at=at))
+            self._active = replace(
+                active, deploy_slowdown=active.deploy_slowdown.again_from(at)
+            )
+        elif (active.drifting_revision is not None
+              and active.drifting_revision.turned_off_at is not None):
+            self._active = replace(
+                active, drifting_revision=active.drifting_revision.again_from(at)
+            )
         elif (active.paused_rollout is not None
               and active.paused_rollout.ended_at is not None):
-            self._active = replace(active, paused_rollout=PausedRollout(began_at=at))
+            self._active = replace(
+                active, paused_rollout=active.paused_rollout.again_from(at)
+            )
 
         return at
 

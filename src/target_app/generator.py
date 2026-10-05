@@ -423,13 +423,30 @@ class FlagTimeline:
     and a provider that stopped answering. `turned_off_at` being `None` means
     the flag is still on - so an incident with no end recorded is one still
     happening, which is exactly the reading a caller wants.
+
+    `earlier` holds the stretches before this one, oldest first, for a revision
+    put back after a rollback ended it: the minutes it was live the first time
+    are what happened, and a stretch that forgot them would rewrite the record.
     """
 
     turned_on_at: datetime
     turned_off_at: datetime | None = None
+    earlier: tuple[FlagTimeline, ...] = ()
+
+    @property
+    def first_turned_on_at(self) -> datetime:
+        """When the first of these stretches began."""
+        return self.earlier[0].turned_on_at if self.earlier else self.turned_on_at
+
+    def again_from(self, at: datetime) -> FlagTimeline:
+        """A new stretch beginning at `at`, remembering this one and its own."""
+        return FlagTimeline(turned_on_at=at, earlier=(*self.earlier, self))
 
     def was_on_during(self, minute: datetime) -> bool:
         """Whether the flag was on for the whole of this minute."""
+        if any(stretch.was_on_during(minute) for stretch in self.earlier):
+            return True
+
         if minute < self.turned_on_at.replace(second=0, microsecond=0):
             return False
 
@@ -454,8 +471,11 @@ class FlagTimeline:
         on_until = window_end if self.turned_off_at is None else min(
             window_end, self.turned_off_at
         )
+        earlier_seconds = sum(
+            stretch.seconds_on_within(minute, elapsed_seconds) for stretch in self.earlier
+        )
 
-        return max(0, int((on_until - on_from).total_seconds()))
+        return max(0, int((on_until - on_from).total_seconds())) + earlier_seconds
 
 
 @dataclass(frozen=True)
@@ -517,10 +537,16 @@ class ScrapeOutage:
     shop that is unwell, it is a window with nothing in it at all.
 
     `ended_at` being `None` means the shop is still not being collected from.
+    `earlier` holds the stretches before this one, as `FlagTimeline`'s does.
     """
 
     began_at: datetime
     ended_at: datetime | None = None
+    earlier: tuple[ScrapeOutage, ...] = ()
+
+    def again_from(self, at: datetime) -> ScrapeOutage:
+        """A new stretch beginning at `at`, remembering this one and its own."""
+        return ScrapeOutage(began_at=at, earlier=(*self.earlier, self))
 
     def covers(self, minute: datetime) -> bool:
         """Whether this whole minute went uncollected.
@@ -532,6 +558,9 @@ class ScrapeOutage:
         resume at the minute of the rollback rather than the one after it, so
         the sight returns as soon as it truly did.
         """
+        if any(stretch.covers(minute) for stretch in self.earlier):
+            return True
+
         if minute < self.began_at.replace(second=0, microsecond=0):
             return False
 
@@ -557,11 +586,17 @@ class CacheOutage:
     where the shop is dialling, and this says over which minutes dialling it
     got nowhere.
 
-    `ended_at` being `None` means the shop still cannot reach it.
+    `ended_at` being `None` means the shop still cannot reach it. `earlier` holds
+    the stretches before this one, as `FlagTimeline`'s does.
     """
 
     began_at: datetime
     ended_at: datetime | None = None
+    earlier: tuple[CacheOutage, ...] = ()
+
+    def again_from(self, at: datetime) -> CacheOutage:
+        """A new stretch beginning at `at`, remembering this one and its own."""
+        return CacheOutage(began_at=at, earlier=(*self.earlier, self))
 
     def share_of(self, minute: datetime, elapsed_seconds: int) -> float:
         """How much of this minute's first `elapsed_seconds` the shop spent
@@ -581,8 +616,11 @@ class CacheOutage:
             window_end, self.ended_at
         )
         seconds_lost = max(0.0, (lost_until - lost_from).total_seconds())
+        earlier_share = sum(
+            stretch.share_of(minute, elapsed_seconds) for stretch in self.earlier
+        )
 
-        return min(1.0, seconds_lost / elapsed_seconds)
+        return min(1.0, seconds_lost / elapsed_seconds + earlier_share)
 
 
 @dataclass(frozen=True)
@@ -648,10 +686,16 @@ class SlowDeployment:
     cost anything. A rollback ends the stretch without removing the entry.
 
     `ended_at` being `None` means the slower revision is still deployed.
+    `earlier` holds the stretches before this one, as `FlagTimeline`'s does.
     """
 
     began_at: datetime
     ended_at: datetime | None = None
+    earlier: tuple[SlowDeployment, ...] = ()
+
+    def again_from(self, at: datetime) -> SlowDeployment:
+        """A new stretch beginning at `at`, remembering this one and its own."""
+        return SlowDeployment(began_at=at, earlier=(*self.earlier, self))
 
     def share_of(self, minute: datetime, elapsed_seconds: int) -> float:
         """How much of this minute's first `elapsed_seconds` the slower revision
@@ -671,8 +715,11 @@ class SlowDeployment:
             window_end, self.ended_at
         )
         seconds_live = max(0.0, (live_until - live_from).total_seconds())
+        earlier_share = sum(
+            stretch.share_of(minute, elapsed_seconds) for stretch in self.earlier
+        )
 
-        return min(1.0, seconds_live / elapsed_seconds)
+        return min(1.0, seconds_live / elapsed_seconds + earlier_share)
 
 
 @dataclass(frozen=True)
@@ -692,11 +739,17 @@ class PausedRollout:
     away from it, and the minute an incident like this is read is the same
     minute however long it has been going on.
 
-    `ended_at` being `None` means the fleet is still split.
+    `ended_at` being `None` means the fleet is still split. `earlier` holds the
+    stretches before this one, as `FlagTimeline`'s does.
     """
 
     began_at: datetime
     ended_at: datetime | None = None
+    earlier: tuple[PausedRollout, ...] = ()
+
+    def again_from(self, at: datetime) -> PausedRollout:
+        """A new stretch beginning at `at`, remembering this one and its own."""
+        return PausedRollout(began_at=at, earlier=(*self.earlier, self))
 
     def share_of(self, minute: datetime, elapsed_seconds: int) -> float:
         """How much of this minute's first `elapsed_seconds` the fleet spent
@@ -718,8 +771,11 @@ class PausedRollout:
             window_end, self.ended_at
         )
         seconds_split = max(0.0, (split_until - split_from).total_seconds())
+        earlier_share = sum(
+            stretch.share_of(minute, elapsed_seconds) for stretch in self.earlier
+        )
 
-        return min(1.0, seconds_split / elapsed_seconds)
+        return min(1.0, seconds_split / elapsed_seconds + earlier_share)
 
 
 @dataclass(frozen=True)
