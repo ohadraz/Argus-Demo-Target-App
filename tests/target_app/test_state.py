@@ -239,6 +239,26 @@ def test_a_flag_switched_back_on_starts_the_incident_again() -> None:
     assert live_again.turned_on_at >= ended.turned_off_at
 
 
+def test_a_flag_switched_back_on_keeps_the_stretch_before_the_revert() -> None:
+    # The minutes the incident first ran are what happened, and the re-enable does
+    # not unhappen them. Dropped, they read as quiet - and an agent investigating
+    # again after its revert was refuted found a window with no departure in it
+    # and called the alarm false.
+    flags = a_flag_client_reporting(True)
+    state = a_scenario_state(flags)
+    state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
+    first_stretch = present(state.timeline_now())
+
+    flags.is_enabled.return_value = False
+    ended = present(state.timeline_now())
+
+    flags.is_enabled.return_value = True
+    live_again = present(state.timeline_now())
+
+    assert live_again.earlier == (ended,)
+    assert live_again.first_turned_on_at == first_stretch.turned_on_at
+
+
 def test_an_incident_started_again_does_not_freeze_the_window() -> None:
     # The consequence the reconciliation exists for. A window frozen at the first
     # revert stops advancing, so the minutes an agent reads to judge its second

@@ -127,17 +127,15 @@ def _caught_up_with_the_flag(timeline: FlagTimeline,
     is the fixture lying in the one channel an agent checks to find out what its
     own action did.
 
-    Reopening starts a fresh stretch rather than extending the old one. A
-    timeline holds one on-and-off pair, so the minutes between a revert and a
-    re-enable cannot be expressed as a gap - and claiming the flag was away
-    throughout would erase the evidence that the revert worked, which is the one
-    thing those minutes are read for. What is lost instead is the earlier
-    stretch's dates: minutes before the re-enable read as quiet. That is the
-    right way round for a fixture, whose job is to be honest about the state an
-    agent is about to act on.
+    Reopening starts a fresh stretch rather than extending the old one, with the
+    old one kept behind it. Extended, the minutes between a revert and a
+    re-enable would read as broken, erasing the evidence that the revert worked;
+    dropped, the minutes before the revert would read as quiet, erasing the
+    incident itself - and an agent investigating again after its revert was
+    refuted would find a window with nothing in it and call the alarm false.
     """
     if moved_now:
-        return FlagTimeline(turned_on_at=utc_now())
+        return timeline.again_from(utc_now())
 
     return replace(timeline, turned_off_at=utc_now())
 
