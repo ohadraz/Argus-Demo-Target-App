@@ -36,6 +36,7 @@ from target_app.monitoring import (
     AlertNotDelivered,
     an_alert_for,
     fire_alert,
+    the_rule_for,
 )
 from target_app.oncall import a_user, an_incident
 from target_app.payments import a_page_of_charges
@@ -202,6 +203,11 @@ class ScenarioStatus(BaseModel):
     # `active_scenario` and for the same reason: a shop with no scenario has no
     # seeding to date anything from.
     seeded_at: datetime | None = None
+    # The uid of the series rule the scenario trips - what Grafana's webhook
+    # names it by. Reported because whoever stages an incident and pages about it
+    # by hand has to say which rule fired, and the rule is the scenario's. `None`
+    # where nothing is staged, for the reason `seeded_at` is.
+    rule_uid: str | None = None
 
 
 class ShopRestarted(BaseModel):
@@ -1538,7 +1544,10 @@ def _the_scenario_now() -> ScenarioStatus:
 
     return ScenarioStatus(
         active_scenario=state.active_scenario_id,
-        seeded_at=active.seeded_at if active is not None else None
+        seeded_at=active.seeded_at if active is not None else None,
+        rule_uid=(
+            the_rule_for(state.active_scenario_id).uid if active is not None else None
+        )
     )
 
 

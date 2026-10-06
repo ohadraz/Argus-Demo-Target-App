@@ -14,7 +14,10 @@ x-on-the-stacks-clock: &on-the-stacks-clock
   FAKETIME_TIMESTAMP_FILE: /clock/spec
   # Read on every call, not cached for the default ten seconds: the offset grows
   # by `speed - 1` seconds every real second, and a cached one would put this
-  # container that far behind everybody else.
+  # container that far behind everybody else. Which is also why a process that
+  # reads the clock from several threads must link the thread-safe build,
+  # `libfaketimeMT`: the plain one, reading this file from two threads at once,
+  # now and then answers with the wall's time.
   FAKETIME_NO_CACHE: "1"
   FAKETIME_DONT_FAKE_MONOTONIC: "1"
   LD_PRELOAD: /usr/local/lib/libfaketime.so.1

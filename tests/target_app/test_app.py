@@ -38,7 +38,7 @@ from target_app.app import (
 )
 from target_app.flags import FlagClient
 from target_app.generator import BASELINE_MEMORY_BYTES, SETTLED_UPTIME
-from target_app.monitoring import an_alert_for
+from target_app.monitoring import an_alert_for, the_rule_for
 from target_app.prometheus import QUERIES
 from target_app.scenarios import (
     AUTOSCALER_FLAPPING,
@@ -289,6 +289,18 @@ def test_a_shop_with_nothing_staged_has_no_seeding_to_date(client: TestClient) -
     client.post("/scenario/reset")
 
     assert client.get("/scenario/status").json()["seeded_at"] is None
+
+
+def test_seeding_says_which_rule_the_scenario_trips(client: TestClient) -> None:
+    seeded = client.post("/scenario/seed", json={"scenario_id": RESOURCE_LEAK})
+
+    assert seeded.json()["rule_uid"] == the_rule_for(RESOURCE_LEAK).uid
+
+
+def test_a_shop_with_nothing_staged_names_no_rule(client: TestClient) -> None:
+    client.post("/scenario/reset")
+
+    assert client.get("/scenario/status").json()["rule_uid"] is None
 
 
 def test_the_leak_is_offered_in_the_console(client: TestClient) -> None:
