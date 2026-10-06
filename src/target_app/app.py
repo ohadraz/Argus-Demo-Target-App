@@ -204,10 +204,12 @@ class ScenarioStatus(BaseModel):
     # `active_scenario` and for the same reason: a shop with no scenario has no
     # seeding to date anything from.
     seeded_at: datetime | None = None
-    # The uid of the series rule the scenario trips - what Grafana's webhook
-    # names it by. Reported because whoever stages an incident and pages about it
-    # by hand has to say which rule fired, and the rule is the scenario's. `None`
-    # where nothing is staged, for the reason `seeded_at` is.
+    # The uid of the series rule a page about the scenario names - what Grafana's
+    # webhook names it by: the rule the scenario trips, or the shop's default
+    # error-rate rule for one whose own page is a finding rather than a series.
+    # Reported because whoever stages an incident and pages about it by hand has
+    # to say which rule fired. `None` where nothing is staged, for the reason
+    # `seeded_at` is.
     rule_uid: str | None = None
 
 
@@ -1432,7 +1434,7 @@ def raise_alert() -> AlertRaised:
 @app.get("/grafana/api/v1/provisioning/alert-rules/{uid}")
 def grafana_alert_rule(uid: str) -> JSONResponse:
     """Stands in for Grafana's `GET /api/v1/provisioning/alert-rules/{uid}`:
-    what the rule watches, over how long, and its `for` and `keepFiringFor`."""
+    what the rule watches, over how long, and its `for` and `keep_firing_for`."""
     rule = alert_rules.SERIES_RULES.get(uid)
 
     if rule is not None:
@@ -1447,7 +1449,7 @@ def grafana_alert_rule(uid: str) -> JSONResponse:
     # caller could read a window off - which is the truth about it.
     return JSONResponse(content={
         "uid": uid, "title": title, "folderUID": alert_rules.FOLDER_UID,
-        "ruleGroup": alert_rules.GROUP, "for": "0s", "keepFiringFor": "0s",
+        "ruleGroup": alert_rules.GROUP, "for": "0s", "keep_firing_for": "0s",
         "data": []
     })
 

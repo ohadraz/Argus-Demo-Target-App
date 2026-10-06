@@ -25,7 +25,7 @@ from datetime import UTC, datetime, timedelta
 from statistics import mean
 from typing import Any, Final
 
-# Grafana's names for the states a rule's instance is in.
+# The states Grafana's Prometheus-compatible rules API reports for a rule.
 FIRING: Final = "firing"
 PENDING: Final = "pending"
 INACTIVE: Final = "inactive"
@@ -149,10 +149,11 @@ HIGH_MEMORY_USAGE: Final = AlertRule(
     range_minutes=1,
     pending=timedelta(minutes=15)
 )
-# The burn-rate rule: errors over a long window, against a lower line. What it
-# sees that the rule above cannot is a shop failing one minute in a few - each
-# failing minute fires the short rule and each quiet one resolves it, where ten
-# minutes averaged stay above the line while any one of them fails. Two and a
+# The long-window rule: the error rate averaged over ten minutes, against a
+# lower line. What it sees that the rule above cannot is a shop failing one
+# minute in a few - each failing minute sets the short rule pending and each
+# quiet one clears it, so it never fires, where ten minutes averaged stay above
+# the line while any one of them fails. Two and a
 # half percent because one failing minute in ten averages above three, and ten
 # healthy minutes average one, two at the very worst.
 ERROR_RATE_SUSTAINED: Final = AlertRule(
@@ -200,8 +201,8 @@ def state_of(rule: AlertRule,
     `window_ends_at` is the instant the shop's minutes run up to. It is `now`
     while a scenario is live, and earlier once one has settled and its window
     froze; an evaluation after that reads the settled shop - the minutes up to
-    the freeze - rather than minutes nobody generated, which would read as no
-    data.
+    the freeze - rather than minutes nobody generated, which would read as
+    inactive.
     """
     evaluated_at = last_evaluation_at(rule, now)
 
@@ -268,7 +269,7 @@ def a_definition(rule: AlertRule) -> dict[str, Any]:
         "ruleGroup": GROUP,
         "condition": "C",
         "for": _a_duration(rule.pending),
-        "keepFiringFor": _a_duration(rule.keep_firing_for),
+        "keep_firing_for": _a_duration(rule.keep_firing_for),
         "noDataState": "NoData",
         "execErrState": "Error",
         "data": [

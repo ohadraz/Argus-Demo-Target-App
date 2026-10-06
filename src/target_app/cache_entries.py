@@ -38,7 +38,7 @@ harness and no patch has ever touched it, so the spelling is safe here.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 
 import redis
@@ -79,7 +79,7 @@ def the_key_for(shopper_id: str) -> str:
 
 
 @contextmanager
-def a_client_for(endpoint: CacheEndpoint) -> Iterator[redis.Redis]:
+def a_client_for(endpoint: CacheEndpoint) -> Generator[redis.Redis]:
     """A connection to the cache at `endpoint`, closed when the caller is done.
 
     `decode_responses` so what comes back is the text the shop wrote, which is

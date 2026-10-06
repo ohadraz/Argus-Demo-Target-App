@@ -62,19 +62,22 @@ REQUEST_TIMEOUT_SECONDS = 300.0
 SERVICE_NAME = "io-shop"
 
 # Which rule fired. A deploy that slowed the shop down trips a different rule
-# than one that made it throw, and the alert name is the only part of the
-# payload that says which. The rules written against a series live in
-# `target_app.alert_rules`, which is what answers for their state; the three
-# below are findings, and are named here with the uid each alert carries.
-# The one rule here that is not written against a series at all. Every name above
-# names something a metrics stack measures over time; this one names a comparison
-# between two stored figures, which is the only way the incident behind it can be
-# reported - no series moves, so no threshold is ever crossed.
+# than one that made it throw, and the link to the rule is the part of the
+# payload that says which - the title alone is shared by the latency rules. The
+# rules written against a series live in `target_app.alert_rules`, which is what
+# answers for their state; the three below are findings, and are named here with
+# the uid each alert links to.
+# The one rule here that is not written against a series at all. Every rule in
+# `target_app.alert_rules` names something a metrics stack measures over time;
+# this one names a comparison between two stored figures, which is the only way
+# the incident behind it can be reported - no series moves, so no threshold is
+# ever crossed.
 _TOTALS_DO_NOT_RECONCILE = "SpendTotalsDoNotReconcile"
 # The second rule here not written against a value, and the only one written
-# against the *absence* of one. Every name above fires because a series crossed
-# a line; this one fires because a series that was reporting stopped, which no
-# threshold can express - there is nothing to compare. Every real monitoring
+# against the *absence* of one. Every rule in `target_app.alert_rules` fires
+# because a series crossed a line; this one fires because a series that was
+# reporting stopped, which no threshold can express - there is nothing to
+# compare. Every real monitoring
 # stack has this rule and it is the last shape of alert this shop could not
 # raise.
 _METRICS_ABSENT = "MetricsAbsent"
@@ -251,9 +254,10 @@ _WHAT_FIRED: dict[str, tuple[AlertRule, str]] = {
     AUTOSCALER_FLAPPING: (
         HIGH_LATENCY_P95, "p95 latency above threshold for 5m"
     ),
-    # The burn-rate rule rather than the error-rate one, because the shop it pages
-    # about fails one minute in a few: the short rule fires and resolves with every
-    # minute, and the long one is what stays firing while any of them fail.
+    # The long-window rule rather than the short error-rate one, because the shop
+    # it pages about fails one minute in a few: the short rule goes pending and
+    # clears with every minute and never fires, and the long one is what stays
+    # firing while any of them fail.
     FLAG_REVERT_LEAVES_A_FLAP: (
         ERROR_RATE_SUSTAINED, "Error rate above 2.5% averaged over 10m"
     ),
@@ -395,7 +399,8 @@ def an_alert_for(scenario_id: str | None,
 
 
 def the_rule_for(scenario_id: str | None) -> AlertRule:
-    """The series rule a scenario trips."""
+    """The series rule a page about a scenario names: the one it trips, or the
+    default error-rate rule for a scenario that trips none of them."""
     return _WHAT_FIRED.get(scenario_id or "", _BY_DEFAULT)[0]
 
 

@@ -4,7 +4,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from target_app.alert_rules import (
-    ERROR_RATE_SUSTAINED,
     FIRING,
     HIGH_ERROR_RATE,
     HIGH_LATENCY_P95,
@@ -106,26 +105,6 @@ def test_the_latency_rule_stays_firing_through_a_capacity_that_will_not_hold_sti
     assert states == [FIRING] * 8
 
 
-def test_the_sustained_rule_stays_firing_through_a_flap_with_no_rhythm() -> None:
-    # Single failing minutes with gaps of two, five, three and seven: the short
-    # rule resolves in every gap, and ten minutes averaged never do.
-    flap = [0.33, 0.01, 0.01, 0.33, 0.01, 0.01, 0.01, 0.01, 0.01, 0.33,
-            0.01, 0.01, 0.01, 0.33, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.33]
-    rows = minutes_of(error_rates=[0.33] * 10 + flap)
-
-    sustained = {
-        state_of(ERROR_RATE_SUSTAINED, rows, at_minute(m), at_minute(m)).state
-        for m in range(21, 32)
-    }
-    short = {
-        state_of(HIGH_ERROR_RATE, rows, at_minute(m), at_minute(m)).state
-        for m in range(21, 32)
-    }
-
-    assert sustained == {FIRING}
-    assert INACTIVE in short
-
-
 def test_no_minute_in_range_is_no_data() -> None:
     state = state_of(HIGH_ERROR_RATE, [], at_minute(5), at_minute(5))
 
@@ -143,7 +122,7 @@ def test_a_definition_carries_its_range_in_seconds_and_its_for() -> None:
     assert definition["uid"] == HIGH_LATENCY_P95.uid
     assert definition["data"][0]["relativeTimeRange"] == {"from": 120, "to": 0}
     assert definition["for"] == "5m"
-    assert definition["keepFiringFor"] == "0m"
+    assert definition["keep_firing_for"] == "0m"
 
 
 def test_the_state_answer_is_in_grafanas_shape() -> None:
@@ -170,19 +149,13 @@ def test_every_alert_the_shop_raises_names_a_rule_it_answers_for() -> None:
         assert the_rule_linked_from(alert) in known
 
 
-def test_the_alert_names_the_rule_it_is_titled_after() -> None:
-    alert = an_alert_for(BAD_DEPLOYMENT, WINDOW_STARTS)["alerts"][0]
-
-    assert the_rule_linked_from(alert) == HIGH_LATENCY_P95.uid
-    assert alert["labels"]["alertname"] == HIGH_LATENCY_P95.title
-
-
-def test_the_alert_names_its_rule_only_where_grafana_does() -> None:
+def test_the_alert_links_to_the_rule_it_is_titled_after() -> None:
     # Grafana's webhook has no field for the rule that fired; the link to the
     # rule is the one place it says, in the shape its releases build.
     alert = an_alert_for(BAD_DEPLOYMENT, WINDOW_STARTS)["alerts"][0]
 
-    assert "ruleUID" not in alert
     assert alert["generatorURL"].endswith(
         f"/alerting/grafana/{HIGH_LATENCY_P95.uid}/view"
     )
+    assert alert["labels"]["alertname"] == HIGH_LATENCY_P95.title
+    assert "ruleUID" not in alert

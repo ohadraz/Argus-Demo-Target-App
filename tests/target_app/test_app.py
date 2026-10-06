@@ -17,12 +17,13 @@ from io_shop.visits import (
     record_visit,
 )
 from target_app import app as app_module
+from target_app.alert_rules import ERROR_RATE_SUSTAINED, FOLDER_UID, GROUP, INACTIVE
 from target_app.app import (
+    A_REQUEST_THE_PROVIDER_REFUSES,
     AN_INVALID_REQUEST,
     AUTOSCALER_GROUP,
     AUTOSCALER_KIND,
     AUTOSCALER_VERSION,
-    A_REQUEST_THE_PROVIDER_REFUSES,
     GENERATED_SPAN_MINUTES,
     MERGE_PATCH_TYPE,
     MIN_REPLICAS_FIELD,
@@ -38,7 +39,7 @@ from target_app.app import (
 )
 from target_app.flags import FlagClient
 from target_app.generator import BASELINE_MEMORY_BYTES, SETTLED_UPTIME
-from target_app.monitoring import an_alert_for, the_rule_for
+from target_app.monitoring import FINDING_RULE_UIDS, an_alert_for, the_rule_for
 from target_app.prometheus import QUERIES
 from target_app.scenarios import (
     AUTOSCALER_FLAPPING,
@@ -301,6 +302,77 @@ def test_a_shop_with_nothing_staged_names_no_rule(client: TestClient) -> None:
     client.post("/scenario/reset")
 
     assert client.get("/scenario/status").json()["rule_uid"] is None
+
+
+def test_the_rule_definition_route_answers_in_the_provisioning_apis_shape(
+    client: TestClient
+) -> None:
+    answer = client.get(
+        f"/grafana/api/v1/provisioning/alert-rules/{ERROR_RATE_SUSTAINED.uid}"
+    )
+    definition = answer.json()
+
+    assert answer.status_code == 200
+    assert definition["data"][0]["relativeTimeRange"]["from"] == 600
+    assert definition["keep_firing_for"] == "0m"
+    assert (definition["folderUID"], definition["ruleGroup"]) == (FOLDER_UID, GROUP)
+
+
+def test_the_rule_definition_route_refuses_a_rule_it_does_not_hold(
+    client: TestClient
+) -> None:
+    answer = client.get("/grafana/api/v1/provisioning/alert-rules/no-such-rule")
+
+    assert answer.status_code == 404
+
+
+def test_the_rule_group_route_answers_only_the_shops_group(client: TestClient) -> None:
+    ours = client.get(
+        f"/grafana/api/v1/provisioning/folder/{FOLDER_UID}/rule-groups/{GROUP}"
+    )
+    another = client.get(
+        f"/grafana/api/v1/provisioning/folder/{FOLDER_UID}/rule-groups/another-group"
+    )
+
+    assert ours.status_code == 200
+    assert ours.json()["interval"] == 60
+    assert another.status_code == 404
+
+
+def test_the_rules_route_answers_a_series_rule_with_its_health(client: TestClient) -> None:
+    client.post("/scenario/reset")
+
+    answer = client.get(
+        "/grafana/api/prometheus/grafana/api/v1/rules",
+        params={"rule_uid": ERROR_RATE_SUSTAINED.uid}
+    )
+    rule = answer.json()["data"]["groups"][0]["rules"][0]
+
+    assert answer.status_code == 200
+    assert rule["uid"] == ERROR_RATE_SUSTAINED.uid
+    assert rule["health"] == "ok"
+    assert "lastEvaluation" in rule
+
+
+def test_a_finding_rule_is_inactive_while_the_shop_would_not_raise_it(
+    client: TestClient
+) -> None:
+    client.post("/scenario/reset")
+
+    answer = client.get(
+        "/grafana/api/prometheus/grafana/api/v1/rules",
+        params={"rule_uid": next(iter(FINDING_RULE_UIDS.values()))}
+    )
+
+    assert answer.json()["data"]["groups"][0]["rules"][0]["state"] == INACTIVE
+
+
+def test_the_rules_route_refuses_a_rule_it_does_not_hold(client: TestClient) -> None:
+    answer = client.get(
+        "/grafana/api/prometheus/grafana/api/v1/rules", params={"rule_uid": "no-such-rule"}
+    )
+
+    assert answer.status_code == 404
 
 
 def test_the_leak_is_offered_in_the_console(client: TestClient) -> None:
