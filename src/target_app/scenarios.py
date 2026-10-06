@@ -803,7 +803,7 @@ MONITORING_CONFIGURATION_DRIFT = "monitoring-configuration-drift"
 # one thing about this incident the shop's operator would have known at the time
 # and nobody investigating the page can see.
 STATE_DIVERGENCE = "cache-failed-over"
-# The same failover with nobody recording when it happened, so the page that
+# The same failover with nobody recording when it happened, so the alert that
 # reports it cannot say since when.
 UNDATED_STATE_DIVERGENCE = "cache-failed-over-undated"
 # Named for what the revert leaves behind. The flag change is the incident and
@@ -1414,7 +1414,7 @@ SCENARIOS[UNDATED_STATE_DIVERGENCE] = replace(
         "The cache in front of Io's monthly totals failed over to a standby that "
         "had stopped copying hours before - and nothing recorded when. The "
         "shop's own check finds the stale entries, but it can say what is wrong "
-        "and not since when, so the page it sends carries no onset."
+        "and not since when, so the alert it raises carries no onset."
     ),
     failover_time_unknown=True,
 )
