@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from io_shop.endpoints import the_shops_routes
 from pydantic import BaseModel, Field
 
-from target_app import console, prometheus
+from target_app import alert_rules, console, prometheus
 from target_app.cache_entries import the_key_for
 from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.generator import (
@@ -31,12 +31,18 @@ from target_app.generator import (
     the_cpu_demanded_by,
 )
 from target_app.history import FlagHistoryUnavailable
-from target_app.monitoring import AlertNotDelivered, fire_alert
+from target_app.monitoring import (
+    FINDING_RULE_UIDS,
+    AlertNotDelivered,
+    an_alert_for,
+    fire_alert,
+)
 from target_app.oncall import a_user, an_incident
 from target_app.payments import a_page_of_charges
 from target_app.people import pay_grades_and_bands
 from target_app.rates import UnknownBase, rates_quoted_against
 from target_app.registry import dependencies_of
+from target_app.relapse import with_relapses
 from target_app.scenarios import (
     FALLBACK_FLAG,
     FAMILY_ORDER,
@@ -1416,6 +1422,104 @@ def raise_alert() -> AlertRaised:
     return AlertRaised(incident_id=delivered.get("incident_id"))
 
 
+@app.get("/grafana/api/v1/provisioning/alert-rules/{uid}")
+def grafana_alert_rule(uid: str) -> JSONResponse:
+    """Stands in for Grafana's `GET /api/v1/provisioning/alert-rules/{uid}`:
+    what the rule watches, over how long, and its `for` and `keepFiringFor`."""
+    rule = alert_rules.SERIES_RULES.get(uid)
+
+    if rule is not None:
+        return JSONResponse(content=alert_rules.a_definition(rule))
+
+    title = _the_finding_rule_titled(uid)
+
+    if title is None:
+        return JSONResponse(status_code=404, content={"message": "rule not found"})
+
+    # A finding's rule is a check, not a query over a range, so it has no data a
+    # caller could read a window off - which is the truth about it.
+    return JSONResponse(content={
+        "uid": uid, "title": title, "folderUID": alert_rules.FOLDER_UID,
+        "ruleGroup": alert_rules.GROUP, "for": "0s", "keepFiringFor": "0s",
+        "data": []
+    })
+
+
+@app.get("/grafana/api/v1/provisioning/folder/{folder_uid}/rule-groups/{group}")
+def grafana_rule_group(folder_uid: str, group: str) -> JSONResponse:
+    """Stands in for Grafana's rule-group route, which carries the interval
+    every rule in the group is evaluated at."""
+    if folder_uid != alert_rules.FOLDER_UID or group != alert_rules.GROUP:
+        return JSONResponse(status_code=404, content={"message": "group not found"})
+
+    return JSONResponse(
+        content=alert_rules.a_rule_group(list(alert_rules.SERIES_RULES.values()))
+    )
+
+
+@app.get("/grafana/api/prometheus/grafana/api/v1/rules")
+def grafana_rules(rule_uid: str = Query(...)) -> JSONResponse:
+    """Stands in for Grafana's `GET /api/prometheus/grafana/api/v1/rules`,
+    filtered to one rule: whether it is firing, as of its last evaluation.
+
+    Evaluated now, over the minutes the shop has published - a rule reads what
+    its data source holds, so a minute the shop never published is a minute it
+    does not see.
+    """
+    now = datetime.now(UTC)
+    rule = alert_rules.SERIES_RULES.get(rule_uid)
+
+    if rule is not None:
+        window = state.generated_window()
+        rows = [bucket.model_dump() for bucket in _the_buckets()]
+        state_now = alert_rules.state_of(
+            rule, rows, now, window[1] if window is not None else now
+        )
+
+        return JSONResponse(
+            content=alert_rules.a_rules_answer(rule.uid, rule.title, state_now, rule)
+        )
+
+    title = _the_finding_rule_titled(rule_uid)
+
+    if title is None:
+        return JSONResponse(status_code=404, content={"message": "rule not found"})
+
+    # A finding's rule is firing exactly while the alert the shop would raise
+    # now is that rule's - the same checks, asked the same way.
+    firing = _the_alert_the_shop_would_raise()["alerts"][0]["ruleUID"] == rule_uid
+
+    return JSONResponse(content=alert_rules.a_rules_answer(
+        rule_uid,
+        title,
+        alert_rules.RuleState(
+            alert_rules.FIRING if firing else alert_rules.INACTIVE,
+            alert_rules.last_evaluation_at(alert_rules.HIGH_ERROR_RATE, now),
+            None,
+            None
+        )
+    ))
+
+
+def _the_finding_rule_titled(uid: str) -> str | None:
+    return next(
+        (title for title, known in FINDING_RULE_UIDS.items() if known == uid), None
+    )
+
+
+def _the_alert_the_shop_would_raise() -> dict[str, Any]:
+    """The alert `raise_alert` would send now, built from the same checks."""
+    return an_alert_for(
+        state.active_scenario_id,
+        datetime.now(UTC),
+        finding=state.the_integrity_check_found(),
+        unheard_from_since=state.the_minute_the_shop_went_quiet(),
+        stale=state.the_cache_check_found(),
+        promoted_at=state.promoted_at,
+        address_of=the_key_for
+    )
+
+
 @app.get("/scenario/status", response_model=ScenarioStatus)
 def scenario_status() -> ScenarioStatus:
     return _the_scenario_now()
@@ -1912,6 +2016,9 @@ def _the_window_now() -> list[GeneratedMinute]:
     active = state.active
     scenario = active.scenario if active else SCENARIOS[FEATURE_FLAG_TOGGLE]
     settings = get_unleash_settings()
+
+    if scenario.flaps_after_revert and timeline is not None:
+        timeline = with_relapses(timeline, up_to)
 
     return generate(
         timeline,

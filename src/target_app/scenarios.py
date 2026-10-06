@@ -582,6 +582,10 @@ class Scenario:
     stops_publishing_telemetry: bool = False
     control_plane_is_down: bool = False
     cache_failed_over: bool = False
+    # Whether reverting the flag leaves the shop failing a single minute at a
+    # time, at irregular gaps, for as long as the scenario runs - as though some
+    # of the fleet went on reading the flag as on. See `target_app.relapse`.
+    flaps_after_revert: bool = False
     # The deploy a *generated* scenario stages, for the one whose cause is a
     # change rather than a state. An authored scenario carries its deploys on
     # its minutes; a generated one has no minutes to hang them on, and a
@@ -795,6 +799,11 @@ MONITORING_CONFIGURATION_DRIFT = "monitoring-configuration-drift"
 # one thing about this incident the shop's operator would have known at the time
 # and nobody investigating the page can see.
 STATE_DIVERGENCE = "cache-failed-over"
+# Named for what the revert leaves behind. The flag change is the incident and
+# turning it off is the right first move; what this stages is a revert that
+# seems to work for a minute and then does not quite, with the shop failing a
+# single minute at a time at gaps that never settle into a rhythm.
+FLAG_REVERT_LEAVES_A_FLAP = "flag-revert-leaves-a-flap"
 
 SCENARIOS: dict[str, Scenario] = {
     FEATURE_FLAG_TOGGLE: Scenario(
@@ -812,6 +821,21 @@ SCENARIOS: dict[str, Scenario] = {
             "flat."
         ),
         family=FLAG_CHANGES,
+    ),
+    FLAG_REVERT_LEAVES_A_FLAP: Scenario(
+        id=FLAG_REVERT_LEAVES_A_FLAP,
+        title="Flag reverted, shop still flapping",
+        description=(
+            "The monthly-spend feature again, behind 'monthly-spend-feature', "
+            "failing a third of account pages. Turning the flag off seems to work: "
+            "the next minute is clean. Then single minutes go on failing - two "
+            "minutes apart, then five, then three, then seven - as though part of "
+            "the fleet still reads the flag as on. No gap repeats, so there is no "
+            "rhythm to wait out, and the shop never settles while it is staged."
+        ),
+        family=FLAG_CHANGES,
+        flaps_after_revert=True,
+        offered_in_console=False,
     ),
     FALLBACK_DISABLED: Scenario(
         id=FALLBACK_DISABLED,

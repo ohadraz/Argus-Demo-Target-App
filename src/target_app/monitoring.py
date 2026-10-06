@@ -26,12 +26,22 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from io_shop.cache_reconciliation import CacheReconciliation
 from io_shop.spend_reconciliation import Reconciliation
+from target_app.alert_rules import (
+    ERROR_RATE_SUSTAINED,
+    HIGH_ERROR_RATE,
+    HIGH_LATENCY_P50,
+    HIGH_LATENCY_P95,
+    HIGH_LATENCY_P99,
+    HIGH_MEMORY_USAGE,
+    AlertRule,
+)
 from target_app.integrity import THE_CHECK_RUNS_EVERY
 from target_app.scenarios import (
     AUTOSCALER_FLAPPING,
     BAD_DEPLOYMENT,
     CACHE_MISCONFIGURED,
     CPU_SATURATION,
+    FLAG_REVERT_LEAVES_A_FLAP,
     PRICING_SERVICE_DEGRADED,
     RESOURCE_LEAK,
     SLOW_CANARY_ROLLOUT,
@@ -53,10 +63,9 @@ SERVICE_NAME = "io-shop"
 
 # Which rule fired. A deploy that slowed the shop down trips a different rule
 # than one that made it throw, and the alert name is the only part of the
-# payload that says which.
-_HIGH_LATENCY = "HighLatency"
-_HIGH_ERROR_RATE = "HighErrorRate"
-_HIGH_MEMORY_USAGE = "HighMemoryUsage"
+# payload that says which. The rules written against a series live in
+# `target_app.alert_rules`, which is what answers for their state; the three
+# below are findings, and are named here with the uid each alert carries.
 # The one rule here that is not written against a series at all. Every name above
 # names something a metrics stack measures over time; this one names a comparison
 # between two stored figures, which is the only way the incident behind it can be
@@ -78,6 +87,13 @@ _METRICS_ABSENT = "MetricsAbsent"
 # stale. A responder who reads one name for the other reaches for the wrong one
 # of those.
 _CACHED_TOTALS_ARE_STALE = "CachedSpendTotalsAreStale"
+
+# The uid each of those three rules is addressed by, as a Grafana rule is.
+FINDING_RULE_UIDS: dict[str, str] = {
+    _TOTALS_DO_NOT_RECONCILE: "io-shop-spend-totals-do-not-reconcile",
+    _METRICS_ABSENT: "io-shop-metrics-absent",
+    _CACHED_TOTALS_ARE_STALE: "io-shop-cached-spend-totals-are-stale",
+}
 
 # How long the shop has to go unheard-from before that is an incident rather
 # than a gap.
@@ -169,15 +185,15 @@ _CENTS_IN_A_UNIT = 100
 # by the time a leak moves the error rate the shop has been failing for a while
 # and the alert is late. Its summary says so - the responder is being told
 # about a climb, not an outage.
-_WHAT_FIRED: dict[str, tuple[str, str]] = {
-    BAD_DEPLOYMENT: (_HIGH_LATENCY, "p95 latency above threshold for 5m"),
+_WHAT_FIRED: dict[str, tuple[AlertRule, str]] = {
+    BAD_DEPLOYMENT: (HIGH_LATENCY_P95, "p95 latency above threshold for 5m"),
     # The median rather than the tail, and that is the scenario rather than a
     # detail: nine requests in ten were served from cache, so the tail always
     # described a recomputed page and barely moves when the cache goes. A rule
     # written against p95 - which is how most latency alerting is written -
     # would never fire on this at all.
     CACHE_MISCONFIGURED: (
-        _HIGH_LATENCY, "p50 latency above threshold for 5m"
+        HIGH_LATENCY_P50, "p50 latency above threshold for 5m"
     ),
     # The other percentile most latency alerting is not written against, and
     # the other half of the same lesson. Three requests in a hundred is below
@@ -185,10 +201,10 @@ _WHAT_FIRED: dict[str, tuple[str, str]] = {
     # here and a rule on the error rate never fires either. Saying which
     # percentile moved is most of what the responder is being told.
     SLOW_CANARY_ROLLOUT: (
-        _HIGH_LATENCY, "p99 latency above threshold for 5m"
+        HIGH_LATENCY_P99, "p99 latency above threshold for 5m"
     ),
     RESOURCE_LEAK: (
-        _HIGH_MEMORY_USAGE,
+        HIGH_MEMORY_USAGE,
         "Memory usage climbing against the container limit for 15m",
     ),
     # The same rule the bad deployment trips, and deliberately the same words:
@@ -197,7 +213,7 @@ _WHAT_FIRED: dict[str, tuple[str, str]] = {
     # alert names the shop, because the shop is what is being paged about - and
     # the shop is not what is wrong, which is the whole incident.
     PRICING_SERVICE_DEGRADED: (
-        _HIGH_LATENCY, "p95 latency above threshold for 5m"
+        HIGH_LATENCY_P95, "p95 latency above threshold for 5m"
     ),
     # A third scenario on the same rule and the same words, which by now is the
     # point rather than a coincidence: a bad deployment, a slow neighbour and a
@@ -206,7 +222,7 @@ _WHAT_FIRED: dict[str, tuple[str, str]] = {
     # rule that fired whenever CPU rose would fire every evening, and the thing
     # worth waking somebody for is the latency it caused.
     CPU_SATURATION: (
-        _HIGH_LATENCY, "p95 latency above threshold for 5m"
+        HIGH_LATENCY_P95, "p95 latency above threshold for 5m"
     ),
     # A fourth, and the same words again. The temptation here is to page on the
     # replica count moving, which is the one signal that would name this incident
@@ -215,10 +231,16 @@ _WHAT_FIRED: dict[str, tuple[str, str]] = {
     # waking somebody for is that the latency never settles; that the capacity is
     # what will not settle is the investigation's to find, and it is retrievable.
     AUTOSCALER_FLAPPING: (
-        _HIGH_LATENCY, "p95 latency above threshold for 5m"
+        HIGH_LATENCY_P95, "p95 latency above threshold for 5m"
+    ),
+    # The burn-rate rule rather than the error-rate one, because the shop it pages
+    # about fails one minute in a few: the short rule fires and resolves with every
+    # minute, and the long one is what stays firing while any of them fail.
+    FLAG_REVERT_LEAVES_A_FLAP: (
+        ERROR_RATE_SUSTAINED, "Error rate above 2.5% averaged over 10m"
     ),
 }
-_BY_DEFAULT = (_HIGH_ERROR_RATE, "Error rate above threshold for 5m")
+_BY_DEFAULT = (HIGH_ERROR_RATE, "Error rate above threshold for 5m")
 
 
 class MonitoringSettings(BaseSettings):
@@ -349,9 +371,14 @@ def an_alert_for(scenario_id: str | None,
             reports_its_own_finding=True
         )
 
-    alertname, summary = _WHAT_FIRED.get(scenario_id or "", _BY_DEFAULT)
+    rule, summary = _WHAT_FIRED.get(scenario_id or "", _BY_DEFAULT)
 
-    return _one_firing_alert(alertname, summary, at)
+    return _one_firing_alert(rule.title, summary, at, rule_uid=rule.uid)
+
+
+def the_rule_for(scenario_id: str | None) -> AlertRule:
+    """The series rule a scenario trips."""
+    return _WHAT_FIRED.get(scenario_id or "", _BY_DEFAULT)[0]
 
 
 def _what_the_silence_said(unheard_from_since: datetime, at: datetime) -> str:
@@ -386,7 +413,8 @@ def _one_firing_alert(alertname: str,
                       at: datetime,
                       onset: datetime | None = None,
                       reports_its_own_finding: bool = False,
-                      also: Mapping[str, str] | None = None) -> dict[str, Any]:
+                      also: Mapping[str, str] | None = None,
+                      rule_uid: str | None = None) -> dict[str, Any]:
     """One firing alert in the vendor's envelope, with whatever it can say.
 
     `startsAt` is when the rule fired, always, for every alert this shop sends.
@@ -432,6 +460,9 @@ def _one_firing_alert(alertname: str,
                 },
                 "annotations": annotations,
                 "startsAt": at.strftime(TIMESTAMP_FORMAT),
+                # Which rule this is, as Grafana's webhook names it: the uid its
+                # definition and its state are asked for by.
+                "ruleUID": rule_uid or FINDING_RULE_UIDS[alertname],
             }
         ],
     }

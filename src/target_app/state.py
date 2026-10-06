@@ -1852,6 +1852,12 @@ class ScenarioState:
         if timeline.turned_off_at is None:
             return timeline, utc_now()
 
+        if active is not None and active.scenario.flaps_after_revert:
+            # A revert that leaves the shop flapping has no recovery to settle
+            # around, so it runs up to now for as long as it is staged - the
+            # same reason the upstream outage above does.
+            return timeline, utc_now()
+
         return timeline, min(utc_now(), _settled_at(timeline.turned_off_at))
 
     def timeline_now(self) -> FlagTimeline | None:
