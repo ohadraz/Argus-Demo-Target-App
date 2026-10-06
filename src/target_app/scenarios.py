@@ -16,7 +16,7 @@ mitigation can be graded against.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -582,6 +582,10 @@ class Scenario:
     stops_publishing_telemetry: bool = False
     control_plane_is_down: bool = False
     cache_failed_over: bool = False
+    # Whether the failover went unrecorded. The cache check still finds the
+    # stale entries, but nothing knows when the standby started serving them,
+    # so the shop's alert carries its finding and no onset.
+    failover_time_unknown: bool = False
     # Whether reverting the flag leaves the shop failing a single minute at a
     # time, at irregular gaps, for as long as the scenario runs - as though some
     # of the fleet went on reading the flag as on. See `target_app.relapse`.
@@ -799,6 +803,9 @@ MONITORING_CONFIGURATION_DRIFT = "monitoring-configuration-drift"
 # one thing about this incident the shop's operator would have known at the time
 # and nobody investigating the page can see.
 STATE_DIVERGENCE = "cache-failed-over"
+# The same failover with nobody recording when it happened, so the page that
+# reports it cannot say since when.
+UNDATED_STATE_DIVERGENCE = "cache-failed-over-undated"
 # Named for what the revert leaves behind. The flag change is the incident and
 # turning it off is the right first move; what this stages is a revert that
 # seems to work for a minute and then does not quite, with the shop failing a
@@ -1394,3 +1401,20 @@ def bucket_id(seeded_at: datetime, offset_minutes: int, span_minutes: int) -> st
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+# The failover again, told the way it is when the promotion left no trace. Built
+# from the dated scenario rather than written out, because everything but the
+# missing time is the same incident.
+SCENARIOS[UNDATED_STATE_DIVERGENCE] = replace(
+    SCENARIOS[STATE_DIVERGENCE],
+    id=UNDATED_STATE_DIVERGENCE,
+    title="A cache serving stale figures since nobody knows when",
+    description=(
+        "The cache in front of Io's monthly totals failed over to a standby that "
+        "had stopped copying hours before - and nothing recorded when. The "
+        "shop's own check finds the stale entries, but it can say what is wrong "
+        "and not since when, so the page it sends carries no onset."
+    ),
+    failover_time_unknown=True,
+)

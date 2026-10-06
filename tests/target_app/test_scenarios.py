@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from target_app.scenarios import FALLBACK_FLAG, FEATURE_FLAG, quiet_state_for
+from target_app.scenarios import (
+    FALLBACK_FLAG,
+    FEATURE_FLAG,
+    SCENARIOS,
+    STATE_DIVERGENCE,
+    UNDATED_STATE_DIVERGENCE,
+    quiet_state_for,
+)
 
 """Where the shop's flags rest.
 
@@ -26,3 +33,12 @@ def test_a_scenario_with_no_decoy_has_no_second_flag_to_place() -> None:
     # `decoy_flag_role` is None for most scenarios, and asking where a flag
     # that is not in play rests has to answer rather than raise.
     assert quiet_state_for(None) is False
+
+
+def test_the_undated_failover_is_the_failover_with_its_time_unknown() -> None:
+    dated = SCENARIOS[STATE_DIVERGENCE]
+    undated = SCENARIOS[UNDATED_STATE_DIVERGENCE]
+
+    assert undated.cache_failed_over and dated.cache_failed_over
+    assert undated.failover_time_unknown and not dated.failover_time_unknown
+    assert undated.id == UNDATED_STATE_DIVERGENCE

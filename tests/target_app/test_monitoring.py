@@ -459,6 +459,22 @@ def test_the_onset_is_the_promotion_and_not_when_the_copies_froze() -> None:
     assert annotations["divergence_began"] == "2026-08-29T05:02:17Z"
 
 
+def test_a_failover_nobody_recorded_pages_with_no_onset() -> None:
+    # The check still finds the stale entries; it cannot say since when, and an
+    # onset made up here would be the shop telling Argus a time nobody knows.
+    alert = an_alert_for(
+        STATE_DIVERGENCE,
+        DONT_CARE_INSTANT,
+        stale=a_cache_finding(90),
+        promoted_at=None,
+        address_of=an_address_for
+    )
+    annotations = alert["alerts"][0]["annotations"]
+
+    assert alert["alerts"][0]["labels"]["alertname"] == "CachedSpendTotalsAreStale"
+    assert "onset" not in annotations
+
+
 def test_every_stale_entry_is_named_by_the_address_the_cache_stores_it_under() -> None:
     # The one field here that is acted on rather than read, and the reason it is
     # addresses rather than shopper ids: a consumer composing a key would be

@@ -599,7 +599,9 @@ class ScenarioState:
                 # incident is diagnosable the instant this returns; the entries
                 # froze three hours before the check runs regardless, so the
                 # share that disagrees does not move with this.
-                promoted_at=now - timedelta(
+                # None where the failover went unrecorded, which is what leaves
+                # the shop's alert with no onset to state.
+                promoted_at=None if scenario.failover_time_unknown else now - timedelta(
                     minutes=get_scenario_settings().onset_backdate_minutes
                 ),
             )
