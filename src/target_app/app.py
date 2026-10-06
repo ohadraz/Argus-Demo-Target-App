@@ -37,6 +37,7 @@ from target_app.monitoring import (
     an_alert_for,
     fire_alert,
     the_rule_for,
+    the_rule_linked_from,
 )
 from target_app.oncall import a_user, an_incident
 from target_app.payments import a_page_of_charges
@@ -1493,7 +1494,9 @@ def grafana_rules(rule_uid: str = Query(...)) -> JSONResponse:
 
     # A finding's rule is firing exactly while the alert the shop would raise
     # now is that rule's - the same checks, asked the same way.
-    firing = _the_alert_the_shop_would_raise()["alerts"][0]["ruleUID"] == rule_uid
+    firing = the_rule_linked_from(
+        _the_alert_the_shop_would_raise()["alerts"][0]
+    ) == rule_uid
 
     return JSONResponse(content=alert_rules.a_rules_answer(
         rule_uid,

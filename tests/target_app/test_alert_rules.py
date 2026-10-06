@@ -16,7 +16,7 @@ from target_app.alert_rules import (
     last_evaluation_at,
     state_of,
 )
-from target_app.monitoring import FINDING_RULE_UIDS, an_alert_for
+from target_app.monitoring import FINDING_RULE_UIDS, an_alert_for, the_rule_linked_from
 from target_app.scenarios import (
     AUTOSCALER_FLAPPING,
     BAD_DEPLOYMENT,
@@ -167,11 +167,22 @@ def test_every_alert_the_shop_raises_names_a_rule_it_answers_for() -> None:
                      SILENT_DATA_CORRUPTION, None):
         alert = an_alert_for(scenario, WINDOW_STARTS)["alerts"][0]
 
-        assert alert["ruleUID"] in known
+        assert the_rule_linked_from(alert) in known
 
 
 def test_the_alert_names_the_rule_it_is_titled_after() -> None:
     alert = an_alert_for(BAD_DEPLOYMENT, WINDOW_STARTS)["alerts"][0]
 
-    assert alert["ruleUID"] == HIGH_LATENCY_P95.uid
+    assert the_rule_linked_from(alert) == HIGH_LATENCY_P95.uid
     assert alert["labels"]["alertname"] == HIGH_LATENCY_P95.title
+
+
+def test_the_alert_names_its_rule_only_where_grafana_does() -> None:
+    # Grafana's webhook has no field for the rule that fired; the link to the
+    # rule is the one place it says, in the shape its releases build.
+    alert = an_alert_for(BAD_DEPLOYMENT, WINDOW_STARTS)["alerts"][0]
+
+    assert "ruleUID" not in alert
+    assert alert["generatorURL"].endswith(
+        f"/alerting/grafana/{HIGH_LATENCY_P95.uid}/view"
+    )

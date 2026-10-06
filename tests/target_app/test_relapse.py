@@ -11,7 +11,7 @@ from target_app.alert_rules import (
     state_of,
 )
 from target_app.generator import FlagTimeline, generate
-from target_app.monitoring import an_alert_for
+from target_app.monitoring import an_alert_for, the_rule_linked_from
 from target_app.relapse import GAPS, failing_minutes_after, with_relapses
 from target_app.scenarios import FLAG_REVERT_LEAVES_A_FLAP, SCENARIOS
 
@@ -88,5 +88,5 @@ def test_the_shop_flaps_after_the_revert_and_only_the_sustained_rule_sees_it() -
 def test_the_scenario_pages_on_the_sustained_rule() -> None:
     alert = an_alert_for(FLAG_REVERT_LEAVES_A_FLAP, REVERTED)["alerts"][0]
 
-    assert alert["ruleUID"] == ERROR_RATE_SUSTAINED.uid
+    assert the_rule_linked_from(alert) == ERROR_RATE_SUSTAINED.uid
     assert SCENARIOS[FLAG_REVERT_LEAVES_A_FLAP].flaps_after_revert

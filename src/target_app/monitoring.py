@@ -95,6 +95,24 @@ FINDING_RULE_UIDS: dict[str, str] = {
     _CACHED_TOTALS_ARE_STALE: "io-shop-cached-spend-totals-are-stale",
 }
 
+# Where Grafana says a rule lives, which is how its webhook names the rule that
+# fired: `<root>/alerting/grafana/<uid>/view`, the shape its releases build.
+_GRAFANA_ROOT = "http://grafana.local"
+_RULE_LINK_PREFIX = f"{_GRAFANA_ROOT}/alerting/grafana/"
+_RULE_LINK_SUFFIX = "/view"
+
+
+def a_link_to_the_rule(uid: str) -> str:
+    """The link Grafana's webhook carries for the rule with this uid."""
+    return f"{_RULE_LINK_PREFIX}{uid}{_RULE_LINK_SUFFIX}"
+
+
+def the_rule_linked_from(alert: dict[str, Any]) -> str:
+    """The uid of the rule one alert of this shop's links to."""
+    return str(alert["generatorURL"]).removeprefix(_RULE_LINK_PREFIX).removesuffix(
+        _RULE_LINK_SUFFIX
+    )
+
 # How long the shop has to go unheard-from before that is an incident rather
 # than a gap.
 #
@@ -460,9 +478,12 @@ def _one_firing_alert(alertname: str,
                 },
                 "annotations": annotations,
                 "startsAt": at.strftime(TIMESTAMP_FORMAT),
-                # Which rule this is, as Grafana's webhook names it: the uid its
-                # definition and its state are asked for by.
-                "ruleUID": rule_uid or FINDING_RULE_UIDS[alertname],
+                # Which rule this is, as Grafana's webhook names it: in the link
+                # to the rule, by the uid its definition and its state are asked
+                # for by. Grafana's payload has no field of its own for it.
+                "generatorURL": a_link_to_the_rule(
+                    rule_uid or FINDING_RULE_UIDS[alertname]
+                ),
             }
         ],
     }
