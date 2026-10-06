@@ -61,4 +61,4 @@ cache:
 # shop loads - so moving to a new model is a change here, reviewed and synced
 # like any other, and moving back is a rollback rather than a rebuild.
 categoriser:
-  model: v1
+  model: v2
