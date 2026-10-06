@@ -460,6 +460,10 @@ class MetricBucket(BaseModel):
     # has to be able to tell a service without a cache from one whose cache
     # has gone.
     cache_hit_ratio: float | None = None
+    # How much of what was bought the categoriser filed with confidence. Present
+    # on every generated minute, because the shop always files its purchases;
+    # absent from an authored one, which carries no purchases to file.
+    categoriser_confident_ratio: float | None = None
 
 
 # The four models below mirror Argo CD's own wire shape, field names included -
@@ -1657,6 +1661,7 @@ def _the_buckets() -> list[MetricBucket]:
                 cpu_used_cores=minute.cpu_used_cores,
                 cpu_limit_cores=minute.cpu_limit_cores,
                 cache_hit_ratio=minute.cache_hit_ratio,
+                categoriser_confident_ratio=minute.categoriser_confident_ratio,
             )
             for minute in _generated_minutes()
             # The one channel that drops a minute, and it drops it rather than
@@ -2084,6 +2089,7 @@ def _the_window_now() -> list[GeneratedMinute]:
         # Named here beside the others and changing nothing about them: what it
         # withholds is the minute itself, not any reading in it.
         scrape_outage=active.scrape_outage if active else None,
+        model_upgrade=active.model_upgrade if active else None,
     )
 
 

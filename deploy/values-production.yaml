@@ -54,3 +54,11 @@ metrics:
 cache:
   host: cache.io-shop.svc.cluster.local
   port: 6380
+
+# Which model files a purchase under a category.
+#
+# Every version ships in the image beside the code, and this picks the one the
+# shop loads - so moving to a new model is a change here, reviewed and synced
+# like any other, and moving back is a rollback rather than a rebuild.
+categoriser:
+  model: v2

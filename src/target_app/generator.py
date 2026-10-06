@@ -31,12 +31,14 @@ actually asks this service for.
 from __future__ import annotations
 
 import random
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
+from io_shop.categorising import MODELS, categorise
 from io_shop.monthly_statement import StatementPeriod, period_for
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
 from io_shop.pricing_service import AskThePricingService, PricingAnswer
@@ -48,6 +50,7 @@ from io_shop.summary_cache import (
     SummaryEntry,
 )
 from target_app.settings import (
+    LAST_KNOWN_GOOD_CATEGORISER_MODEL,
     DeclaredAutoscaler,
     get_unleash_settings,
     the_deployed_replica_count,
@@ -410,6 +413,37 @@ _SLOWEST_UNDER_PRESSURE = 9.0
 _FAILING_SHARE = 0.35
 
 _OUT_OF_MEMORY_FAILURE = "OutOfMemoryError: heap allocation failed"
+
+# What the shop sells, as the titles a shopper sees. A purchase's title is read off
+# its price rather than drawn, so that giving every purchase one left every figure
+# this generator already produced exactly where it was - see `_the_title_of`.
+#
+# Written in sentence case, as a catalogue is, and that is what the categoriser
+# meets: most of these name the thing first and capitalise it, and some name it
+# after a word that says what kind. The last two are product lines newer than the
+# first model the shop ran, so that model files them under nothing.
+_THE_CATALOGUE = (
+    "Headphones for travel",
+    "Keyboard with backlight",
+    "Kettle in brushed steel",
+    "Lamp for a reading corner",
+    "Backpack for daily use",
+    "Jacket for wet weather",
+    "Novel in paperback",
+    "Charger for two devices",
+    "Toaster with four slots",
+    "Blanket in merino wool",
+    "Portable speaker",
+    "Wireless mouse",
+    "Curved monitor",
+    "Hand blender",
+    "Hardshell suitcase",
+    "Running trainers",
+    "Family cookbook",
+    "Braided cable",
+    "Smartwatch for running",
+    "Earbuds in a charging case",
+)
 
 _SECONDS_PER_MINUTE = 60
 _BYTES_PER_MIB = 1024**2
@@ -779,6 +813,78 @@ class PausedRollout:
 
 
 @dataclass(frozen=True)
+class ModelUpgrade:
+    """When the shop began filing purchases with an upgraded categoriser, and
+    when it went back to the model before it.
+
+    `SlowDeployment`'s shape and a different consequence. That revision made
+    every request dearer; this one leaves every request exactly as dear as it
+    was, because filing a purchase costs the same whichever model does it. What
+    changes is the filing - which aisle a purchase lands in, and whether the
+    model knew - and no latency, error or resource series can see that.
+
+    `model` is the version the upgrade loaded, read from the deployment's values
+    when the scenario was staged; what was loaded before it, and what a rollback
+    loads again, is `LAST_KNOWN_GOOD_CATEGORISER_MODEL`. `ended_at` being `None`
+    means the upgrade is still deployed, and `earlier` holds the stretches
+    before this one, as `FlagTimeline`'s does.
+    """
+
+    began_at: datetime
+    model: str
+    ended_at: datetime | None = None
+    earlier: tuple[ModelUpgrade, ...] = ()
+
+    def again_from(self, at: datetime) -> ModelUpgrade:
+        """A new stretch beginning at `at`, remembering this one and its own."""
+        return ModelUpgrade(began_at=at, model=self.model, earlier=(*self.earlier, self))
+
+    def share_of(self, minute: datetime, elapsed_seconds: int) -> float:
+        """How much of this minute's first `elapsed_seconds` the upgraded model
+        was the one filing purchases.
+
+        A share, as every other condition here reports itself: the minute the
+        upgrade lands in is filed partly by each model, so the fall in
+        confidence ramps across it instead of stepping, and the minute a
+        rollback lands in is the same thing in reverse.
+        """
+        if elapsed_seconds <= 0:
+            return 0.0
+
+        window_end = minute + timedelta(seconds=elapsed_seconds)
+        live_from = max(minute, self.began_at)
+        live_until = window_end if self.ended_at is None else min(
+            window_end, self.ended_at
+        )
+        seconds_live = max(0.0, (live_until - live_from).total_seconds())
+        earlier_share = sum(
+            stretch.share_of(minute, elapsed_seconds) for stretch in self.earlier
+        )
+
+        return min(1.0, seconds_live / elapsed_seconds + earlier_share)
+
+    def loaded_within(self, minute: datetime, elapsed_seconds: int) -> tuple[str, ...]:
+        """The model versions loaded during this minute's first
+        `elapsed_seconds`, in the order they were: the upgrade wherever a stretch
+        began, and the model before it wherever one ended."""
+        window_end = minute + timedelta(seconds=elapsed_seconds)
+        moments = sorted(
+            [(stretch.began_at, stretch.model) for stretch in (*self.earlier, self)]
+            + [
+                (stretch.ended_at, LAST_KNOWN_GOOD_CATEGORISER_MODEL)
+                for stretch in (*self.earlier, self)
+                if stretch.ended_at is not None
+            ]
+        )
+
+        return tuple(
+            model
+            for at, model in moments
+            if minute <= at < window_end
+        )
+
+
+@dataclass(frozen=True)
 class PricingSlowdown:
     """When the pricing service began taking too long to answer, and when it
     stopped.
@@ -1076,6 +1182,11 @@ class GeneratedMinute:
     # `None` where the deployment configured no cache, which is a different
     # fact from a cache answering nothing - see `_how_much_the_cache_carried`.
     cache_hit_ratio: float | None = None
+    # How much of what the minute's shoppers had bought the categoriser filed
+    # with confidence. A share over every purchase the minute's sample carried,
+    # reported in every minute of every scenario, because the shop always files
+    # its purchases - `None` only where a minute carried no purchase at all.
+    categoriser_confident_ratio: float | None = None
     # Whether the shop published this minute's metrics at all. False only while
     # the blind-spot scenario's flag is on, and a property of the minute rather
     # than of the reader: the same minute is unpublished for everybody.
@@ -1113,7 +1224,8 @@ def generate(timeline: FlagTimeline | None,
              ships_the_statement: bool = False,
              ships_the_incremental_write: bool = False,
              scrape_outage: ScrapeOutage | None = None,
-             promoted_at: datetime | None = None) -> list[GeneratedMinute]:
+             promoted_at: datetime | None = None,
+             model_upgrade: ModelUpgrade | None = None) -> list[GeneratedMinute]:
     """Every minute from `span_minutes` ago up to and including the one in
     progress, once any of it has happened.
 
@@ -1260,6 +1372,14 @@ def generate(timeline: FlagTimeline | None,
     its log lines with it, and a shop whose logs went quiet alongside its metrics
     is a shop that is down. That is a different incident, and the one this
     scenario must not be mistaken for.
+
+    `model_upgrade` is the stretch an upgraded categoriser spent filing the
+    shop's purchases. Left unsaid, the model the shop has always run files them,
+    which is what every scenario that is not about the categoriser looks like.
+    It moves one figure and nothing else: the share of purchases filed with
+    confidence. Filing a purchase costs the same whichever model does it, so no
+    latency moves, and a purchase filed under "General" is not a failure, so the
+    error rate does not either.
     """
     current_minute = now.replace(second=0, microsecond=0)
     elapsed_in_current = int((now - current_minute).total_seconds())
@@ -1297,6 +1417,7 @@ def generate(timeline: FlagTimeline | None,
             ships_the_incremental_write=ships_the_incremental_write,
             scrape_outage=scrape_outage,
             promoted_at=promoted_at,
+            model_upgrade=model_upgrade,
         )
         for offset in range(span_minutes, 0, -1)
     ]
@@ -1333,6 +1454,7 @@ def generate(timeline: FlagTimeline | None,
                 ships_the_incremental_write=ships_the_incremental_write,
                 scrape_outage=scrape_outage,
                 promoted_at=promoted_at,
+                model_upgrade=model_upgrade,
             )
         )
 
@@ -1371,6 +1493,7 @@ def _a_whole_minute(
     ships_the_incremental_write: bool = False,
     scrape_outage: ScrapeOutage | None = None,
     promoted_at: datetime | None = None,
+    model_upgrade: ModelUpgrade | None = None,
 ) -> GeneratedMinute:
     """One minute that has finished, generated once and then remembered.
 
@@ -1420,6 +1543,7 @@ def _a_whole_minute(
         ships_the_incremental_write=ships_the_incremental_write,
         scrape_outage=scrape_outage,
         promoted_at=promoted_at,
+        model_upgrade=model_upgrade,
     )
 
 
@@ -1447,6 +1571,7 @@ def _generate_minute(
     ships_the_incremental_write: bool = False,
     scrape_outage: ScrapeOutage | None = None,
     promoted_at: datetime | None = None,
+    model_upgrade: ModelUpgrade | None = None,
 ) -> GeneratedMinute:
     minute_id = minute.strftime(TIMESTAMP_FORMAT)
     entropy = random.Random(minute_id)
@@ -1599,6 +1724,14 @@ def _generate_minute(
     measured = sorted(
         served.latency_ms for served in outcomes if served.latency_ms is not None
     )
+    # How much of the minute the upgraded categoriser was the one filing. No
+    # entropy, so it cannot shift a draw made after it - the same reason the
+    # deployment's slowdown is worked out without one.
+    filed_by_the_upgrade = (
+        model_upgrade.share_of(minute, elapsed_seconds)
+        if model_upgrade is not None
+        else 0.0
+    )
 
     return GeneratedMinute(
         minute_id=minute_id,
@@ -1701,6 +1834,17 @@ def _generate_minute(
             heap=_heap_lines_for(minute_id, minute, heap_bytes, pressure, lifetime),
             cache=_cache_lines_for(minute_id, outcomes, minute, promoted_at),
             pricing=_pricing_lines_for(minute_id, outcomes),
+            categoriser=_categoriser_lines_for(
+                minute_id, minute, elapsed_seconds, model_upgrade
+            ),
+        ),
+        # After every drawn figure and drawing nothing itself, so it moved no
+        # number this generator already produced: the purchases it reads were
+        # drawn for the pages, and the titles are read off their prices.
+        categoriser_confident_ratio=_how_much_was_filed_confidently(
+            [price for served in outcomes for price in served.prices],
+            filed_by_the_upgrade,
+            model_upgrade.model if model_upgrade is not None else None,
         ),
         # Whole minutes, and deliberately not the share-of-minute arithmetic the
         # readings above use: a partly-collected minute is not a partly-true
@@ -1709,6 +1853,73 @@ def _generate_minute(
         # landed in is the first with no row - and that minute is the onset an
         # absence alert states, worked out from the last row that arrived.
         published=scrape_outage is None or not scrape_outage.covers(minute),
+    )
+
+
+def _how_much_was_filed_confidently(prices: list[int],
+                                    filed_by_the_upgrade: float,
+                                    upgraded_to: str | None) -> float | None:
+    """The share of these purchases the categoriser filed with confidence.
+
+    Mixed across the two models by how much of the minute each was the one
+    filing, so the minute an upgrade or a rollback lands in reads between the two
+    rather than as either - the same slope every other condition here reports.
+
+    Counted by title rather than by purchase: a title is read off a price, so a
+    minute's thousand-odd purchases are a score of distinct titles, and each is
+    categorised once per model rather than once per purchase.
+    """
+    if not prices:
+        return None
+
+    titles = Counter(_the_title_of(price) for price in prices)
+
+    def confident_share(version: str) -> float:
+        model = MODELS[version]
+        confident = sum(
+            count for title, count in titles.items() if categorise(title, model).confident
+        )
+
+        return confident / len(prices)
+
+    before = confident_share(LAST_KNOWN_GOOD_CATEGORISER_MODEL)
+
+    if upgraded_to is None or filed_by_the_upgrade == 0.0:
+        return round(before, 4)
+
+    return round(
+        (1.0 - filed_by_the_upgrade) * before
+        + filed_by_the_upgrade * confident_share(upgraded_to),
+        4,
+    )
+
+
+def _the_title_of(price_cents: int) -> str:
+    """The catalogue title of a purchase at this price.
+
+    Read off the price rather than drawn, so that every purchase this generator
+    already produced keeps its price and gains a title with no draw spent.
+    """
+    return _THE_CATALOGUE[price_cents % len(_THE_CATALOGUE)]
+
+
+def _categoriser_lines_for(minute_id: str,
+                           minute: datetime,
+                           elapsed_seconds: int,
+                           model_upgrade: ModelUpgrade | None) -> tuple[str, ...]:
+    """What the shop logs when it loads a categoriser model.
+
+    One line per load, in the minute it happened - the line any service writes
+    when it swaps the model it serves with. It names the version and says
+    nothing about whether the version is any good: what it did to the filing is
+    the series' to say.
+    """
+    if model_upgrade is None:
+        return ()
+
+    return tuple(
+        f"{minute_id} INFO io-shop: categoriser loaded model {version}"
+        for version in model_upgrade.loaded_within(minute, elapsed_seconds)
     )
 
 
@@ -2189,6 +2400,10 @@ class _ServedPage:
     said it, and a minute's log lines are assembled from what the shop said.
     `pricing_delay` is carried for that reason too, and it is the one thing in a
     minute of this scenario's telemetry that names where the time went.
+
+    `prices` are what the shopper behind the page had bought, which is what the
+    categoriser files - carried out so the minute can say how much of it was
+    filed with confidence without drawing a second set of purchases.
     """
 
     flag_is_on: bool
@@ -2197,6 +2412,7 @@ class _ServedPage:
     from_cache: bool = False
     cache_failure: str | None = None
     pricing_delay: str | None = None
+    prices: tuple[int, ...] = ()
 
 
 def _serve_one_account_page(
@@ -2317,6 +2533,7 @@ def _serve_one_account_page(
         and entropy.random() < share_of_minute_refused
     )
     an_account_of_theirs = _an_account(entropy)
+    prices = tuple(purchase.price_cents for purchase in an_account_of_theirs.purchases)
 
     page = serve_account_page(
         an_account_of_theirs,
@@ -2359,12 +2576,12 @@ def _serve_one_account_page(
         # hit ratio that dipped here would destroy.
         return _ServedPage(
             flag_is_on, _UNREADABLE_ENTRY_FAILURE, cost, page.served_from_cache,
-            page.cache_failure, page.pricing_delay
+            page.cache_failure, page.pricing_delay, prices
         )
 
     if page.failure is not None:
         return _ServedPage(flag_is_on, page.failure, cost, page.served_from_cache,
-                           page.cache_failure)
+                           page.cache_failure, prices=prices)
 
     if entropy.random() < BASELINE_ERROR_RATE + entropy.uniform(
         -_BASELINE_ERROR_RATE_WOBBLE, _BASELINE_ERROR_RATE_WOBBLE
@@ -2380,11 +2597,11 @@ def _serve_one_account_page(
         # nothing to do with one.
         return _ServedPage(
             flag_is_on, "ClientDisconnected: the shopper closed the connection",
-            cost, page.served_from_cache, page.cache_failure, page.pricing_delay
+            cost, page.served_from_cache, page.cache_failure, page.pricing_delay, prices
         )
 
     return _ServedPage(flag_is_on, None, cost, page.served_from_cache,
-                       page.cache_failure, page.pricing_delay)
+                       page.cache_failure, page.pricing_delay, prices)
 
 
 def _the_two_revisions_crossed(rollout_entropy: random.Random | None,
@@ -2627,6 +2844,7 @@ def _log_lines_for(
     heap: tuple[str, ...] = (),
     cache: tuple[str, ...] = (),
     pricing: tuple[str, ...] = (),
+    categoriser: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     evaluations = (
         *(
@@ -2638,6 +2856,7 @@ def _log_lines_for(
         *heap,
         *cache,
         *pricing,
+        *categoriser,
     )
 
     if not failures:

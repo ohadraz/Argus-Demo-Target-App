@@ -4,10 +4,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from target_app.alert_rules import (
+    CATEGORISATION_CONFIDENCE_LOW,
     FIRING,
     HIGH_ERROR_RATE,
     HIGH_LATENCY_P95,
+    HIGH_MEMORY_USAGE,
     INACTIVE,
+    LT,
     PENDING,
     SERIES_RULES,
     a_definition,
@@ -16,9 +19,11 @@ from target_app.alert_rules import (
     state_of,
 )
 from target_app.monitoring import FINDING_RULE_UIDS, an_alert_for, the_rule_linked_from
+from target_app.prometheus import THE_STEP_SECONDS, a_matrix
 from target_app.scenarios import (
     AUTOSCALER_FLAPPING,
     BAD_DEPLOYMENT,
+    CATEGORISER_MODEL_UPGRADED,
     FEATURE_FLAG_TOGGLE,
     SILENT_DATA_CORRUPTION,
 )
@@ -35,8 +40,9 @@ WINDOW_STARTS = datetime(2026, 10, 6, 10, 0, tzinfo=UTC)
 
 
 def minutes_of(error_rates: list[float] | None = None,
-               p95s: list[float] | None = None) -> list[dict[str, Any]]:
-    count = len(error_rates or p95s or [])
+               p95s: list[float] | None = None,
+               confident_shares: list[float] | None = None) -> list[dict[str, Any]]:
+    count = len(error_rates or p95s or confident_shares or [])
     return [
         {
             "bucket_id": (WINDOW_STARTS + timedelta(minutes=offset)).strftime(
@@ -48,6 +54,7 @@ def minutes_of(error_rates: list[float] | None = None,
             "p99_ms": 200.0,
             "memory_used_bytes": 440 * 1024**2,
             "memory_limit_bytes": 2 * 1024**3,
+            "categoriser_confident_ratio": (confident_shares or [0.9] * count)[offset],
         }
         for offset in range(count)
     ]
@@ -159,3 +166,79 @@ def test_the_alert_links_to_the_rule_it_is_titled_after() -> None:
     )
     assert alert["labels"]["alertname"] == HIGH_LATENCY_P95.title
     assert "ruleUID" not in alert
+
+
+def test_a_rule_written_below_its_line_fires_when_the_share_falls() -> None:
+    rows = minutes_of(confident_shares=[0.9] * 10 + [0.4] * 10)
+
+    state = state_of(CATEGORISATION_CONFIDENCE_LOW, rows, at_minute(20), at_minute(20))
+
+    assert state.state == FIRING
+
+
+def test_a_rule_written_below_its_line_is_quiet_while_the_share_is_high() -> None:
+    rows = minutes_of(confident_shares=[0.9] * 20)
+
+    state = state_of(CATEGORISATION_CONFIDENCE_LOW, rows, at_minute(20), at_minute(20))
+
+    assert state.state == INACTIVE
+
+
+def test_the_confidence_rule_reads_clean_on_a_window_settled_after_a_rollback() -> None:
+    # The window freezes three clean minutes after the minute a rollback lands
+    # in, and that minute is half of each model. A longer range would still
+    # reach back into the broken minutes, and the rule would never resolve.
+    rows = minutes_of(confident_shares=[0.9] * 10 + [0.4] * 10 + [0.65] + [0.9] * 3)
+
+    state = state_of(
+        CATEGORISATION_CONFIDENCE_LOW, rows, at_minute(80), at_minute(24, 0)
+    )
+
+    assert state.state == INACTIVE
+
+
+def test_a_definition_carries_its_comparator_as_grafanas_evaluator_type() -> None:
+    definition = a_definition(CATEGORISATION_CONFIDENCE_LOW)
+
+    [condition] = definition["data"][2]["model"]["conditions"]
+
+    assert condition["evaluator"] == {"type": LT, "params": [0.8]}
+    assert a_definition(HIGH_ERROR_RATE)["data"][2]["model"]["conditions"][0][
+        "evaluator"
+    ]["type"] == "gt"
+
+
+def test_every_rules_query_is_answered_by_the_prometheus_stand_in() -> None:
+    # A responder who reads a rule's definition and runs its query must be sent
+    # the series the rule fired on, value for value.
+    rows = minutes_of(error_rates=[0.01, 0.2, 0.3])
+
+    for rule in SERIES_RULES.values():
+        expr = a_definition(rule)["data"][0]["model"]["expr"]
+
+        data = a_matrix(
+            rows, expr, at_minute(1, 0), at_minute(3, 0), THE_STEP_SECONDS,
+            now=at_minute(60), reporting_lag_minutes=0
+        )
+
+        assert data["result"], rule.uid
+
+
+def test_the_memory_rule_is_evaluated_over_the_share_of_the_limit_in_use() -> None:
+    rows = minutes_of(error_rates=[0.01])
+
+    data = a_matrix(
+        rows, a_definition(HIGH_MEMORY_USAGE)["data"][0]["model"]["expr"],
+        at_minute(1, 0), at_minute(1, 0), THE_STEP_SECONDS,
+        now=at_minute(60), reporting_lag_minutes=0
+    )
+
+    [[_, value]] = data["result"][0]["values"]
+    assert float(value) == (440 * 1024**2) / (2 * 1024**3)
+
+
+def test_the_categoriser_upgrade_pages_on_the_confidence_rule() -> None:
+    alert = an_alert_for(CATEGORISER_MODEL_UPGRADED, WINDOW_STARTS)["alerts"][0]
+
+    assert the_rule_linked_from(alert) == CATEGORISATION_CONFIDENCE_LOW.uid
+    assert alert["labels"]["alertname"] == "CategorisationConfidenceLow"

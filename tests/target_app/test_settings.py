@@ -10,6 +10,7 @@ from target_app.settings import (
     PrometheusSettings,
     the_declared_autoscaler,
     the_deployed_cache_endpoint,
+    the_deployed_categoriser_model,
 )
 
 """The deployment's own configuration, as the shop reads it.
@@ -133,3 +134,22 @@ def test_the_prometheus_stand_in_refuses_a_lag_it_cannot_serve() -> None:
     # late is a source nothing here stands in for.
     with pytest.raises(ValidationError):
         PrometheusSettings(reporting_lag_minutes=2)
+
+
+def test_the_shipped_values_file_names_the_categoriser_model_it_loads() -> None:
+    assert the_deployed_categoriser_model() == "v2"
+
+
+def test_the_categoriser_model_is_the_one_the_file_says(tmp_path: Path) -> None:
+    values = tmp_path / "values-production.yaml"
+    values.write_text("categoriser:\n  model: v1\n", encoding="utf-8")
+
+    assert the_deployed_categoriser_model(values) == "v1"
+
+
+def test_a_file_naming_no_categoriser_model_is_refused(tmp_path: Path) -> None:
+    values = tmp_path / "values-production.yaml"
+    values.write_text("replicas: 3\n", encoding="utf-8")
+
+    with pytest.raises(KeyError):
+        the_deployed_categoriser_model(values)

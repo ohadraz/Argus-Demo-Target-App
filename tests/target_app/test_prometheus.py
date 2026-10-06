@@ -8,6 +8,7 @@ import pytest
 from target_app.prometheus import (
     EXPOSITION_CONTENT_TYPE,
     MATRIX,
+    MEMORY_IN_USE,
     QUERIES,
     THE_STEP_SECONDS,
     BadData,
@@ -15,6 +16,7 @@ from target_app.prometheus import (
     an_exposition,
     read_step,
     read_time,
+    the_reading_for,
 )
 
 """The shop's minutes in Prometheus's shape.
@@ -45,6 +47,7 @@ def a_row(minute: datetime, **fields: Any) -> dict[str, Any]:
         "cpu_used_cores": 0.75,
         "cpu_limit_cores": 3.0,
         "cache_hit_ratio": None,
+        "categoriser_confident_ratio": 0.9,
         **fields
     }
 
@@ -228,3 +231,36 @@ def test_an_empty_shop_exposes_nothing() -> None:
 
 def test_the_exposition_is_served_as_prometheus_text() -> None:
     assert EXPOSITION_CONTENT_TYPE.startswith("text/plain; version=0.0.4")
+
+
+def test_the_categorisers_share_is_answered_from_its_field() -> None:
+    rows = [a_row(THE_FIRST_MINUTE, categoriser_confident_ratio=0.4)]
+
+    [[_, value]] = the_samples(
+        a_matrix_over(rows, "categoriser_confident_ratio", now=long_after())
+    )
+
+    assert value == "0.4"
+
+
+def test_the_memory_rules_query_is_the_heap_over_its_limit() -> None:
+    rows = [a_row(THE_FIRST_MINUTE, memory_used_bytes=256, memory_limit_bytes=1024)]
+
+    data = a_matrix(rows, MEMORY_IN_USE, THE_FIRST_MINUTE + A_MINUTE,
+                    THE_FIRST_MINUTE + A_MINUTE, THE_STEP_SECONDS, long_after(), 0)
+
+    assert the_samples(data) == [[(THE_FIRST_MINUTE + A_MINUTE).timestamp(), "0.25"]]
+
+
+def test_a_query_nobody_answers_has_no_reading() -> None:
+    assert the_reading_for("up") is None
+
+
+def test_the_exposition_carries_the_categorisers_share_where_it_is_reported() -> None:
+    rows = three_minutes()
+    rows[-1]["categoriser_confident_ratio"] = 0.41
+
+    exposition = an_exposition(rows)
+
+    assert "# TYPE categoriser_confident_ratio gauge" in exposition
+    assert "categoriser_confident_ratio 0.41\n" in exposition

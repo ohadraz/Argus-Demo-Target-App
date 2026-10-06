@@ -16,6 +16,7 @@ from target_app.generator import TIMESTAMP_FORMAT, generate, utc_now
 from target_app.scenarios import (
     BAD_DEPLOYMENT,
     CACHE_MISCONFIGURED,
+    CATEGORISER_MODEL_UPGRADED,
     COMPETING_FLAG_CHANGES,
     CPU_SATURATION,
     FALLBACK_DISABLED,
@@ -1841,3 +1842,72 @@ def test_resetting_the_renamed_shop_leaves_no_minute_to_report() -> None:
     state.reset()
 
     assert state.the_minute_the_shop_went_quiet() is None
+
+
+def a_staged_categoriser_upgrade() -> ScenarioState:
+    state = a_scenario_state(a_flag_client_reporting(False))
+    state.seed(SCENARIOS[CATEGORISER_MODEL_UPGRADED])
+
+    return state
+
+
+def test_the_upgrade_loads_the_model_the_values_file_names() -> None:
+    state = a_staged_categoriser_upgrade()
+
+    upgrade = present(present(state.active).model_upgrade)
+
+    assert upgrade.model == "v2"
+    assert upgrade.ended_at is None
+
+
+def test_the_upgrade_is_backdated_like_every_other_onset() -> None:
+    before = utc_now()
+    state = a_staged_categoriser_upgrade()
+
+    began = present(present(state.active).model_upgrade).began_at
+
+    assert began <= before - timedelta(
+        minutes=get_scenario_settings().onset_backdate_minutes
+    ) + timedelta(seconds=1)
+
+
+def test_staging_the_upgrade_moves_no_flag() -> None:
+    flags = a_flag_client_reporting(False)
+
+    a_scenario_state(flags).seed(SCENARIOS[CATEGORISER_MODEL_UPGRADED])
+
+    flags.enable.assert_not_called()
+
+
+def test_the_upgrade_is_running_until_the_deployment_is_returned() -> None:
+    assert a_staged_categoriser_upgrade().phase() == RUNNING
+
+
+def test_rolling_the_deployment_back_puts_the_old_model_back() -> None:
+    state = a_staged_categoriser_upgrade()
+
+    state.roll_the_deployment_back()
+
+    assert present(present(state.active).model_upgrade).ended_at is not None
+    assert state.phase() == RECOVERING
+
+
+def test_restarting_the_shop_leaves_the_upgrade_loaded() -> None:
+    # The process comes back reading the same values file.
+    state = a_staged_categoriser_upgrade()
+
+    state.restart_the_shop()
+
+    assert state.phase() == RUNNING
+
+
+def test_withdrawing_the_rollback_loads_the_upgrade_again() -> None:
+    state = a_staged_categoriser_upgrade()
+    rolled_back_at = state.roll_the_deployment_back()
+
+    state.withdraw_the_rollback()
+
+    upgrade = present(present(state.active).model_upgrade)
+    assert upgrade.ended_at is None
+    assert [stretch.ended_at for stretch in upgrade.earlier] == [rolled_back_at]
+    assert state.phase() == RUNNING

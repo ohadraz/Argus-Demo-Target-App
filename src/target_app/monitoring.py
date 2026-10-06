@@ -33,6 +33,7 @@ from target_app.alert_rules import (
     HIGH_LATENCY_P95,
     HIGH_LATENCY_P99,
     HIGH_MEMORY_USAGE,
+    CATEGORISATION_CONFIDENCE_LOW,
     AlertRule,
 )
 from target_app.integrity import THE_CHECK_RUNS_EVERY
@@ -40,6 +41,7 @@ from target_app.scenarios import (
     AUTOSCALER_FLAPPING,
     BAD_DEPLOYMENT,
     CACHE_MISCONFIGURED,
+    CATEGORISER_MODEL_UPGRADED,
     CPU_SATURATION,
     FLAG_REVERT_LEAVES_A_FLAP,
     PRICING_SERVICE_DEGRADED,
@@ -260,6 +262,13 @@ _WHAT_FIRED: dict[str, tuple[AlertRule, str]] = {
     # firing while any of them fail.
     FLAG_REVERT_LEAVES_A_FLAP: (
         ERROR_RATE_SUSTAINED, "Error rate above 2.5% averaged over 10m"
+    ),
+    # The one rule here that pages on something the shop decided rather than on
+    # how it served. Nothing a request-level rule watches moves in this scenario,
+    # so a stack without this rule would never page about it at all.
+    CATEGORISER_MODEL_UPGRADED: (
+        CATEGORISATION_CONFIDENCE_LOW,
+        "Share of purchases categorised confidently below 80% for 5m"
     ),
 }
 _BY_DEFAULT = (HIGH_ERROR_RATE, "Error rate above threshold for 5m")

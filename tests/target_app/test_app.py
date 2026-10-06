@@ -17,7 +17,15 @@ from io_shop.visits import (
     record_visit,
 )
 from target_app import app as app_module
-from target_app.alert_rules import ERROR_RATE_SUSTAINED, FOLDER_UID, GROUP, INACTIVE
+from target_app.alert_rules import (
+    CATEGORISATION_CONFIDENCE_LOW,
+    ERROR_RATE_SUSTAINED,
+    FOLDER_UID,
+    GROUP,
+    INACTIVE,
+    PENDING,
+    a_definition,
+)
 from target_app.app import (
     A_REQUEST_THE_PROVIDER_REFUSES,
     AN_INVALID_REQUEST,
@@ -44,6 +52,7 @@ from target_app.prometheus import QUERIES
 from target_app.scenarios import (
     AUTOSCALER_FLAPPING,
     CACHE_MISCONFIGURED,
+    CATEGORISER_MODEL_UPGRADED,
     CONTROL_PLANE_UNREACHABLE,
     CPU_SATURATION,
     HALF_FINISHED_ROLLOUT,
@@ -54,7 +63,9 @@ from target_app.scenarios import (
     RESOURCE_LEAK,
     SILENT_DATA_CORRUPTION,
     SLOW_CANARY_ROLLOUT,
+    THE_COMMIT_BEFORE_THE_UPGRADE,
     THE_COMMIT_THAT_NAMED_EVERY_PORT_FOR_ITS_PROTOCOL,
+    THE_COMMIT_THAT_UPGRADED_THE_CATEGORISER,
     THE_COMMIT_THAT_STOPPED_CARRYING_THE_MONTH,
     TIMESTAMP_FORMAT,
     UPSTREAM_DEPENDENCY_FAILURE,
@@ -2036,3 +2047,66 @@ def test_the_scrape_endpoint_is_prometheus_text(client: TestClient) -> None:
     assert scraped.status_code == 200
     assert scraped.headers["content-type"].startswith("text/plain; version=0.0.4")
     assert "# TYPE process_resident_memory_bytes gauge" in scraped.text
+
+
+def a_staged_categoriser_upgrade(client: TestClient) -> None:
+    seeded = client.post(
+        "/scenario/seed", json={"scenario_id": CATEGORISER_MODEL_UPGRADED}
+    )
+
+    assert seeded.status_code == 200
+
+
+def test_the_deploy_history_names_the_upgrade_and_the_revision_before_it(
+    client: TestClient
+) -> None:
+    a_staged_categoriser_upgrade(client)
+
+    history = client.get("/argocd/io-shop").json()["status"]["history"]
+
+    assert [entry["revision"] for entry in history] == [
+        THE_COMMIT_BEFORE_THE_UPGRADE, THE_COMMIT_THAT_UPGRADED_THE_CATEGORISER
+    ]
+
+
+def test_the_upgrades_rule_query_answers_the_rows_share(client: TestClient) -> None:
+    # The rule's own query, read off its definition, sent to the stand-in a
+    # responder would send it to - and the numbers are the rows'.
+    a_staged_categoriser_upgrade(client)
+    rows = client.get("/scenario/metrics").json()[:-1]
+    expr = a_definition(CATEGORISATION_CONFIDENCE_LOW)["data"][0]["model"]["expr"]
+
+    answered = a_range_query(
+        client, expr, start=a_minutes_end(rows[0]), end=a_minutes_end(rows[-1])
+    )
+
+    assert [
+        value for _, value in answered.json()["data"]["result"][0]["values"]
+    ] == [str(row["categoriser_confident_ratio"]) for row in rows]
+
+
+def test_the_confidence_rule_holds_once_the_upgrade_is_staged(client: TestClient) -> None:
+    a_staged_categoriser_upgrade(client)
+
+    answer = client.get(
+        "/grafana/api/prometheus/grafana/api/v1/rules",
+        params={"rule_uid": CATEGORISATION_CONFIDENCE_LOW.uid}
+    )
+
+    assert answer.json()["data"]["groups"][0]["rules"][0]["state"] in (
+        PENDING, "firing"
+    )
+
+
+def test_the_upgrade_is_offered_in_the_console_under_an_ai_specific_family(
+    client: TestClient
+) -> None:
+    catalog = client.get("/scenario/catalog").json()
+
+    families = {family["id"]: family for family in catalog["families"]}
+    offered = {
+        scenario["id"]: scenario["family"] for scenario in catalog["scenarios"]
+    }
+
+    assert offered[CATEGORISER_MODEL_UPGRADED] == "ai-specific"
+    assert "2%" in families["ai-specific"]["taxonomy"]

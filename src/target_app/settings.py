@@ -39,6 +39,16 @@ _MAX_REPLICAS = "maxReplicas"
 _TARGET_CPU_PERCENT = "targetCpuPercent"
 _SCALE_DOWN_STABILIZATION_SECONDS = "scaleDownStabilizationSeconds"
 
+# Where the categoriser's model is chosen, named for the reason the cache's keys
+# are: these two lines decide which version files every purchase.
+_CATEGORISER = "categoriser"
+_MODEL = "model"
+
+# The model the shop ran before the upgrade, and what a rollback loads again. A
+# constant for the reason the cache's last good port is one: this service cannot
+# read git, and the previous revision's values live only in its history.
+LAST_KNOWN_GOOD_CATEGORISER_MODEL = "v1"
+
 # Where the cache actually listens, which is where the revision *before* the
 # current one pointed the shop. A constant rather than a second read, because
 # this service cannot read git: the previous revision's values live in the
@@ -251,6 +261,19 @@ def the_declared_autoscaler(values_file: Path = VALUES_FILE) -> DeclaredAutoscal
             autoscaling[_SCALE_DOWN_STABILIZATION_SECONDS]
         )
     )
+
+
+def the_deployed_categoriser_model(values_file: Path = VALUES_FILE) -> str:
+    """Which categoriser model the deployment says to load.
+
+    Read on every call and raising where the key is absent, for the reasons the
+    cache's address is read that way: a model is configuration, and a shop that
+    invented one when its configuration was missing would be a shop whose
+    configuration decides nothing.
+    """
+    values: dict[str, Any] = yaml.safe_load(values_file.read_text(encoding="utf-8"))
+
+    return str(values[_CATEGORISER][_MODEL])
 
 
 def the_working_cache_endpoint(values_file: Path = VALUES_FILE) -> CacheEndpoint:

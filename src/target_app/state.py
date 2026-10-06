@@ -31,6 +31,7 @@ from target_app.generator import (
     DemandSurge,
     FlagTimeline,
     LiveAutoscaler,
+    ModelUpgrade,
     PausedRollout,
     Pin,
     PricingSlowdown,
@@ -60,6 +61,7 @@ from target_app.settings import (
     get_scenario_settings,
     the_declared_autoscaler,
     the_deployed_cache_endpoint,
+    the_deployed_categoriser_model,
     the_deployed_replica_count,
     the_working_cache_endpoint,
 )
@@ -283,6 +285,13 @@ class ActiveScenario:
     # running it cost anything. A rollback ends the stretch and leaves the
     # entry, which is what the history is for.
     deploy_slowdown: SlowDeployment | None = None
+    # The stretch an upgraded categoriser has been the model filing purchases,
+    # for the one scenario whose condition is which model a deployment loads.
+    # `None` everywhere else, which leaves the model the shop has always run
+    # filing every purchase. Stored rather than derived from the deploy history
+    # for the reason the slowdown above is: a rollback ends the stretch and
+    # leaves the entry.
+    model_upgrade: ModelUpgrade | None = None
     # The stretch the revision that stopped carrying the month has been the one
     # deployed, for the one scenario whose drift a deployment shipped. `None`
     # everywhere else - the flag scenario's drift is read off the flag's own
@@ -626,6 +635,26 @@ class ScenarioState:
                     began_at=now - timedelta(
                         minutes=get_scenario_settings().onset_backdate_minutes
                     )
+                ),
+            )
+            return
+
+        if scenario.categoriser_upgraded:
+            # No flag, no cache, nothing unreachable and nothing slower. What is
+            # staged is the model the deployed revision loads: the shop starts
+            # filing purchases with the version the values file names, which is
+            # not the one it was filing them with. Backdated like the others, so
+            # the incident is diagnosable the instant this returns.
+            self._remember_where_the_flags_are_now()
+            self._active = ActiveScenario(
+                scenario=scenario,
+                seeded_at=now,
+                process_started_at=now - SETTLED_UPTIME,
+                model_upgrade=ModelUpgrade(
+                    began_at=now - timedelta(
+                        minutes=get_scenario_settings().onset_backdate_minutes
+                    ),
+                    model=the_deployed_categoriser_model(),
                 ),
             )
             return
@@ -1057,6 +1086,13 @@ class ScenarioState:
                 active,
                 deploy_slowdown=replace(active.deploy_slowdown, ended_at=at),
             )
+        elif active.model_upgrade is not None:
+            # The model before the upgrade is loaded again, and files every
+            # purchase from here on. The minutes v2 filed stay as they were.
+            self._active = replace(
+                active,
+                model_upgrade=replace(active.model_upgrade, ended_at=at),
+            )
         elif active.drifting_revision is not None:
             # The one a rollback ends least of. Purchases from here on
             # are written through the path that keeps the month, so the drift
@@ -1125,6 +1161,11 @@ class ScenarioState:
               and active.deploy_slowdown.ended_at is not None):
             self._active = replace(
                 active, deploy_slowdown=active.deploy_slowdown.again_from(at)
+            )
+        elif (active.model_upgrade is not None
+              and active.model_upgrade.ended_at is not None):
+            self._active = replace(
+                active, model_upgrade=active.model_upgrade.again_from(at)
             )
         elif (active.drifting_revision is not None
               and active.drifting_revision.turned_off_at is not None):
@@ -1613,6 +1654,12 @@ class ScenarioState:
                 if active.deploy_slowdown is not None
                 else None
             )
+        elif active.scenario.categoriser_upgraded:
+            ended_at = (
+                active.model_upgrade.ended_at
+                if active.model_upgrade is not None
+                else None
+            )
         elif active.scenario.rollout_is_paused:
             ended_at = (
                 active.paused_rollout.ended_at
@@ -1768,6 +1815,15 @@ class ScenarioState:
                 return None, utc_now()
 
             return None, min(utc_now(), _settled_at(active.deploy_slowdown.ended_at))
+
+        if active is not None and active.scenario.categoriser_upgraded:
+            # No flag, and what ends it is the rollback the slow deployment is
+            # ended by - settled the same way, so the share is seen coming back
+            # up and staying there before the window stops.
+            if active.model_upgrade is None or active.model_upgrade.ended_at is None:
+                return None, utc_now()
+
+            return None, min(utc_now(), _settled_at(active.model_upgrade.ended_at))
 
         if active is not None and active.drifting_revision is not None:
             # No flag, and nothing in the window to settle. Every minute is flat

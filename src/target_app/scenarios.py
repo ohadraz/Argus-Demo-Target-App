@@ -233,6 +233,18 @@ HALF_ROLLED_OUT = ScenarioFamily(
     ),
 )
 
+AI_SPECIFIC = ScenarioFamily(
+    id="ai-specific",
+    name="AI-specific",
+    taxonomy="Output-quality degradation (FM-17) - 2% of incidents",
+    blurb=(
+        "A model is serving, and serving worse. Nothing fails and nothing "
+        "slows, so no request-level series moves; the only sign is the share "
+        "of its answers the model was sure of, and only a rule written against "
+        "that share can page anybody."
+    ),
+)
+
 # The order a console draws them in: by the share of real incidents each family
 # accounts for, largest first. Not by how interesting the scenario is to watch -
 # the rail is the one place the shop says what kinds of incident exist at all,
@@ -246,6 +258,7 @@ FAMILY_ORDER: tuple[ScenarioFamily, ...] = (
     FOUNDATIONAL_INTEGRITY,
     THE_TAIL,
     HALF_ROLLED_OUT,
+    AI_SPECIFIC,
 )
 
 
@@ -541,6 +554,21 @@ class Scenario:
     branch - so it is mitigated and not resolved, and re-enabling the platform's
     own reconciliation brings it straight back.
 
+    `categoriser_upgraded` stages the fourteenth generated kind, and the only one
+    whose fault is in what the shop *decides* rather than in how it serves. A
+    revision moved the purchase categoriser from one model to the next, and the
+    new model was served words it was not trained to read, so most purchases are
+    filed under "General" with no confidence. Every page renders, as fast as it
+    did, and nothing fails - so the error rate, every quantile, the heap and the
+    CPU are where they were. What moves is the categoriser's own confident share,
+    and only a rule written against it pages anybody.
+
+    It is `deploy_is_slow`'s mirror. Both are a revision that made the shop
+    worse; that one made every request slower and nothing hides, and this one
+    made every request exactly as quick and nothing a request-level series
+    watches can see it. What ends it is the same rollback, which puts the old
+    model back and leaves the new one on the branch - mitigated, not resolved.
+
     `control_plane_is_down` stages something no other field here does: not an
     incident, but a platform that will not carry a mitigation. The deployment
     platform's acting routes refuse while it holds and its reporting routes go
@@ -582,6 +610,7 @@ class Scenario:
     stops_publishing_telemetry: bool = False
     control_plane_is_down: bool = False
     cache_failed_over: bool = False
+    categoriser_upgraded: bool = False
     # Whether the failover went unrecorded. The cache check still finds the
     # stale entries, but nothing knows when the standby started serving them,
     # so the shop's alert carries its finding and no onset.
@@ -611,7 +640,8 @@ class Scenario:
         accumulation, an upstream failure is another company's service, a
         misconfigured cache is a value in a file, a bad deployment is the
         revision that is running, a slow dependency is another team's process,
-        and a monitoring blind spot is the name of a port. A page offering a
+        a monitoring blind spot is the name of a port, and a degraded categoriser
+        is which model a deployment loads. A page offering a
         flag to watch for any of them would be
         offering a control that changes nothing, and naming a flag as the thing
         that breaks the shop would be pointing at a suspect the fixture
@@ -628,6 +658,7 @@ class Scenario:
             or self.rollout_is_paused
             or self.stops_publishing_telemetry
             or self.drifts_from_a_deployment
+            or self.categoriser_upgraded
         )
 
     @property
@@ -746,6 +777,15 @@ THE_COMMIT_THAT_STOPPED_CARRYING_THE_MONTH = (
 THE_COMMIT_BEFORE_THE_MONTH_STOPPED_BEING_CARRIED = (
     "4c810f22894e612ced87f5ee3f3062dfeb785050"
 )
+# The revision that moved the categoriser from model v1 to v2 in
+# `deploy/values-production.yaml`, and its parent. Real commits, on a branch of
+# their own and never merged, as the month-boundary pair is: `main` names v2 and
+# carries the fault the fix corpus patches, and a deployed revision only has to be
+# a commit the change channel can compare against.
+THE_COMMIT_THAT_UPGRADED_THE_CATEGORISER = (
+    "7c3ca00c7528df68d533f6e87acd4f23a55ab342"
+)
+THE_COMMIT_BEFORE_THE_UPGRADE = "d268103129978816ce705c50c14cd42c7c5fe46e"
 FALLBACK_DISABLED = "fallback-disabled"
 FLAG_TOGGLE_RED_HERRING = "flag-toggle-red-herring"
 COMPETING_FLAG_CHANGES = "competing-flag-changes"
@@ -811,6 +851,10 @@ UNDATED_STATE_DIVERGENCE = "cache-failed-over-undated"
 # seems to work for a minute and then does not quite, with the shop failing a
 # single minute at a time at gaps that never settle into a rhythm.
 FLAG_REVERT_LEAVES_A_FLAP = "flag-revert-leaves-a-flap"
+# Named for the change rather than for what it did to the filing, as the failover
+# above is named for the event: what the investigation has to find is that a model
+# moved, and the id says only what the shop's operator would have known.
+CATEGORISER_MODEL_UPGRADED = "categoriser-model-upgraded"
 
 SCENARIOS: dict[str, Scenario] = {
     FEATURE_FLAG_TOGGLE: Scenario(
@@ -1364,6 +1408,40 @@ SCENARIOS: dict[str, Scenario] = {
         deploy=ScenarioDeploy(
             revision=THE_COMMIT_THAT_NAMED_EVERY_PORT_FOR_ITS_PROTOCOL,
             previous_revision=THE_COMMIT_BEFORE_THE_CONVENTION,
+            repo_url="https://github.com/ohadraz/Argus-Demo-Target-App",
+            path="deploy",
+            initiated_by="kuki"
+        )
+    ),
+    CATEGORISER_MODEL_UPGRADED: Scenario(
+        id=CATEGORISER_MODEL_UPGRADED,
+        title="A model upgrade that files everything under General",
+        description=(
+            "Io files every purchase under a category - Audio, Kitchen, Travel - "
+            "so the monthly statement can say where a shopper's money went. A "
+            "small model does the filing, and a deployment moved it from v1 to "
+            "v2 in 'deploy/values-production.yaml'. v2 was retrained on a bigger "
+            "catalogue, and its training pipeline lowercases every title before "
+            "it learns from it; the shop still hands it titles as they are "
+            "written. So 'Kettle in brushed steel' reaches it as 'Kettle', a word "
+            "it has never seen, and most purchases are filed under 'General' with "
+            "no confidence. Nothing fails: every page renders in the time it "
+            "always did, so the error rate, every latency quantile, the heap and "
+            "the CPU are flat. What falls is the share of purchases filed with "
+            "confidence, from nine in ten to four, and a rule watching that share "
+            "pages somebody. The shop's log says when the new model was loaded, "
+            "and the deploy history names the revision. Restarting changes "
+            "nothing, because the process comes back loading the same model; "
+            "what ends it is rolling the deployment back to v1. The revision "
+            "sits on a branch of its own and main still names v2, so this is "
+            "mitigated and not resolved - what is owed is the shop handing v2 the "
+            "words it was trained on."
+        ),
+        family=AI_SPECIFIC,
+        categoriser_upgraded=True,
+        deploy=ScenarioDeploy(
+            revision=THE_COMMIT_THAT_UPGRADED_THE_CATEGORISER,
+            previous_revision=THE_COMMIT_BEFORE_THE_UPGRADE,
             repo_url="https://github.com/ohadraz/Argus-Demo-Target-App",
             path="deploy",
             initiated_by="kuki"

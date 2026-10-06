@@ -325,7 +325,7 @@ PAGE = """<!doctype html>
 <h2>Metrics <span class="note">- per minute, newest last</span></h2>
 <div class="scroll" id="metrics-scroll">
   <table>
-    <thead><tr><th>minute</th><th>error rate</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>requests</th></tr></thead>
+    <thead><tr><th>minute</th><th>error rate</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>requests</th><th>filed confidently</th></tr></thead>
     <tbody id="metrics"></tbody>
   </table>
 </div>
@@ -589,6 +589,15 @@ function actionMarkers(minute) {
     .join('');
 }
 
+// The categoriser's confident share, as a percentage. Blank for a minute that
+// carried no purchases to file, rather than a zero that would read as a model
+// recognising nothing.
+function filedConfidently(bucket) {
+  const share = bucket.categoriser_confident_ratio;
+  return share === null || share === undefined
+    ? '' : (100 * share).toFixed(0) + '%';
+}
+
 function renderMetrics(buckets) {
   // Every bucket, not a recent slice. The window is what an investigation
   // reads, so it is what an audience should be able to scroll back through -
@@ -608,7 +617,8 @@ function renderMetrics(buckets) {
       return '<tr' + marker + '><td>' + bucket.bucket_id + notes + '</td>' + cell +
              '<td>' + bucket.p50_ms + '</td><td>' + bucket.p95_ms + '</td>' +
              '<td>' + bucket.p99_ms + '</td>' +
-             '<td>' + bucket.request_volume + '</td></tr>';
+             '<td>' + bucket.request_volume + '</td>' +
+             '<td>' + filedConfidently(bucket) + '</td></tr>';
     })
     .join(''));
 }

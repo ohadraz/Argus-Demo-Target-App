@@ -17,6 +17,7 @@ from target_app.generator import (
     FlagTimeline,
     GeneratedMinute,
     LiveAutoscaler,
+    ModelUpgrade,
     PausedRollout,
     Pin,
     PricingSlowdown,
@@ -1235,6 +1236,106 @@ def test_a_window_with_no_deployment_staged_is_untouched_by_it() -> None:
     ]
 
 
+def a_window_with_the_categoriser_upgraded(
+    upgraded_minutes_ago: int, rolled_back_minutes_ago: int | None = None
+) -> list[GeneratedMinute]:
+    """A shop filing its purchases with model v2 since then, and with v1 again
+    from the rollback if there was one."""
+    return generate(
+        None,
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="dont-care-flag",
+        model_upgrade=ModelUpgrade(
+            began_at=SOME_NOW - timedelta(minutes=upgraded_minutes_ago),
+            model="v2",
+            ended_at=(
+                None if rolled_back_minutes_ago is None
+                else SOME_NOW - timedelta(minutes=rolled_back_minutes_ago)
+            ),
+        ),
+    )
+
+
+def confident_share_at(minutes_ago: int, minutes: list[GeneratedMinute]) -> float:
+    share = minute_at(minutes_ago, minutes).categoriser_confident_ratio
+
+    assert share is not None, f"No confident share {minutes_ago} minutes ago."
+    return share
+
+
+def test_a_calm_shop_files_most_of_its_purchases_with_confidence() -> None:
+    minutes = generate(None, SOME_NOW, SOME_SPAN_MINUTES, flag="dont-care-flag")
+
+    shares = [minute.categoriser_confident_ratio for minute in minutes]
+
+    assert all(share is not None and 0.85 < share < 0.95 for share in shares), shares
+
+
+def test_the_upgrade_drops_the_confident_share_well_under_half() -> None:
+    minutes = a_window_with_the_categoriser_upgraded(upgraded_minutes_ago=10)
+
+    assert confident_share_at(18, minutes) > 0.85
+    assert confident_share_at(3, minutes) < 0.45
+
+
+def test_the_upgrade_moves_no_other_series() -> None:
+    # The whole of the scenario: filing a purchase costs the same whichever
+    # model does it, and filing one under "General" is not a failure.
+    calm = generate(None, SOME_NOW, SOME_SPAN_MINUTES, flag="dont-care-flag")
+    upgraded = a_window_with_the_categoriser_upgraded(upgraded_minutes_ago=10)
+
+    for field in ("error_rate", "p50_ms", "p95_ms", "p99_ms", "request_volume",
+                  "memory_used_bytes", "cpu_used_cores", "process_start_time_seconds"):
+        assert [getattr(minute, field) for minute in upgraded] == [
+            getattr(minute, field) for minute in calm
+        ], field
+
+
+def test_the_minute_the_upgrade_lands_in_reads_between_the_two_models() -> None:
+    minutes = a_window_with_the_categoriser_upgraded(upgraded_minutes_ago=10)
+    landed_in = minute_at(10, minutes)
+
+    assert confident_share_at(3, minutes) < (
+        landed_in.categoriser_confident_ratio or 0.0
+    ) < confident_share_at(18, minutes)
+
+
+def test_a_rollback_brings_the_confident_share_back_and_keeps_the_fall() -> None:
+    minutes = a_window_with_the_categoriser_upgraded(
+        upgraded_minutes_ago=15, rolled_back_minutes_ago=5
+    )
+
+    assert confident_share_at(8, minutes) < 0.45
+    assert confident_share_at(2, minutes) > 0.85
+
+
+def test_the_shop_logs_each_model_it_loads_in_the_minute_it_loaded_it() -> None:
+    minutes = a_window_with_the_categoriser_upgraded(
+        upgraded_minutes_ago=15, rolled_back_minutes_ago=5
+    )
+
+    loads = [
+        (minute.minute_id, line.split("categoriser loaded model ")[1])
+        for minute in minutes
+        for line in minute.log_lines
+        if "categoriser loaded model" in line
+    ]
+
+    assert loads == [
+        (minute_at(15, minutes).minute_id, "v2"),
+        (minute_at(5, minutes).minute_id, "v1"),
+    ]
+
+
+def test_a_shop_whose_model_never_changed_logs_no_load() -> None:
+    minutes = generate(None, SOME_NOW, SOME_SPAN_MINUTES, flag="dont-care-flag")
+
+    assert not any(
+        "categoriser" in line for minute in minutes for line in minute.log_lines
+    )
+
+
 def a_window_with_the_pricing_service_slow(
     began_minutes_ago: int, restarted_minutes_ago: int | None = None
 ) -> list[GeneratedMinute]:
@@ -2299,6 +2400,7 @@ def test_a_stretch_opened_again_keeps_the_minutes_of_the_one_before() -> None:
         CacheOutage(began_at=FIRST_BEGAN, ended_at=ROLLED_BACK),
         SlowDeployment(began_at=FIRST_BEGAN, ended_at=ROLLED_BACK),
         PausedRollout(began_at=FIRST_BEGAN, ended_at=ROLLED_BACK),
+        ModelUpgrade(began_at=FIRST_BEGAN, model="v2", ended_at=ROLLED_BACK),
     ):
         again = first.again_from(PUT_BACK)
 

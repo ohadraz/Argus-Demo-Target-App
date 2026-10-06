@@ -7,10 +7,11 @@ scrape endpoint is what Prometheus itself reads off a service - text
 exposition, current values only.
 
 A stand-in, not an engine. Nothing here parses PromQL: it knows the fixed set
-of expressions the consumer sends, verbatim, and answers each from the field
-of the per-minute rows it names. Anything else is refused the way Prometheus
-refuses a query it cannot run, so a consumer that changed its expressions
-learns it here rather than by reading an empty window as a quiet shop.
+of expressions the consumer sends and the expressions the shop's alert rules
+evaluate, verbatim, and answers each from the per-minute rows. Anything else is
+refused the way Prometheus refuses a query it cannot run, so a consumer that
+changed its expressions learns it here rather than by reading an empty window
+as a quiet shop.
 
 Values are the rows' own, digit for digit. That is the point of standing in
 rather than computing: a consumer reading through this sees exactly the
@@ -19,15 +20,16 @@ numbers it read before, so nothing recorded against the old shape moves.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 
-# The expressions the consumer sends, keyed by the row field each answers.
-# Idiomatic PromQL over the series `an_exposition` publishes, so the same
-# expressions would run against a real Prometheus scraping this shop. A sample
-# at `t` describes the minute that ended at `t`, which is Prometheus's own
-# convention for a `[1m]` range.
+# The expressions answered from a single field, keyed by the row field each
+# answers: the fixed set the consumer sends, and the categoriser's share, which a
+# rule evaluates and the consumer does not ask for by name. Idiomatic PromQL over
+# the series `an_exposition` publishes, so the same expressions would run against
+# a real Prometheus scraping this shop. A sample at `t` describes the minute that
+# ended at `t`, which is Prometheus's own convention for a `[1m]` range.
 QUERIES: Final[Mapping[str, str]] = {
     "error_rate": (
         'sum(rate(http_requests_total{code=~"5.."}[1m]))'
@@ -42,12 +44,30 @@ QUERIES: Final[Mapping[str, str]] = {
     "process_start_time_seconds": "max(process_start_time_seconds)",
     "cpu_used_cores": "sum(rate(container_cpu_usage_seconds_total[1m]))",
     "cpu_limit_cores": 'sum(kube_pod_container_resource_limits{resource="cpu"})',
-    "cache_hit_ratio": "avg(cache_hit_ratio)"
+    "cache_hit_ratio": "avg(cache_hit_ratio)",
+    "categoriser_confident_ratio": "avg(categoriser_confident_ratio)"
 }
 
-_FIELD_ANSWERING: Final[Mapping[str, str]] = {
-    query: field for field, query in QUERIES.items()
-}
+# The share of its limit the heap is using, as the memory rule evaluates it: the
+# two memory expressions above, divided. Answered from both fields of a row, the
+# one expression here that is not answered from one.
+MEMORY_IN_USE: Final = (
+    f"{QUERIES['memory_used_bytes']} / {QUERIES['memory_limit_bytes']}"
+)
+
+# What a query reads off one row: its value for that minute, or `None` where the
+# row does not report it.
+Reading = Callable[[Mapping[str, Any]], Any]
+
+
+def _memory_in_use(row: Mapping[str, Any]) -> float | None:
+    used = row.get("memory_used_bytes")
+    limit = row.get("memory_limit_bytes")
+
+    return None if used is None or not limit else used / limit
+
+
+_DERIVED: Final[Mapping[str, Reading]] = {MEMORY_IN_USE: _memory_in_use}
 
 # The one step this stand-in evaluates at. A minute is what a row is, and a
 # finer step would ask for readings the rows do not hold.
@@ -122,9 +142,9 @@ def a_matrix(rows: Sequence[Mapping[str, Any]],
     always reported it. At 1 only minutes that have ended are, which is what a
     source that reads a minute once it is over can answer.
     """
-    field = _FIELD_ANSWERING.get(query)
+    reading = the_reading_for(query)
 
-    if field is None:
+    if reading is None:
         raise BadData(f"this stand-in does not answer {query!r}")
 
     if step_seconds != THE_STEP_SECONDS:
@@ -134,9 +154,9 @@ def a_matrix(rows: Sequence[Mapping[str, Any]],
         raise BadData("end is before start")
 
     ended_by = {
-        _the_minute_of(row) + _A_MINUTE: row[field]
+        _the_minute_of(row) + _A_MINUTE: reading(row)
         for row in rows
-        if row.get(field) is not None
+        if reading(row) is not None
         and (reporting_lag_minutes == 0 or _the_minute_of(row) + _A_MINUTE <= now)
     }
     values = []
@@ -155,6 +175,24 @@ def a_matrix(rows: Sequence[Mapping[str, Any]],
         "resultType": MATRIX,
         "result": [{"metric": {}, "values": values}] if values else []
     }
+
+
+def the_reading_for(query: str) -> Reading | None:
+    """What `query` reads off a row, or `None` for a query this stand-in does
+    not answer.
+
+    One answer for the range-query API and the alert rules alike, so a rule
+    evaluates exactly the series a consumer asking its query is sent.
+    """
+    if query in _DERIVED:
+        return _DERIVED[query]
+
+    field = next((name for name, known in QUERIES.items() if known == query), None)
+
+    if field is None:
+        return None
+
+    return lambda row: row.get(field)
 
 
 def an_exposition(rows: Sequence[Mapping[str, Any]]) -> str:
@@ -221,6 +259,14 @@ def an_exposition(rows: Sequence[Mapping[str, Any]]) -> str:
             "# HELP cache_hit_ratio Share of cache reads that hit.",
             "# TYPE cache_hit_ratio gauge",
             f"cache_hit_ratio {newest['cache_hit_ratio']}"
+        ]
+
+    if newest.get("categoriser_confident_ratio") is not None:
+        lines += [
+            "# HELP categoriser_confident_ratio Share of purchases the categoriser "
+            "filed with confidence.",
+            "# TYPE categoriser_confident_ratio gauge",
+            f"categoriser_confident_ratio {newest['categoriser_confident_ratio']}"
         ]
 
     return "\n".join(lines) + "\n"

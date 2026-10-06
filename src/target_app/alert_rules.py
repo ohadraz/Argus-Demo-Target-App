@@ -11,19 +11,28 @@ it is asked at, so nothing has to run between requests for the answer to be the
 one a rule evaluated every interval would give.
 
 Thresholds are absolute, as a real rule's are, and set against the shop's own
-figures: far above anything a healthy minute reads, far below anything an
-incident does. A rule whose range is longer than a minute is longer for a
-reason - a scenario on that rule pauses for a minute at a time, and a rule
-reading one minute would resolve in the pause.
+figures: far from anything a healthy minute reads, well short of anything an
+incident does. Most rules fire above theirs; the one written against a share the
+shop wants high fires below it. A rule whose range is longer than a minute is
+longer for a reason - a scenario on that rule pauses for a minute at a time, and
+a rule reading one minute would resolve in the pause.
+
+A rule's query is PromQL the shop's Prometheus stand-in answers, and the rule is
+evaluated over exactly what that query answers - see `target_app.prometheus` -
+so a responder who reads a rule's definition and runs its query sees the series
+the rule fired on.
 """
 
 from __future__ import annotations
 
+import operator
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from statistics import mean
 from typing import Any, Final
+
+from target_app.prometheus import MEMORY_IN_USE, QUERIES, the_reading_for
 
 # The states Grafana's Prometheus-compatible rules API reports for a rule.
 FIRING: Final = "firing"
@@ -34,27 +43,36 @@ INACTIVE: Final = "inactive"
 FOLDER_UID: Final = "io-shop"
 GROUP: Final = "io-shop-slos"
 
-_A_MINUTE: Final = timedelta(minutes=1)
+# How a threshold compares, as Grafana's threshold expression names its
+# evaluator types.
+GT: Final = "gt"
+LT: Final = "lt"
 
-Reading = Callable[[Mapping[str, Any]], float | None]
+_COMPARISONS: Final[Mapping[str, Callable[[float, float], bool]]] = {
+    GT: operator.gt,
+    LT: operator.lt,
+}
+
+_A_MINUTE: Final = timedelta(minutes=1)
 
 
 @dataclass(frozen=True)
 class AlertRule:
-    """One rule: what it reads, over how long, and the line it fires above.
+    """One rule: what it reads, over how long, and the line it fires across.
 
     `reduce` is how the minutes in the range become one figure - Grafana's
-    Reduce expression. `pending` is the rule's `for`: how long the condition has
-    to hold before the rule fires rather than pends.
+    Reduce expression. `comparator` is which side of the threshold the rule
+    fires on, in Grafana's evaluator vocabulary. `pending` is the rule's `for`:
+    how long the condition has to hold before the rule fires rather than pends.
     """
 
     uid: str
     title: str
     query: str
-    reading: Reading
     reduce: str
     threshold: float
     range_minutes: int
+    comparator: str = GT
     pending: timedelta = timedelta(0)
     keep_firing_for: timedelta = timedelta(0)
     interval: timedelta = _A_MINUTE
@@ -74,17 +92,6 @@ class RuleState:
     value: float | None
 
 
-def _a_field(name: str) -> Reading:
-    return lambda row: row.get(name)
-
-
-def _memory_in_use(row: Mapping[str, Any]) -> float | None:
-    used = row.get("memory_used_bytes")
-    limit = row.get("memory_limit_bytes")
-
-    return None if used is None or not limit else used / limit
-
-
 _REDUCERS: Final[Mapping[str, Callable[[Sequence[float]], float]]] = {
     "last": lambda values: values[-1],
     "mean": mean,
@@ -94,8 +101,7 @@ _REDUCERS: Final[Mapping[str, Callable[[Sequence[float]], float]]] = {
 HIGH_ERROR_RATE: Final = AlertRule(
     uid="io-shop-high-error-rate",
     title="HighErrorRate",
-    query="error_rate",
-    reading=_a_field("error_rate"),
+    query=QUERIES["error_rate"],
     reduce="last",
     # A healthy minute reads four percent at worst; the least of any incident
     # on this rule reads fifteen.
@@ -109,8 +115,7 @@ HIGH_ERROR_RATE: Final = AlertRule(
 HIGH_LATENCY_P95: Final = AlertRule(
     uid="io-shop-high-latency-p95",
     title="HighLatency",
-    query="p95_ms",
-    reading=_a_field("p95_ms"),
+    query=QUERIES["p95_ms"],
     reduce="max",
     threshold=600.0,
     range_minutes=2,
@@ -119,8 +124,7 @@ HIGH_LATENCY_P95: Final = AlertRule(
 HIGH_LATENCY_P50: Final = AlertRule(
     uid="io-shop-high-latency-p50",
     title="HighLatency",
-    query="p50_ms",
-    reading=_a_field("p50_ms"),
+    query=QUERIES["p50_ms"],
     reduce="last",
     threshold=100.0,
     range_minutes=1,
@@ -132,8 +136,7 @@ HIGH_LATENCY_P50: Final = AlertRule(
 HIGH_LATENCY_P99: Final = AlertRule(
     uid="io-shop-high-latency-p99",
     title="HighLatency",
-    query="p99_ms",
-    reading=_a_field("p99_ms"),
+    query=QUERIES["p99_ms"],
     reduce="max",
     threshold=500.0,
     range_minutes=2,
@@ -142,8 +145,7 @@ HIGH_LATENCY_P99: Final = AlertRule(
 HIGH_MEMORY_USAGE: Final = AlertRule(
     uid="io-shop-high-memory-usage",
     title="HighMemoryUsage",
-    query="memory_used_bytes / memory_limit_bytes",
-    reading=_memory_in_use,
+    query=MEMORY_IN_USE,
     reduce="last",
     threshold=0.6,
     range_minutes=1,
@@ -159,11 +161,27 @@ HIGH_MEMORY_USAGE: Final = AlertRule(
 ERROR_RATE_SUSTAINED: Final = AlertRule(
     uid="io-shop-error-rate-sustained",
     title="ErrorRateSustained",
-    query="error_rate",
-    reading=_a_field("error_rate"),
+    query=QUERIES["error_rate"],
     reduce="mean",
     threshold=0.025,
     range_minutes=10
+)
+# The one rule here that fires below its line, because it watches a share the
+# shop wants high: how much of what was bought the categoriser filed with
+# confidence. A healthy minute files nine purchases in ten; a model that has
+# stopped recognising the catalogue files well under half. Averaged over two
+# minutes rather than read off one, as a ratio over a sample is - and no longer
+# than two, so that a shop whose categoriser has been put back reads clean on
+# the minutes a settled window still shows.
+CATEGORISATION_CONFIDENCE_LOW: Final = AlertRule(
+    uid="io-shop-categorisation-confidence-low",
+    title="CategorisationConfidenceLow",
+    query=QUERIES["categoriser_confident_ratio"],
+    reduce="mean",
+    threshold=0.8,
+    comparator=LT,
+    range_minutes=2,
+    pending=timedelta(minutes=5)
 )
 
 SERIES_RULES: Final[Mapping[str, AlertRule]] = {
@@ -175,6 +193,7 @@ SERIES_RULES: Final[Mapping[str, AlertRule]] = {
         HIGH_LATENCY_P99,
         HIGH_MEMORY_USAGE,
         ERROR_RATE_SUSTAINED,
+        CATEGORISATION_CONFIDENCE_LOW,
     )
 }
 
@@ -212,7 +231,9 @@ def state_of(rule: AlertRule,
     def holds_at(moment: datetime) -> bool:
         figure = figure_at(moment)
 
-        return figure is not None and figure > rule.threshold
+        return figure is not None and _COMPARISONS[rule.comparator](
+            figure, rule.threshold
+        )
 
     value = figure_at(evaluated_at)
 
@@ -238,10 +259,15 @@ def _the_figure(rule: AlertRule,
                 at: datetime) -> float | None:
     """The rule's reduced figure at one evaluation, or `None` with no data:
     over the minutes that had ended by `at` and began within the range."""
+    reading = the_reading_for(rule.query)
+
+    if reading is None:
+        raise ValueError(f"no series answers the query of rule {rule.uid}")
+
     values = [
         value
         for value in (
-            rule.reading(row)
+            reading(row)
             for row in rows
             if at - rule.range_minutes * _A_MINUTE
             <= _the_minute_of(row)
@@ -296,7 +322,11 @@ def a_definition(rule: AlertRule) -> dict[str, Any]:
                     "type": "threshold",
                     "expression": "B",
                     "conditions": [
-                        {"evaluator": {"type": "gt", "params": [rule.threshold]}}
+                        {
+                            "evaluator": {
+                                "type": rule.comparator, "params": [rule.threshold]
+                            }
+                        }
                     ],
                     "refId": "C",
                 },
