@@ -5,10 +5,70 @@
 # provider's database. Nothing in this file mentions Argus, and nothing in it
 # needs Argus to be running - Argus reaches this environment over HTTP the same
 # way it would reach a real one, and the environment neither knows nor cares.
+
+# What puts a container on the stack's clock: libfaketime, preloaded, reading the
+# offset `sim-clock` writes. Only the wall clock moves - monotonic time is left
+# real, so every timer, timeout and sleep inside the container lasts what it
+# always did. Every image links the library to one path, so all preload that.
+x-on-the-stacks-clock: &on-the-stacks-clock
+  FAKETIME_TIMESTAMP_FILE: /clock/spec
+  # Read on every call, not cached for the default ten seconds: the offset grows
+  # by `speed - 1` seconds every real second, and a cached one would put this
+  # container that far behind everybody else.
+  FAKETIME_NO_CACHE: "1"
+  FAKETIME_DONT_FAKE_MONOTONIC: "1"
+  LD_PRELOAD: /usr/local/lib/libfaketime.so.1
+
 services:
-  unleash-db:
-    image: postgres:16
+  # The stack's clock: simulated time is SIM_CLOCK_EPOCH + (real - EPOCH) *
+  # SIM_CLOCK_SPEED, the formula every process that reads it agrees on. This
+  # writes the offset that puts real time there into a spec file every 100ms,
+  # on a volume every faked service reads.
+  #
+  # One shared offset rather than libfaketime's own speed factor, which anchors
+  # to each process's start: measured, containers started a few seconds apart
+  # then disagreed by tens of simulated seconds. Unset, the offset is zero and
+  # every container reads the real clock.
+  sim-clock:
+    image: python:3.14-slim
     environment:
+      SIM_CLOCK_EPOCH: "${SIM_CLOCK_EPOCH:-0}"
+      SIM_CLOCK_SPEED: "${SIM_CLOCK_SPEED:-1}"
+    volumes:
+      - sim-clock:/clock
+    command:
+      - python
+      - -c
+      - |
+        import os, time
+        epoch = float(os.environ["SIM_CLOCK_EPOCH"])
+        speed = float(os.environ["SIM_CLOCK_SPEED"])
+        while True:
+            with open("/clock/spec.tmp", "w") as spec:
+                print("+%.3f" % ((time.time() - epoch) * (speed - 1)), file=spec)
+            os.replace("/clock/spec.tmp", "/clock/spec")
+            time.sleep(0.1)
+    healthcheck:
+      # Healthy once the first offset is down, because a faked process that
+      # starts before it finds no spec and runs on the real clock.
+      test: ["CMD", "test", "-f", "/clock/spec"]
+      interval: 1s
+      retries: 30
+
+  unleash-db:
+    build:
+      context: images/postgres-faketime
+    # As `postgres` from the start: the image's entrypoint starts as root and
+    # switches with `gosu`, and under libfaketime that switch hangs with no
+    # output.
+    user: postgres
+    depends_on:
+      sim-clock:
+        condition: service_healthy
+    volumes:
+      - sim-clock:/clock:ro
+    environment:
+      <<: *on-the-stacks-clock
       POSTGRES_USER: unleash
       POSTGRES_PASSWORD: unleash
       POSTGRES_DB: unleash
@@ -30,16 +90,21 @@ services:
       retries: 15
 
   unleash:
-    # Pinned rather than tracking `latest`: the init-token environment
+    # Pinned rather than tracking `latest`, in `images/unleash-faketime`, which
+    # adds only libfaketime to the vendor's image: the init-token environment
     # variables below have been renamed across versions, and a wrong one makes
     # the container refuse to start. The names, the admin paths and the
     # evaluation response shape were all verified against this exact tag -
     # re-verify on any bump.
-    image: unleashorg/unleash-server:8.1.0
+    build:
+      context: images/unleash-faketime
     depends_on:
       unleash-db:
         condition: service_healthy
+    volumes:
+      - sim-clock:/clock:ro
     environment:
+      <<: *on-the-stacks-clock
       DATABASE_URL: "postgres://unleash:unleash@unleash-db:5432/unleash"
       DATABASE_SSL: "false"
       LOG_LEVEL: "warn"
@@ -205,7 +270,10 @@ services:
       # describing some.
       cache:
         condition: service_healthy
+    volumes:
+      - sim-clock:/clock:ro
     environment:
+      <<: *on-the-stacks-clock
       UNLEASH_BASE_URL: "http://unleash:4242"
       UNLEASH_PROJECT: "default"
       UNLEASH_ENVIRONMENT: "production"
@@ -251,3 +319,12 @@ services:
       interval: 2s
       timeout: 2s
       retries: 15
+
+volumes:
+  # In memory: every faked process reads the spec on each call, so it lives
+  # where reading it costs nothing - and a clock has no business outliving its
+  # stack.
+  sim-clock:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
