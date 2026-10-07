@@ -5,6 +5,7 @@ import time
 from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime, timedelta
 from statistics import median
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -598,8 +599,24 @@ def a_staged_cache_misconfiguration(client: TestClient) -> None:
     assert seeded.status_code == 200
 
 
-def suspend_automated_sync(client: TestClient) -> None:
-    client.put("/argocd/io-shop/spec", json={"syncPolicy": {}})
+def a_sync_patch(automated: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": "io-shop",
+        "patch": json.dumps({"spec": {"syncPolicy": {"automated": automated}}}),
+        "patchType": "merge"
+    }
+
+
+def suspend_automated_sync(client: TestClient) -> Response:
+    return client.patch("/argocd/io-shop", json=a_sync_patch({"enabled": False}))
+
+
+def restore_automated_sync(client: TestClient) -> Response:
+    return client.patch("/argocd/io-shop", json=a_sync_patch({"enabled": None}))
+
+
+def the_automated_sync(client: TestClient) -> Any:
+    return client.get("/argocd/io-shop").json()["spec"]["syncPolicy"]["automated"]
 
 
 def test_the_cache_scenario_is_seedable_by_id(client: TestClient) -> None:
@@ -670,6 +687,104 @@ def test_suspending_automated_sync_then_rolling_back_is_accepted(
     rolled_back = client.post("/argocd/io-shop/rollback", json={"id": 1})
 
     assert rolled_back.status_code == 200
+
+
+def test_the_application_starts_with_self_heal_on(client: TestClient) -> None:
+    # What a GitOps application is usually declared with, and what makes a
+    # suspension that disturbed the rest of the policy visible.
+    automated = the_automated_sync(client)
+
+    assert automated["selfHeal"] is True
+    assert automated["enabled"] is None
+
+
+def test_suspending_switches_sync_off_and_keeps_the_rest_of_the_policy(
+    client: TestClient
+) -> None:
+    suspended = suspend_automated_sync(client)
+
+    assert suspended.status_code == 200
+    automated = the_automated_sync(client)
+    assert automated["enabled"] is False
+    assert automated["selfHeal"] is True
+
+
+def test_restoring_removes_the_switch_and_the_application_syncs_itself_again(
+    client: TestClient
+) -> None:
+    a_staged_cache_misconfiguration(client)
+    suspend_automated_sync(client)
+
+    restore_automated_sync(client)
+
+    automated = the_automated_sync(client)
+    assert automated["enabled"] is None
+    assert automated["selfHeal"] is True
+    assert client.post("/argocd/io-shop/rollback", json={"id": 1}).status_code == 400
+
+
+def test_a_patch_removing_automated_entirely_leaves_the_application_unsynced(
+    client: TestClient
+) -> None:
+    # The older way of suspending, which the real platform also accepts.
+    a_staged_cache_misconfiguration(client)
+
+    client.patch(
+        "/argocd/io-shop",
+        json={
+            "name": "io-shop",
+            "patch": json.dumps({"spec": {"syncPolicy": {"automated": None}}}),
+            "patchType": "merge"
+        }
+    )
+
+    assert the_automated_sync(client) is None
+    assert client.post("/argocd/io-shop/rollback", json={"id": 1}).status_code == 200
+
+
+def test_a_patch_type_other_than_merge_is_refused(client: TestClient) -> None:
+    refused = client.patch(
+        "/argocd/io-shop",
+        json={**a_sync_patch({"enabled": False}), "patchType": "json"}
+    )
+
+    assert refused.status_code == 400
+    assert the_automated_sync(client)["enabled"] is None
+
+
+def test_a_patch_reaching_past_the_sync_policy_is_refused(
+    client: TestClient
+) -> None:
+    refused = client.patch(
+        "/argocd/io-shop",
+        json={
+            "name": "io-shop",
+            "patch": json.dumps({"spec": {"destination": {"namespace": "x"}}}),
+            "patchType": "merge"
+        }
+    )
+
+    assert refused.status_code == 400
+
+
+def test_a_patch_setting_a_field_the_policy_does_not_have_is_refused(
+    client: TestClient
+) -> None:
+    refused = client.patch(
+        "/argocd/io-shop", json=a_sync_patch({"selfHealing": True})
+    )
+
+    assert refused.status_code == 400
+    assert "selfHealing" not in the_automated_sync(client)
+
+
+def test_a_patch_that_is_not_json_is_refused(client: TestClient) -> None:
+    refused = client.patch(
+        "/argocd/io-shop",
+        json={"name": "io-shop", "patch": "{not json", "patchType": "merge"}
+    )
+
+    assert refused.status_code == 400
 
 
 def test_the_cache_scenario_reports_a_hit_ratio_and_a_flat_error_rate(
@@ -1901,7 +2016,7 @@ def test_suspending_sync_is_refused_by_a_platform_that_will_not_act(
 ) -> None:
     a_staged_unreachable_control_plane(client)
 
-    refused = client.put("/argocd/io-shop/spec", json={"syncPolicy": {}})
+    refused = suspend_automated_sync(client)
 
     assert refused.status_code == 503
 
@@ -1957,9 +2072,7 @@ def test_resetting_returns_the_platform_to_acting(client: TestClient) -> None:
 
     client.post("/scenario/reset")
 
-    assert client.put(
-        "/argocd/io-shop/spec", json={"syncPolicy": {}}
-    ).status_code == 200
+    assert suspend_automated_sync(client).status_code == 200
 
 
 def test_the_console_offers_it_under_the_foundational_integrity_family(

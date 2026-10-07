@@ -1021,9 +1021,34 @@ def test_a_deployment_reconciles_itself_until_somebody_stops_it() -> None:
 
     assert state.syncs_itself
 
-    state.set_automated_sync(False)
+    state.set_sync_policy({"automated": {"selfHeal": True, "enabled": False}})
 
     assert not state.syncs_itself
+
+
+def test_an_automated_policy_with_no_switch_syncs_itself() -> None:
+    # Argo CD reads an absent `enabled` as on.
+    state = a_scenario_state(a_flag_client_reporting(False))
+
+    state.set_sync_policy({"automated": {}})
+
+    assert state.syncs_itself
+
+
+def test_a_policy_with_no_automated_object_does_not_sync_itself() -> None:
+    state = a_scenario_state(a_flag_client_reporting(False))
+
+    state.set_sync_policy({})
+
+    assert not state.syncs_itself
+
+
+def test_the_sync_policy_handed_out_is_a_copy() -> None:
+    state = a_scenario_state(a_flag_client_reporting(False))
+
+    state.sync_policy["automated"]["enabled"] = False
+
+    assert state.syncs_itself
 
 
 def test_a_reset_puts_automated_sync_back_on() -> None:
@@ -1033,11 +1058,12 @@ def test_a_reset_puts_automated_sync_back_on() -> None:
     # belonging to the previous run.
     state = a_scenario_state(a_flag_client_reporting(False))
     a_staged_cache_misconfiguration(state)
-    state.set_automated_sync(False)
+    state.set_sync_policy({"automated": {"selfHeal": True, "enabled": False}})
 
     state.reset()
 
     assert state.syncs_itself
+    assert state.sync_policy["automated"]["selfHeal"] is True
 
 
 def test_resetting_a_cache_scenario_touches_no_flag() -> None:

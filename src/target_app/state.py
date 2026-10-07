@@ -6,9 +6,11 @@ state, so they survive restarts unaffected.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from typing import Any
 
 from io_shop.cache_reconciliation import (
     CacheReconciliation,
@@ -86,6 +88,21 @@ COMPLETE = "complete"
 # rather than a fixture that is wrong. It was one once, and one bad minute then
 # refuted a mitigation that had worked.
 CLEAN_MINUTES_SHOWN_AFTER_RECOVERY = 3
+
+# Argo CD's own field names for the part of a sync policy that says whether the
+# application syncs itself.
+AUTOMATED = "automated"
+ENABLED = "enabled"
+
+
+def _a_gitops_sync_policy() -> dict[str, Any]:
+    """The sync policy the application starts with, and is reset to.
+
+    Automated with `selfHeal` on, as a GitOps application is usually declared:
+    a live change is reverted at the next reconciliation, which is the reason a
+    mitigation has to suspend sync at all.
+    """
+    return {AUTOMATED: {"prune": False, "selfHeal": True}}
 
 
 def _settled_at(turned_off_at: datetime) -> datetime:
@@ -412,8 +429,8 @@ class ScenarioState:
         self._moments: list[FlagMoment] = []
         self._last_seen: dict[str, bool] = {}
         # A GitOps deployment reconciles itself unless somebody has stopped it,
-        # so this starts on. See `syncs_itself`.
-        self._syncs_itself = True
+        # so this starts on. See `sync_policy`.
+        self._sync_policy = _a_gitops_sync_policy()
         # Every resize the deployment has had, oldest first. A history rather
         # than a count, for the reason the process's restarts are one: see
         # `capacity`.
@@ -905,26 +922,40 @@ class ScenarioState:
         return active is not None and active.scenario.control_plane_is_down
 
     @property
+    def sync_policy(self) -> dict[str, Any]:
+        """The application's sync policy, in Argo CD's own spelling.
+
+        On by default with `selfHeal`, which is how a GitOps deployment normally
+        runs and is what makes suspending it a real step rather than a
+        formality - and what makes a suspension that disturbed the rest of the
+        policy visible. Process state rather than per-scenario state: it
+        describes the platform's arrangement with the application, not any
+        incident, and a scenario seeding would no more reset it than it would
+        reset the cluster.
+
+        A copy, so a caller holding it cannot change the policy by editing it.
+        """
+        return copy.deepcopy(self._sync_policy)
+
+    def set_sync_policy(self, policy: dict[str, Any]) -> None:
+        """Replaces the sync policy - both directions, because a mitigation
+        that suspends sync has to be able to put it back, and putting it back is
+        the half of the undo that matters: an application left un-reconciling is
+        an application quietly not receiving anything anybody deploys to it.
+        """
+        self._sync_policy = copy.deepcopy(policy)
+
+    @property
     def syncs_itself(self) -> bool:
         """Whether the platform is reconciling this application on its own.
 
-        On by default, which is how a GitOps deployment normally runs and is
-        what makes suspending it a real step rather than a formality. Process
-        state rather than per-scenario state: it describes the platform's
-        arrangement with the application, not any incident, and a scenario
-        seeding would no more reset it than it would reset the cluster.
+        Read as Argo CD reads it (`SyncPolicy.IsAutomatedSyncEnabled`): an
+        `automated` object whose `enabled` is absent or true. An `automated`
+        switched off with `enabled: false` keeps its settings and syncs nothing.
         """
-        return self._syncs_itself
+        automated = self._sync_policy.get(AUTOMATED)
 
-    def set_automated_sync(self, enabled: bool) -> None:
-        """Turns the platform's own reconciliation on or off.
-
-        Both directions, because a mitigation that suspends it has to be able
-        to put it back - and putting it back is the half of the undo that
-        matters, since an application left un-reconciling is an application
-        quietly not receiving anything anybody deploys to it.
-        """
-        self._syncs_itself = enabled
+        return automated is not None and automated.get(ENABLED) is not False
 
     @property
     def replicas(self) -> int:
@@ -998,7 +1029,7 @@ class ScenarioState:
         It says nothing about whether the platform will leave it alone. A
         deployment still reconciling itself is one whose next sync re-applies the
         autoscaler the repository declares, floor included, and suspending that is
-        the caller's business - `set_automated_sync` above - for the same reason it
+        the caller's business - `set_sync_policy` above - for the same reason it
         is the caller's business before a rollback or a scale-out.
         """
         at = utc_now()
@@ -1024,7 +1055,7 @@ class ScenarioState:
         It says nothing about whether the platform will leave it alone. A
         deployment still reconciling itself is one whose next sync sets this back
         to the values file's count, and suspending that is the caller's business
-        - `set_automated_sync` above - for the same reason it is the caller's
+        - `set_sync_policy` above - for the same reason it is the caller's
         business before a rollback.
         """
         at = utc_now()
@@ -1535,7 +1566,7 @@ class ScenarioState:
         # would then be staged onto a deployment that silently reconciles
         # nothing, with its rollback accepted on the first try for reasons
         # belonging to the previous run.
-        self._syncs_itself = True
+        self._sync_policy = _a_gitops_sync_policy()
         # And its size, for the same reason. A scale-out raises the count and a
         # withdrawal puts it back, but a run abandoned between the two leaves the
         # shop larger than its configuration - and the next scenario would then be

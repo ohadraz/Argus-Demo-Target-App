@@ -11,7 +11,7 @@ from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from io_shop.endpoints import the_shops_routes
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from target_app import alert_rules, console, prometheus
 from target_app.cache_entries import the_key_for
@@ -110,6 +110,10 @@ PRICING_APPLICATION = "io-pricing"
 # it changed - so any fixed spelling does, and a random one would make a pod
 # appear to have been replaced on every poll.
 _A_POD_SUFFIX = "7d9c4f8b6-x2k9p"
+
+# Argo CD's name for an RFC 7386 merge patch, as `ApplicationPatchRequest`
+# spells its `patchType`.
+_A_MERGE_PATCH = "merge"
 
 flags = FlagClient()
 # The second flag guards the safe path, so the shop is well while it is on.
@@ -504,17 +508,38 @@ class ArgoCdAutomatedSync(BaseModel):
     """The automated half of a sync policy.
 
     Argo CD spells the presence of this object as "this application syncs
-    itself"; there is no boolean to read. An application with no `automated`
-    key is one a human syncs, which is why the field above it is optional
-    rather than defaulting to anything.
+    itself", unless `enabled` is `false` - the switch Argo CD 3.1 added so that
+    automated sync can be turned off while what it was configured to do is kept.
+    `enabled` absent means on. An application with no `automated` key is one a
+    human syncs, which is why the field above it is optional rather than
+    defaulting to anything.
+
+    Unknown fields are refused rather than dropped: a patch that set one would
+    otherwise be answered as accepted and change nothing.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     prune: bool = False
     selfHeal: bool = False
+    enabled: bool | None = None
 
 
 class ArgoCdSyncPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     automated: ArgoCdAutomatedSync | None = None
+
+
+class ArgoCdApplicationPatch(BaseModel):
+    """The body of Argo CD's `PATCH /api/v1/applications/{name}` - its
+    `ApplicationPatchRequest`, bound with `body: "*"`. `patch` is the patch
+    itself as a JSON string, applied to the whole application.
+    """
+
+    name: str
+    patch: str
+    patchType: str
 
 
 class ArgoCdApplicationSpec(BaseModel):
@@ -1314,10 +1339,10 @@ def _the_autoscaler_of(application: str) -> ArgoCdManagedResource:
     )
 
 
-@app.put("/argocd/{application}/spec")
-def argocd_update_spec(application: str,
-                       body: ArgoCdApplicationSpec) -> ArgoCdApplicationSpec:
-    """Stands in for Argo CD's `PUT /api/v1/applications/{name}/spec`.
+@app.patch("/argocd/{application}", response_model=ArgoCdApplication)
+def argocd_patch_application(application: str,
+                             body: ArgoCdApplicationPatch) -> ArgoCdApplication:
+    """Stands in for Argo CD's `PATCH /api/v1/applications/{name}`.
 
     The one thing a caller changes through it here is the sync policy, because
     a rollback cannot run while an application syncs itself - the platform
@@ -1325,12 +1350,73 @@ def argocd_update_spec(application: str,
     from at the next reconciliation. Suspending automated sync is therefore
     part of rolling back rather than a separate concern, and it is the half a
     withdrawal has to put back.
+
+    A merge patch (RFC 7386) only, of `spec.syncPolicy` only. The real route
+    also takes a JSON patch, and a patch of anything in the application; this
+    application has a sync policy and nothing else that may change, so any
+    other patch is refused rather than answered as though it had landed.
     """
     _the_platform_has_to_answer()
 
-    state.set_automated_sync(body.syncPolicy.automated is not None)
+    if body.patchType != _A_MERGE_PATCH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Patch type '{body.patchType}' is not supported here"
+        )
 
-    return _the_spec_now()
+    try:
+        patch = json.loads(body.patch)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400, detail=f"the patch is not JSON: {error}"
+        ) from error
+
+    if not _touches_only_the_sync_policy(patch):
+        raise HTTPException(
+            status_code=400,
+            detail="only spec.syncPolicy may be patched here"
+        )
+
+    patched = _merged({"spec": {"syncPolicy": state.sync_policy}}, patch)
+    policy = patched.get("spec", {}).get("syncPolicy") or {}
+
+    try:
+        ArgoCdSyncPolicy.model_validate(policy)
+    except ValidationError as error:
+        raise HTTPException(
+            status_code=400, detail=f"not a sync policy: {error}"
+        ) from error
+
+    state.set_sync_policy(policy)
+
+    return argocd_application(application)
+
+
+def _touches_only_the_sync_policy(patch: Any) -> bool:
+    if not isinstance(patch, dict) or set(patch) - {"spec"}:
+        return False
+
+    spec = patch.get("spec", {})
+
+    return isinstance(spec, dict) and not set(spec) - {"syncPolicy"}
+
+
+def _merged(target: Any, patch: Any) -> Any:
+    """`patch` applied to `target` as RFC 7386 says: an object merges key by key,
+    a `null` removes its key, and anything else replaces what was there.
+    """
+    if not isinstance(patch, dict):
+        return patch
+
+    result = dict(target) if isinstance(target, dict) else {}
+
+    for key, value in patch.items():
+        if value is None:
+            result.pop(key, None)
+        else:
+            result[key] = _merged(result.get(key), value)
+
+    return result
 
 
 @app.post("/argocd/{application}/rollback", response_model=ArgoCdApplication)
@@ -1893,18 +1979,11 @@ def argocd_application(application: str) -> ArgoCdApplication:
 
 
 def _the_spec_now() -> ArgoCdApplicationSpec:
-    """The application's spec, which here is its sync policy and nothing else.
-
-    Argo CD spells "this application syncs itself" as the presence of an
-    `automated` object rather than as a boolean, so suspending it is the
-    removal of a key - which is exactly what a caller has to do before a
-    rollback, and exactly what an undo has to put back.
+    """The application's spec, which here is its sync policy and nothing else -
+    as it was declared, and as anybody has since patched it.
     """
-    if not state.syncs_itself:
-        return ArgoCdApplicationSpec(syncPolicy=ArgoCdSyncPolicy())
-
     return ArgoCdApplicationSpec(
-        syncPolicy=ArgoCdSyncPolicy(automated=ArgoCdAutomatedSync())
+        syncPolicy=ArgoCdSyncPolicy.model_validate(state.sync_policy)
     )
 
 
