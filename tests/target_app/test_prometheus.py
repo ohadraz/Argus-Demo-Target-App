@@ -48,6 +48,7 @@ def a_row(minute: datetime, **fields: Any) -> dict[str, Any]:
         "cpu_limit_cores": 3.0,
         "cache_hit_ratio": None,
         "categoriser_confident_ratio": 0.9,
+        "fraud_held_for_review_ratio": 0.05,
         **fields
     }
 
@@ -264,3 +265,23 @@ def test_the_exposition_carries_the_categorisers_share_where_it_is_reported() ->
 
     assert "# TYPE categoriser_confident_ratio gauge" in exposition
     assert "categoriser_confident_ratio 0.41\n" in exposition
+
+
+def test_the_held_share_is_answered_from_its_field() -> None:
+    rows = [a_row(THE_FIRST_MINUTE, fraud_held_for_review_ratio=0.18)]
+
+    [[_, value]] = the_samples(
+        a_matrix_over(rows, "fraud_held_for_review_ratio", now=long_after())
+    )
+
+    assert value == "0.18"
+
+
+def test_the_exposition_carries_the_held_share_where_it_is_reported() -> None:
+    rows = three_minutes()
+    rows[-1]["fraud_held_for_review_ratio"] = 0.18
+
+    exposition = an_exposition(rows)
+
+    assert "# TYPE fraud_held_for_review_ratio gauge" in exposition
+    assert "fraud_held_for_review_ratio 0.18\n" in exposition

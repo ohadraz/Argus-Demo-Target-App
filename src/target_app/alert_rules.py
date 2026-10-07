@@ -183,6 +183,21 @@ CATEGORISATION_CONFIDENCE_LOW: Final = AlertRule(
     range_minutes=2,
     pending=timedelta(minutes=5)
 )
+# A share the shop wants low: how much of what was bought the fraud scorer held
+# for somebody to look at. A healthy minute holds about one purchase in twenty,
+# the dearest few; a scorer whose arithmetic has stopped meaning anything holds
+# about half of whatever it scores. One replica of three doing that lifts the
+# minute to near one in five, so a line at one in ten is clear of both. Two
+# minutes, for the reason the categoriser's rule is two.
+FRAUD_HOLDS_HIGH: Final = AlertRule(
+    uid="io-shop-fraud-holds-high",
+    title="FraudHoldsHigh",
+    query=QUERIES["fraud_held_for_review_ratio"],
+    reduce="mean",
+    threshold=0.1,
+    range_minutes=2,
+    pending=timedelta(minutes=5)
+)
 
 SERIES_RULES: Final[Mapping[str, AlertRule]] = {
     rule.uid: rule
@@ -194,6 +209,7 @@ SERIES_RULES: Final[Mapping[str, AlertRule]] = {
         HIGH_MEMORY_USAGE,
         ERROR_RATE_SUSTAINED,
         CATEGORISATION_CONFIDENCE_LOW,
+        FRAUD_HOLDS_HIGH,
     )
 }
 

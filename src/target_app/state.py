@@ -19,6 +19,12 @@ from io_shop.cache_reconciliation import (
 from io_shop.spend_reconciliation import Reconciliation
 from io_shop.summary_cache import CacheEndpoint
 from io_shop.visits import forget_every_visit
+from target_app.accelerators import (
+    A100,
+    V100,
+    ReplicaPlacement,
+    the_node_carrying,
+)
 from target_app.cache_entries import (
     a_client_for,
     discard_every_entry,
@@ -38,6 +44,7 @@ from target_app.generator import (
     Pin,
     PricingSlowdown,
     ProviderOutage,
+    Rescheduling,
     Scaling,
     ScrapeOutage,
     SlowDeployment,
@@ -309,6 +316,12 @@ class ActiveScenario:
     # for the reason the slowdown above is: a rollback ends the stretch and
     # leaves the entry.
     model_upgrade: ModelUpgrade | None = None
+    # The stretch one replica has spent on the Ampere node, for the one scenario
+    # whose condition is where a pod was placed. `None` everywhere else, which
+    # leaves every replica on the cards the fleet was bought with. A pin to those
+    # cards ends the stretch and leaves the entry, as a rollback leaves the
+    # upgrade's.
+    rescheduling: Rescheduling | None = None
     # The stretch the revision that stopped carrying the month has been the one
     # deployed, for the one scenario whose drift a deployment shipped. `None`
     # everywhere else - the flag scenario's drift is read off the flag's own
@@ -440,6 +453,15 @@ class ScenarioState:
         # active scenario's, exactly as the resizes are - it describes what has been
         # done to the deployment, and a pin outlives the incident that prompted it.
         self._pins: tuple[Pin, ...] = ()
+        # The card the deployment's pods are held to, or `None` where nothing
+        # holds them. Process state for the reason the pins are: it describes
+        # what has been done to the deployment, not any incident.
+        self._accelerator_pin: str | None = None
+        # When a change to the pod template last replaced every pod, or `None`
+        # where none has. A node selector is part of the template, so setting or
+        # removing one rolls the whole deployment - and every pod the platform
+        # reports from then on came up then.
+        self._pods_replaced_at: datetime | None = None
 
     def _flags_for(self, scenario: Scenario) -> FlagClient:
         return (
@@ -672,6 +694,25 @@ class ScenarioState:
                         minutes=get_scenario_settings().onset_backdate_minutes
                     ),
                     model=the_deployed_categoriser_model(),
+                ),
+            )
+            return
+
+        if scenario.replica_rescheduled:
+            # No flag, no deploy, and nothing in the shop's code or values. What
+            # is staged is where one pod is running: the scheduler placed one
+            # replica on the Ampere node, and from then on that replica scores
+            # its share of the purchases in TF32. Backdated like the others, so
+            # the incident is diagnosable the instant this returns.
+            self._remember_where_the_flags_are_now()
+            self._active = ActiveScenario(
+                scenario=scenario,
+                seeded_at=now,
+                process_started_at=now - SETTLED_UPTIME,
+                rescheduling=Rescheduling(
+                    began_at=now - timedelta(
+                        minutes=get_scenario_settings().onset_backdate_minutes
+                    )
                 ),
             )
             return
@@ -1036,6 +1077,95 @@ class ScenarioState:
         self._pins = (*self._pins, Pin(at=at, floor=floor))
 
         return at
+
+    @property
+    def accelerator_pin(self) -> str | None:
+        """The card the deployment's pods are held to, or `None` where nothing
+        holds them."""
+        return self._accelerator_pin
+
+    def pin_to_accelerator(self, accelerator: str | None) -> datetime:
+        """Holds the deployment's pods to one kind of card, or releases them,
+        and says when.
+
+        Either way the pod template changed, so every pod is replaced - which is
+        what a node selector costs on a real cluster too. Held to the fleet's own
+        cards, the replica on the Ampere node comes up on one of them and the
+        rescheduling ends there. Held to any other card it does not: the incident
+        is about the Ampere node, and a fixture that ended it for a pin to the
+        wrong card would grade a wrong answer as a right one. Released, every pod
+        comes back up where it was, because nothing moves a pod onto the Ampere
+        node but the scheduler's own accident.
+
+        It says nothing about whether the platform will leave it alone. A
+        deployment still reconciling itself is one whose next sync takes the
+        selector off again, and suspending that is the caller's business, as it
+        is before a rollback or a scale-out.
+        """
+        at = utc_now()
+        self._accelerator_pin = accelerator
+        self._pods_replaced_at = at
+        active = self._active
+
+        if (
+            accelerator == V100
+            and active is not None
+            and active.rescheduling is not None
+            and active.rescheduling.ended_at is None
+        ):
+            self._active = replace(
+                active, rescheduling=replace(active.rescheduling, ended_at=at)
+            )
+
+        return at
+
+    def placements(self) -> list[ReplicaPlacement]:
+        """Where each of the shop's replicas is running, and since when.
+
+        One per replica serving now. Each came up when the process did, or when a
+        change to the pod template last replaced every pod, whichever is later -
+        and runs on a node carrying the cards the fleet was bought with, except
+        the replica the scheduler moved, for as long as it is moved. That one came
+        up on the Ampere node when it was moved there.
+
+        Empty with nothing staged, for the reason the platform's tree is empty
+        then: there is nothing deployed to place.
+        """
+        active = self._active
+
+        if active is None or active.serving_since is None:
+            return []
+
+        came_up = active.serving_since
+
+        if self._pods_replaced_at is not None:
+            came_up = max(came_up, self._pods_replaced_at)
+
+        moved = active.rescheduling
+        placements = []
+
+        for index in range(self.replicas):
+            if index == 0 and moved is not None and moved.ended_at is None:
+                placements.append(
+                    ReplicaPlacement(
+                        index=index,
+                        node=the_node_carrying(A100, 0),
+                        accelerator=A100,
+                        started_at=max(came_up, moved.began_at),
+                    )
+                )
+                continue
+
+            placements.append(
+                ReplicaPlacement(
+                    index=index,
+                    node=the_node_carrying(V100, index),
+                    accelerator=V100,
+                    started_at=came_up,
+                )
+            )
+
+        return placements
 
     def scale_the_deployment_to(self, replicas: int) -> datetime:
         """Sets how many replicas are serving, and says when.
@@ -1580,6 +1710,11 @@ class ScenarioState:
         # nowhere to scale down to, and the next flapping scenario would be staged
         # onto a deployment whose count cannot move - an incident that never starts.
         self._pins = ()
+        # And the card its pods are held to, for the same reason: a pin outliving
+        # the run that set it would stage the next rescheduling onto a deployment
+        # the scheduler may not move a pod in - an incident that never starts.
+        self._accelerator_pin = None
+        self._pods_replaced_at = None
 
         if active is None:
             self._put_the_flags_back_where_they_rest()
@@ -1689,6 +1824,12 @@ class ScenarioState:
             ended_at = (
                 active.model_upgrade.ended_at
                 if active.model_upgrade is not None
+                else None
+            )
+        elif active.scenario.replica_rescheduled:
+            ended_at = (
+                active.rescheduling.ended_at
+                if active.rescheduling is not None
                 else None
             )
         elif active.scenario.rollout_is_paused:
@@ -1855,6 +1996,15 @@ class ScenarioState:
                 return None, utc_now()
 
             return None, min(utc_now(), _settled_at(active.model_upgrade.ended_at))
+
+        if active is not None and active.scenario.replica_rescheduled:
+            # No flag, and what ends it is the pin rather than a rollback -
+            # settled the same way, so the share is seen coming back down and
+            # staying there before the window stops.
+            if active.rescheduling is None or active.rescheduling.ended_at is None:
+                return None, utc_now()
+
+            return None, min(utc_now(), _settled_at(active.rescheduling.ended_at))
 
         if active is not None and active.drifting_revision is not None:
             # No flag, and nothing in the window to settle. Every minute is flat

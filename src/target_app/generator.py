@@ -39,6 +39,7 @@ from functools import lru_cache
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
 from io_shop.categorising import MODELS, categorise
+from io_shop.fraud_scoring import held_for_review
 from io_shop.monthly_statement import StatementPeriod, period_for
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
 from io_shop.pricing_service import AskThePricingService, PricingAnswer
@@ -49,6 +50,7 @@ from io_shop.summary_cache import (
     LookUpSummary,
     SummaryEntry,
 )
+from target_app.accelerators import A100, V100
 from target_app.settings import (
     LAST_KNOWN_GOOD_CATEGORISER_MODEL,
     DeclaredAutoscaler,
@@ -885,6 +887,65 @@ class ModelUpgrade:
 
 
 @dataclass(frozen=True)
+class Rescheduling:
+    """When one of the shop's replicas came up again on the Ampere node, and when
+    the deployment was held back to the cards the rest of its replicas run on.
+
+    `ModelUpgrade`'s shape, and the first condition here that nobody deployed.
+    The scheduler moved a pod - a node drained, a pod evicted, a replacement
+    placed wherever there was room - and the replacement runs exactly the code
+    and the configuration the one before it ran. What differs is the card under
+    it, and with it the arithmetic the fraud scorer's matrix products are done in.
+
+    One replica of however many are serving, so it scores that share of the
+    minute's purchases and the others score the rest as they always did.
+    `ended_at` is the moment the deployment was pinned back to the fleet's own
+    cards. One stretch and never a second: removing the pin leaves every pod where
+    the pin put it, and nothing reschedules one onto the Ampere node again.
+    """
+
+    began_at: datetime
+    ended_at: datetime | None = None
+
+    def share_of(self, minute: datetime, elapsed_seconds: int) -> float:
+        """How much of this minute's first `elapsed_seconds` the moved replica
+        was serving from the Ampere node.
+
+        A share, as every other condition here reports itself: the minute the
+        pod is placed in is scored partly on each card, so the rise ramps across
+        it instead of stepping, and the minute the pin lands in is the same thing
+        in reverse.
+        """
+        if elapsed_seconds <= 0:
+            return 0.0
+
+        window_end = minute + timedelta(seconds=elapsed_seconds)
+        moved_from = max(minute, self.began_at)
+        moved_until = window_end if self.ended_at is None else min(
+            window_end, self.ended_at
+        )
+        seconds_moved = max(0.0, (moved_until - moved_from).total_seconds())
+
+        return min(1.0, seconds_moved / elapsed_seconds)
+
+    def placed_within(self, minute: datetime, elapsed_seconds: int) -> tuple[str, ...]:
+        """The cards the moved replica came up on during this minute's first
+        `elapsed_seconds`, in the order it did: the Ampere card where the stretch
+        began, and the fleet's own where it ended."""
+        window_end = minute + timedelta(seconds=elapsed_seconds)
+        moments = [(self.began_at, A100)]
+
+        if self.ended_at is not None:
+            moments.append((self.ended_at, V100))
+
+        return tuple(
+            accelerator
+            for at, accelerator in moments
+            if minute <= at < window_end
+        )
+
+
+@dataclass(frozen=True)
 class PricingSlowdown:
     """When the pricing service began taking too long to answer, and when it
     stopped.
@@ -1187,6 +1248,11 @@ class GeneratedMinute:
     # reported in every minute of every scenario, because the shop always files
     # its purchases - `None` only where a minute carried no purchase at all.
     categoriser_confident_ratio: float | None = None
+    # How much of what the minute's shoppers had bought the fraud scorer held for
+    # review. A share over every purchase the minute's sample carried, reported in
+    # every minute of every scenario for the reason the categoriser's is - `None`
+    # only where a minute carried no purchase at all.
+    fraud_held_for_review_ratio: float | None = None
     # Whether the shop published this minute's metrics at all. False only while
     # the blind-spot scenario's flag is on, and a property of the minute rather
     # than of the reader: the same minute is unpublished for everybody.
@@ -1225,7 +1291,8 @@ def generate(timeline: FlagTimeline | None,
              ships_the_incremental_write: bool = False,
              scrape_outage: ScrapeOutage | None = None,
              promoted_at: datetime | None = None,
-             model_upgrade: ModelUpgrade | None = None) -> list[GeneratedMinute]:
+             model_upgrade: ModelUpgrade | None = None,
+             rescheduling: Rescheduling | None = None) -> list[GeneratedMinute]:
     """Every minute from `span_minutes` ago up to and including the one in
     progress, once any of it has happened.
 
@@ -1418,6 +1485,7 @@ def generate(timeline: FlagTimeline | None,
             scrape_outage=scrape_outage,
             promoted_at=promoted_at,
             model_upgrade=model_upgrade,
+            rescheduling=rescheduling,
         )
         for offset in range(span_minutes, 0, -1)
     ]
@@ -1455,6 +1523,7 @@ def generate(timeline: FlagTimeline | None,
                 scrape_outage=scrape_outage,
                 promoted_at=promoted_at,
                 model_upgrade=model_upgrade,
+                rescheduling=rescheduling,
             )
         )
 
@@ -1494,6 +1563,7 @@ def _a_whole_minute(
     scrape_outage: ScrapeOutage | None = None,
     promoted_at: datetime | None = None,
     model_upgrade: ModelUpgrade | None = None,
+    rescheduling: Rescheduling | None = None,
 ) -> GeneratedMinute:
     """One minute that has finished, generated once and then remembered.
 
@@ -1544,6 +1614,7 @@ def _a_whole_minute(
         scrape_outage=scrape_outage,
         promoted_at=promoted_at,
         model_upgrade=model_upgrade,
+        rescheduling=rescheduling,
     )
 
 
@@ -1572,6 +1643,7 @@ def _generate_minute(
     scrape_outage: ScrapeOutage | None = None,
     promoted_at: datetime | None = None,
     model_upgrade: ModelUpgrade | None = None,
+    rescheduling: Rescheduling | None = None,
 ) -> GeneratedMinute:
     minute_id = minute.strftime(TIMESTAMP_FORMAT)
     entropy = random.Random(minute_id)
@@ -1732,6 +1804,15 @@ def _generate_minute(
         if model_upgrade is not None
         else 0.0
     )
+    # How much of the minute's purchases were scored on the Ampere card: the
+    # moved replica's share of the fleet, for as much of the minute as it was
+    # there. No entropy, for the reason the categoriser's share draws none.
+    scored_on_the_moved_replica = (
+        rescheduling.share_of(minute, elapsed_seconds)
+        / _the_replicas_serving(minute, capacity, autoscaler, demand_surge)
+        if rescheduling is not None
+        else 0.0
+    )
 
     return GeneratedMinute(
         minute_id=minute_id,
@@ -1837,6 +1918,9 @@ def _generate_minute(
             categoriser=_categoriser_lines_for(
                 minute_id, minute, elapsed_seconds, model_upgrade
             ),
+            scorer=_scorer_lines_for(
+                minute_id, minute, elapsed_seconds, rescheduling
+            ),
         ),
         # After every drawn figure and drawing nothing itself, so it moved no
         # number this generator already produced: the purchases it reads were
@@ -1845,6 +1929,13 @@ def _generate_minute(
             [price for served in outcomes for price in served.prices],
             filed_by_the_upgrade,
             model_upgrade.model if model_upgrade is not None else None,
+        ),
+        # After every drawn figure and drawing nothing itself, for the reason the
+        # categoriser's share is: the purchases were drawn for the pages, and
+        # whether each is held is read off its price.
+        fraud_held_for_review_ratio=_how_much_was_held_for_review(
+            [price for served in outcomes for price in served.prices],
+            scored_on_the_moved_replica,
         ),
         # Whole minutes, and deliberately not the share-of-minute arithmetic the
         # readings above use: a partly-collected minute is not a partly-true
@@ -1891,6 +1982,53 @@ def _how_much_was_filed_confidently(prices: list[int],
         (1.0 - filed_by_the_upgrade) * before
         + filed_by_the_upgrade * confident_share(upgraded_to),
         4,
+    )
+
+
+def _how_much_was_held_for_review(prices: list[int],
+                                  scored_on_the_moved_replica: float) -> float | None:
+    """The share of these purchases the fraud scorer held for review.
+
+    Mixed across the two cards by how much of the minute's scoring each did, so
+    the minute the replica moves in reads between the two rather than as either -
+    the same slope every other condition here reports. Every other replica, and
+    the moved one before it moved, scores on the fleet's own cards.
+    """
+    if not prices:
+        return None
+
+    def held_share(accelerator: str) -> float:
+        return sum(1 for price in prices if held_for_review(price, accelerator)) / len(prices)
+
+    before = held_share(V100)
+
+    if scored_on_the_moved_replica == 0.0:
+        return round(before, 4)
+
+    return round(
+        (1.0 - scored_on_the_moved_replica) * before
+        + scored_on_the_moved_replica * held_share(A100),
+        4,
+    )
+
+
+def _scorer_lines_for(minute_id: str,
+                      minute: datetime,
+                      elapsed_seconds: int,
+                      rescheduling: Rescheduling | None) -> tuple[str, ...]:
+    """What the shop logs when a replica's fraud scorer comes up.
+
+    One line per replica that came up in the minute, naming the card it found -
+    the line any service serving a model writes about the device it loaded onto.
+    It says nothing about whether the card is a problem: what it did to the
+    scoring is the series' to say.
+    """
+    if rescheduling is None:
+        return ()
+
+    return tuple(
+        f"{minute_id} INFO io-shop: fraud scorer serving on cuda device {accelerator}"
+        for accelerator in rescheduling.placed_within(minute, elapsed_seconds)
     )
 
 
@@ -2845,6 +2983,7 @@ def _log_lines_for(
     cache: tuple[str, ...] = (),
     pricing: tuple[str, ...] = (),
     categoriser: tuple[str, ...] = (),
+    scorer: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     evaluations = (
         *(
@@ -2857,6 +2996,7 @@ def _log_lines_for(
         *cache,
         *pricing,
         *categoriser,
+        *scorer,
     )
 
     if not failures:

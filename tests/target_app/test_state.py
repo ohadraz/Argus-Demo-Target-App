@@ -29,11 +29,13 @@ from target_app.scenarios import (
     PRICING_SERVICE_DEGRADED,
     RESOURCE_LEAK,
     SCENARIOS,
+    SCORER_REPLICA_RESCHEDULED,
     SILENT_DATA_CORRUPTION,
     SLOW_CANARY_ROLLOUT,
     UPSTREAM_DEPENDENCY_FAILURE,
     Scenario,
 )
+from target_app.accelerators import A100, V100
 from target_app.settings import get_scenario_settings, the_working_cache_endpoint
 from target_app.state import (
     CLEAN_MINUTES_SHOWN_AFTER_RECOVERY,
@@ -1937,3 +1939,107 @@ def test_withdrawing_the_rollback_loads_the_upgrade_again() -> None:
     assert upgrade.ended_at is None
     assert [stretch.ended_at for stretch in upgrade.earlier] == [rolled_back_at]
     assert state.phase() == RUNNING
+
+
+def a_rescheduled_replica() -> ScenarioState:
+    state = a_scenario_state(a_flag_client_reporting(False))
+    state.seed(SCENARIOS[SCORER_REPLICA_RESCHEDULED])
+
+    return state
+
+
+def test_the_rescheduling_is_backdated_like_every_other_onset() -> None:
+    before = utc_now()
+    state = a_rescheduled_replica()
+
+    began = present(present(state.active).rescheduling).began_at
+
+    assert began <= before - timedelta(
+        minutes=get_scenario_settings().onset_backdate_minutes
+    ) + timedelta(seconds=1)
+
+
+def test_staging_the_rescheduling_moves_no_flag() -> None:
+    flags = a_flag_client_reporting(False)
+
+    a_scenario_state(flags).seed(SCENARIOS[SCORER_REPLICA_RESCHEDULED])
+
+    flags.enable.assert_not_called()
+
+
+def test_the_rescheduling_is_running_until_the_deployment_is_pinned() -> None:
+    assert a_rescheduled_replica().phase() == RUNNING
+
+
+def test_one_replica_runs_on_the_ampere_node_since_the_onset() -> None:
+    state = a_rescheduled_replica()
+    began = present(present(state.active).rescheduling).began_at
+
+    placements = state.placements()
+
+    assert [placement.accelerator for placement in placements] == [
+        A100, V100, V100
+    ]
+    assert placements[0].node == "gpu-a100-0"
+    assert placements[0].started_at == began
+    assert all(placement.started_at < began for placement in placements[1:])
+
+
+def test_pinning_to_the_fleets_own_cards_ends_the_rescheduling() -> None:
+    state = a_rescheduled_replica()
+
+    pinned_at = state.pin_to_accelerator(V100)
+
+    assert present(present(state.active).rescheduling).ended_at == pinned_at
+    assert state.phase() == RECOVERING
+    assert state.accelerator_pin == V100
+    assert all(placement.accelerator == V100 for placement in state.placements())
+    assert all(placement.started_at == pinned_at for placement in state.placements())
+
+
+def test_pinning_to_the_ampere_card_leaves_it_running() -> None:
+    state = a_rescheduled_replica()
+
+    state.pin_to_accelerator(A100)
+
+    assert state.phase() == RUNNING
+
+
+def test_releasing_the_pin_leaves_every_pod_where_it_was() -> None:
+    state = a_rescheduled_replica()
+    state.pin_to_accelerator(V100)
+
+    state.pin_to_accelerator(None)
+
+    assert state.accelerator_pin is None
+    assert state.phase() == RECOVERING
+    assert all(placement.accelerator == V100 for placement in state.placements())
+
+
+def test_restarting_the_shop_leaves_the_replica_where_it_was() -> None:
+    state = a_rescheduled_replica()
+
+    state.restart_the_shop()
+
+    assert state.phase() == RUNNING
+    assert state.placements()[0].accelerator == A100
+
+
+def test_every_other_scenario_runs_on_the_fleets_own_cards() -> None:
+    state = a_scenario_state(a_flag_client_reporting(False))
+    state.seed(SCENARIOS[RESOURCE_LEAK])
+
+    assert {placement.accelerator for placement in state.placements()} == {V100}
+
+
+def test_nothing_staged_is_placed_nowhere() -> None:
+    assert a_scenario_state(a_flag_client_reporting(False)).placements() == []
+
+
+def test_a_reset_takes_the_pin_off() -> None:
+    state = a_rescheduled_replica()
+    state.pin_to_accelerator(V100)
+
+    state.reset()
+
+    assert state.accelerator_pin is None

@@ -34,6 +34,7 @@ from target_app.alert_rules import (
     HIGH_LATENCY_P99,
     HIGH_MEMORY_USAGE,
     CATEGORISATION_CONFIDENCE_LOW,
+    FRAUD_HOLDS_HIGH,
     AlertRule,
 )
 from target_app.integrity import THE_CHECK_RUNS_EVERY
@@ -46,6 +47,7 @@ from target_app.scenarios import (
     FLAG_REVERT_LEAVES_A_FLAP,
     PRICING_SERVICE_DEGRADED,
     RESOURCE_LEAK,
+    SCORER_REPLICA_RESCHEDULED,
     SLOW_CANARY_ROLLOUT,
     TIMESTAMP_FORMAT,
     utc_now,
@@ -269,6 +271,12 @@ _WHAT_FIRED: dict[str, tuple[AlertRule, str]] = {
     CATEGORISER_MODEL_UPGRADED: (
         CATEGORISATION_CONFIDENCE_LOW,
         "Share of purchases categorised confidently below 80% for 5m"
+    ),
+    # The second rule on something the shop decided, and for the same reason:
+    # every request-level series is flat, so this is the only rule that sees it.
+    SCORER_REPLICA_RESCHEDULED: (
+        FRAUD_HOLDS_HIGH,
+        "Share of purchases held for review above 10% for 5m"
     ),
 }
 _BY_DEFAULT = (HIGH_ERROR_RATE, "Error rate above threshold for 5m")

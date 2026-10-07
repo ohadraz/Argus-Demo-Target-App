@@ -54,6 +54,7 @@ from target_app.scenarios import (
     AUTOSCALER_FLAPPING,
     CACHE_MISCONFIGURED,
     CATEGORISER_MODEL_UPGRADED,
+    SCORER_REPLICA_RESCHEDULED,
     CONTROL_PLANE_UNREACHABLE,
     CPU_SATURATION,
     HALF_FINISHED_ROLLOUT,
@@ -1388,7 +1389,7 @@ def test_patching_the_floor_back_lowers_it_again(client: TestClient) -> None:
     assert the_autoscaler_of(client, "io-shop")[MIN_REPLICAS_FIELD] == 3
 
 
-def test_a_patch_of_anything_but_the_autoscaler_is_refused(
+def test_a_floor_sent_to_the_deployment_is_refused(
     client: TestClient
 ) -> None:
     # A platform answering 200 to a patch it did not apply would have a caller
@@ -2223,3 +2224,166 @@ def test_the_upgrade_is_offered_in_the_console_under_an_ai_specific_family(
 
     assert offered[CATEGORISER_MODEL_UPGRADED] == "ai-specific"
     assert "2%" in families["ai-specific"]["taxonomy"]
+
+
+GPU_PRODUCT = "nvidia.com/gpu.product"
+
+
+def a_staged_rescheduled_replica(client: TestClient) -> None:
+    seeded = client.post(
+        "/scenario/seed", json={"scenario_id": SCORER_REPLICA_RESCHEDULED}
+    )
+
+    assert seeded.status_code == 200
+
+
+def the_placements_of(client: TestClient, application: str) -> list[tuple[str, str, str]]:
+    """Each pod's creation time, node and card, read the way a caller has to:
+    the node off the pod's info, and the card off the host of that name."""
+    tree = client.get(f"/argocd/{application}/resource-tree").json()
+    labels = {host["name"]: host["labels"] for host in tree["hosts"]}
+
+    placements = []
+
+    for node in tree["nodes"]:
+        if node["kind"] != "Pod":
+            continue
+
+        [on] = [item["value"] for item in node["info"] if item["name"] == "Node"]
+        placements.append((node["createdAt"], on, labels[on].get(GPU_PRODUCT, "")))
+
+    return placements
+
+
+def a_pin_to(accelerator: str | None) -> str:
+    return json.dumps({"spec": {"template": {"spec": {"nodeSelector": {
+        GPU_PRODUCT: accelerator
+    }}}}})
+
+
+def the_node_selector_of(client: TestClient, application: str) -> dict:
+    manifest = json.loads(
+        client.get(f"/argocd/{application}/resource").json()["manifest"]
+    )
+
+    selector: dict = manifest["spec"]["template"]["spec"].get("nodeSelector", {})
+
+    return selector
+
+
+def test_the_tree_lists_a_pod_per_replica_each_on_a_labelled_node(
+    client: TestClient
+) -> None:
+    a_staged_slow_dependency(client)
+
+    placements = the_placements_of(client, "io-shop")
+
+    assert len(placements) == the_deployed_replica_count()
+    assert {card for _, _, card in placements} == {"Tesla-V100-SXM2-16GB"}
+    assert len({node for _, node, _ in placements}) == len(placements)
+
+
+def test_the_pricing_service_runs_on_a_node_with_no_gpu(client: TestClient) -> None:
+    a_staged_slow_dependency(client)
+
+    [(_, node, card)] = the_placements_of(client, "io-pricing")
+
+    assert node
+    assert card == ""
+
+
+def test_the_moved_replica_is_the_newest_pod_and_on_the_ampere_node(
+    client: TestClient
+) -> None:
+    a_staged_rescheduled_replica(client)
+
+    placements = sorted(the_placements_of(client, "io-shop"))
+    newest = placements[-1]
+
+    assert newest[2] == "NVIDIA-A100-SXM4-40GB"
+    assert {card for _, _, card in placements[:-1]} == {"Tesla-V100-SXM2-16GB"}
+    assert all(created < newest[0] for created, _, _ in placements[:-1])
+
+
+def test_pinning_the_deployment_to_the_fleets_cards_moves_the_replica_back(
+    client: TestClient
+) -> None:
+    a_staged_rescheduled_replica(client)
+
+    assert patched(
+        client, "io-shop", a_pin_to("Tesla-V100-SXM2-16GB"), kind="Deployment"
+    ).status_code == 200
+
+    assert the_node_selector_of(client, "io-shop") == {
+        GPU_PRODUCT: "Tesla-V100-SXM2-16GB"
+    }
+    assert {card for _, _, card in the_placements_of(client, "io-shop")} == {
+        "Tesla-V100-SXM2-16GB"
+    }
+    assert client.get("/scenario/catalog").json()["phase"] == "recovering"
+
+
+def test_a_null_takes_the_pin_off(client: TestClient) -> None:
+    a_staged_rescheduled_replica(client)
+    patched(client, "io-shop", a_pin_to("Tesla-V100-SXM2-16GB"), kind="Deployment")
+
+    assert patched(client, "io-shop", a_pin_to(None), kind="Deployment").status_code == 200
+    assert the_node_selector_of(client, "io-shop") == {}
+
+
+def test_a_deployment_nobody_pinned_carries_no_selector(client: TestClient) -> None:
+    a_staged_rescheduled_replica(client)
+
+    assert the_node_selector_of(client, "io-shop") == {}
+
+
+def test_a_deployment_patch_reaching_past_the_gpu_label_is_refused(
+    client: TestClient
+) -> None:
+    a_staged_rescheduled_replica(client)
+
+    for patch in (
+        json.dumps({"spec": {"replicas": 9}}),
+        json.dumps({"spec": {"template": {"spec": {"nodeSelector": {
+            "kubernetes.io/hostname": "gpu-v100-1"
+        }}}}}),
+        json.dumps({"spec": {"template": {"spec": {"nodeSelector": {
+            GPU_PRODUCT: 7
+        }}}}}),
+        json.dumps({"spec": {"replicas": 9, "template": {"spec": {"nodeSelector": {
+            GPU_PRODUCT: "Tesla-V100-SXM2-16GB"
+        }}}}}),
+        "not a document",
+    ):
+        assert patched(client, "io-shop", patch, kind="Deployment").status_code == 400, patch
+
+    assert the_node_selector_of(client, "io-shop") == {}
+
+
+def test_the_pricing_service_has_no_deployment_to_pin(client: TestClient) -> None:
+    a_staged_rescheduled_replica(client)
+
+    refused = patched(
+        client, "io-pricing", a_pin_to("Tesla-V100-SXM2-16GB"), kind="Deployment"
+    )
+
+    assert refused.status_code == 400
+
+
+def test_the_rescheduled_replica_is_offered_as_ai_specific(client: TestClient) -> None:
+    catalog = client.get("/scenario/catalog").json()
+
+    offered = {
+        scenario["id"]: scenario["family"] for scenario in catalog["scenarios"]
+    }
+
+    assert offered[SCORER_REPLICA_RESCHEDULED] == "ai-specific"
+
+
+def test_the_window_carries_the_held_share(client: TestClient) -> None:
+    a_staged_rescheduled_replica(client)
+
+    buckets = client.get("/scenario/metrics").json()
+
+    assert all(bucket["fraud_held_for_review_ratio"] is not None for bucket in buckets)
+

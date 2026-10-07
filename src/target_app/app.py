@@ -14,6 +14,11 @@ from io_shop.endpoints import the_shops_routes
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from target_app import alert_rules, console, prometheus
+from target_app.accelerators import (
+    GPU_PRODUCT_LABEL,
+    PRICING_NODE,
+    ReplicaPlacement,
+)
 from target_app.cache_entries import the_key_for
 from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.generator import (
@@ -110,6 +115,17 @@ PRICING_APPLICATION = "io-pricing"
 # it changed - so any fixed spelling does, and a random one would make a pod
 # appear to have been replaced on every poll.
 _A_POD_SUFFIX = "7d9c4f8b6-x2k9p"
+# The replica set's half of every replica's name, and the per-pod halves that
+# tell them apart. The first replica keeps the name a one-pod tree always gave
+# it; the rest are spelled the way a replica set spells them, and the index is
+# the fallback for a deployment scaled past what is spelled out here.
+_THE_REPLICA_SETS_HASH = "7d9c4f8b6"
+_THE_PODS_OWN_SUFFIXES = (
+    "x2k9p", "m4q7r", "c8v2n", "h5t3w", "b9f6k", "r2d8s",
+    "w7n4j", "p3g5z", "k6y2m", "t9c4x", "f8w3q", "n5r7v",
+)
+# The info item Argo CD puts on a Pod naming the node it runs on.
+NODE_INFO_ITEM = "Node"
 
 # Argo CD's name for an RFC 7386 merge patch, as `ApplicationPatchRequest`
 # spells its `patchType`.
@@ -258,6 +274,12 @@ _THE_AUTOSCALERS_SUFFIX = "-cpu"
 MERGE_PATCH_TYPE = "application/merge-patch+json"
 SPEC_FIELD = "spec"
 MIN_REPLICAS_FIELD = "minReplicas"
+# And the one field of the Deployment a caller may patch: the node selector on
+# its pod template, and on that only the GPU product label. Kubernetes' own
+# names, all the way down.
+DEPLOYMENT_KIND = "Deployment"
+TEMPLATE_FIELD = "template"
+NODE_SELECTOR_FIELD = "nodeSelector"
 
 # How a Deployment says how far a rolling update has got, in Kubernetes' own
 # vocabulary. A rollout in progress and a rollout that finished are the same
@@ -468,6 +490,10 @@ class MetricBucket(BaseModel):
     # on every generated minute, because the shop always files its purchases;
     # absent from an authored one, which carries no purchases to file.
     categoriser_confident_ratio: float | None = None
+    # How much of what was bought the fraud scorer held for review. Present on
+    # every generated minute for the reason the categoriser's share is, and
+    # absent from an authored one for the same reason.
+    fraud_held_for_review_ratio: float | None = None
 
 
 # The four models below mirror Argo CD's own wire shape, field names included -
@@ -577,6 +603,11 @@ class RegisteredServiceResponse(BaseModel):
     dependencies: list[RegisteredDependency]
 
 
+class ArgoCdInfoItem(BaseModel):
+    name: str
+    value: str
+
+
 class ArgoCdResourceNode(BaseModel):
     """One live object the platform sees under an application.
 
@@ -606,10 +637,30 @@ class ArgoCdResourceNode(BaseModel):
     version: str | None = None
     namespace: str
     createdAt: str
+    # What the platform says about the object beyond its identity, as name and
+    # value pairs. A Pod's carries the node it runs on, under `Node`; nothing
+    # else here carries any.
+    info: list[ArgoCdInfoItem] | None = None
+
+
+class ArgoCdHost(BaseModel):
+    """One node the application's pods run on, as the tree reports it.
+
+    Argo CD lists the nodes under `hosts` with whatever labels its configuration
+    allow-lists (`application.allowedNodeLabels`), and nothing else of the
+    node's labels. This one is configured to carry the GPU product, which is how
+    a caller learns what card a pod is running on without a cluster credential.
+    `resourcesInfo` and `systemInfo` are left out for the reason a node's health
+    is: nothing reads them.
+    """
+
+    name: str
+    labels: dict[str, str]
 
 
 class ArgoCdResourceTree(BaseModel):
     nodes: list[ArgoCdResourceNode]
+    hosts: list[ArgoCdHost] = []
 
 
 class ArgoCdManagedResource(BaseModel):
@@ -953,11 +1004,16 @@ def argocd_resource_tree(application: str) -> ArgoCdResourceTree:
     """Stands in for Argo CD's `GET
     /api/v1/applications/{name}/resource-tree`.
 
-    One pod per application, and its `createdAt` is when that process came up.
+    One pod per replica, and each pod's `createdAt` is when that process came up.
     This is what confirms a restart landed, and it is per application on purpose:
     restarting the pricing service moves its pod's creation time and leaves the
     shop's where it was, which is the only evidence distinguishing "the
     dependency was restarted" from "something was restarted".
+
+    Each pod names the node it runs on, and `hosts` lists those nodes with the
+    one label this platform is configured to report - the GPU product. That is
+    the only place a caller can learn a replica moved to a different card: the
+    deploy history records nothing, because nothing was deployed.
 
     Empty with nothing staged. A platform with no application deployed has no
     pods to report, and a fixture answering with a creation time it invented
@@ -977,14 +1033,25 @@ def argocd_resource_tree(application: str) -> ArgoCdResourceTree:
     if came_up is None:
         return ArgoCdResourceTree(nodes=[])
 
-    nodes = [
-        ArgoCdResourceNode(
-            kind="Pod",
-            name=f"{application}-{_A_POD_SUFFIX}",
-            namespace="production",
-            createdAt=came_up.strftime(TIMESTAMP_FORMAT)
+    if application == PRICING_APPLICATION:
+        # One pod, on a node with no GPU: the pricing service serves no model,
+        # so its node carries no product label - which is a node, and not a
+        # reading that went missing.
+        return ArgoCdResourceTree(
+            nodes=[
+                ArgoCdResourceNode(
+                    kind="Pod",
+                    name=f"{application}-{_A_POD_SUFFIX}",
+                    namespace="production",
+                    createdAt=came_up.strftime(TIMESTAMP_FORMAT),
+                    info=[ArgoCdInfoItem(name=NODE_INFO_ITEM, value=PRICING_NODE)]
+                )
+            ],
+            hosts=[ArgoCdHost(name=PRICING_NODE, labels={})]
         )
-    ]
+
+    placements = state.placements()
+    nodes = [_the_pod_of(application, placement) for placement in placements]
     autoscaler = state.autoscaler
 
     if autoscaler is not None:
@@ -1015,7 +1082,33 @@ def argocd_resource_tree(application: str) -> ArgoCdResourceTree:
             )
         )
 
-    return ArgoCdResourceTree(nodes=nodes)
+    return ArgoCdResourceTree(
+        nodes=nodes,
+        hosts=[
+            ArgoCdHost(
+                name=placement.node,
+                labels={GPU_PRODUCT_LABEL: placement.accelerator}
+            )
+            for placement in placements
+        ]
+    )
+
+
+def _the_pod_of(application: str, placement: ReplicaPlacement) -> ArgoCdResourceNode:
+    """One replica's pod, as the tree lists it: named, dated, and placed."""
+    own_suffix = (
+        _THE_PODS_OWN_SUFFIXES[placement.index]
+        if placement.index < len(_THE_PODS_OWN_SUFFIXES)
+        else str(placement.index)
+    )
+
+    return ArgoCdResourceNode(
+        kind="Pod",
+        name=f"{application}-{_THE_REPLICA_SETS_HASH}-{own_suffix}",
+        namespace="production",
+        createdAt=placement.started_at.strftime(TIMESTAMP_FORMAT),
+        info=[ArgoCdInfoItem(name=NODE_INFO_ITEM, value=placement.node)]
+    )
 
 
 @app.get("/argocd/{application}/resource", response_model=ArgoCdManagedResource)
@@ -1103,6 +1196,9 @@ def _the_deployment_of(application: str) -> dict[str, Any]:
                 "type": ROLLING_UPDATE_STRATEGY,
                 "rollingUpdate": {"maxSurge": "100%", "maxUnavailable": 0},
             },
+            # The pod template, and of it only the node selector - the one part
+            # of it a caller may change here, and absent until somebody has.
+            TEMPLATE_FIELD: {SPEC_FIELD: _the_pod_spec()},
         },
         "status": {
             "replicas": (
@@ -1114,6 +1210,17 @@ def _the_deployment_of(application: str) -> dict[str, Any]:
             "conditions": [_the_progress_of(rollout)],
         },
     }
+
+
+def _the_pod_spec() -> dict[str, Any]:
+    """The part of the pod template a pin changes: its node selector, where the
+    deployment's pods are held to one card, and nothing where they are not."""
+    pinned_to = state.accelerator_pin
+
+    if pinned_to is None:
+        return {}
+
+    return {NODE_SELECTOR_FIELD: {GPU_PRODUCT_LABEL: pinned_to}}
 
 
 def _is_paused(rollout: PausedRollout | None) -> bool:
@@ -1206,20 +1313,24 @@ def argocd_patch_resource(application: str,
     taking a parsed object would be an easier endpoint to write against and not the
     one the adapter will meet.
 
-    One kind and one field. A patch addressed at anything but the autoscaler, or
-    carrying anything but the floor, is refused rather than quietly accepted: a
-    platform answering 200 to a patch it did not apply would have a caller believe
-    production had changed when it had not, which is the same reason an unknown
-    resource action is refused above.
+    Two kinds and one field of each. A patch addressed at anything but the
+    autoscaler or the Deployment, or carrying anything but the autoscaler's floor
+    or the Deployment's GPU node selector, is refused rather than quietly
+    accepted: a platform answering 200 to a patch it did not apply would have a
+    caller believe production had changed when it had not, which is the same
+    reason an unknown resource action is refused above.
 
     Argo CD answers an empty body on success, and so does this.
     """
     _the_platform_has_to_answer()
 
-    if kind != AUTOSCALER_KIND:
+    if kind not in (AUTOSCALER_KIND, DEPLOYMENT_KIND):
         raise HTTPException(
             status_code=400,
-            detail=f"only a {AUTOSCALER_KIND} may be patched here, not {kind}",
+            detail=(
+                f"only a {AUTOSCALER_KIND} or a {DEPLOYMENT_KIND} may be patched "
+                f"here, not {kind}"
+            ),
         )
 
     if patchType is not None and patchType != MERGE_PATCH_TYPE:
@@ -1227,6 +1338,17 @@ def argocd_patch_resource(application: str,
             status_code=400,
             detail=f"unsupported patch type: {patchType}",
         )
+
+    if kind == DEPLOYMENT_KIND:
+        if application == PRICING_APPLICATION:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{PRICING_APPLICATION} has no managed Deployment to patch",
+            )
+
+        state.pin_to_accelerator(_the_accelerator_in(body))
+
+        return {}
 
     if state.autoscaler is None:
         raise HTTPException(
@@ -1275,6 +1397,53 @@ def _the_floor_in(body: str) -> int:
         )
 
     return floor
+
+
+def _the_accelerator_in(body: str) -> str | None:
+    """The card the patch holds the pods to, `None` for a patch that releases
+    them, or a refusal.
+
+    A merge patch that reaches the GPU label on the pod template's node selector
+    and nothing else, with a string to set or a null to remove - RFC 7386's own
+    way of deleting a key. Everything else is refused with a 400, for the reason
+    a malformed floor is: a caller has to be able to tell a patch the platform
+    could not read from one it applied.
+    """
+    refusal = HTTPException(
+        status_code=400,
+        detail=(
+            f"the patch must be a merge patch setting only "
+            f"{SPEC_FIELD}.{TEMPLATE_FIELD}.{SPEC_FIELD}.{NODE_SELECTOR_FIELD}"
+            f".{GPU_PRODUCT_LABEL}"
+        ),
+    )
+
+    try:
+        patch = json.loads(body)
+        selector = patch[SPEC_FIELD][TEMPLATE_FIELD][SPEC_FIELD][NODE_SELECTOR_FIELD]
+    except (ValueError, KeyError, TypeError):
+        raise refusal from None
+
+    reaches_only_the_selector = (
+        list(patch) == [SPEC_FIELD]
+        and list(patch[SPEC_FIELD]) == [TEMPLATE_FIELD]
+        and list(patch[SPEC_FIELD][TEMPLATE_FIELD]) == [SPEC_FIELD]
+        and list(patch[SPEC_FIELD][TEMPLATE_FIELD][SPEC_FIELD]) == [NODE_SELECTOR_FIELD]
+    )
+
+    if (
+        not reaches_only_the_selector
+        or not isinstance(selector, dict)
+        or list(selector) != [GPU_PRODUCT_LABEL]
+    ):
+        raise refusal
+
+    accelerator = selector[GPU_PRODUCT_LABEL]
+
+    if accelerator is not None and not isinstance(accelerator, str):
+        raise refusal
+
+    return accelerator
 
 
 def _the_autoscaler_of(application: str) -> ArgoCdManagedResource:
@@ -1748,6 +1917,7 @@ def _the_buckets() -> list[MetricBucket]:
                 cpu_limit_cores=minute.cpu_limit_cores,
                 cache_hit_ratio=minute.cache_hit_ratio,
                 categoriser_confident_ratio=minute.categoriser_confident_ratio,
+                fraud_held_for_review_ratio=minute.fraud_held_for_review_ratio,
             )
             for minute in _generated_minutes()
             # The one channel that drops a minute, and it drops it rather than
@@ -2169,6 +2339,7 @@ def _the_window_now() -> list[GeneratedMinute]:
         # withholds is the minute itself, not any reading in it.
         scrape_outage=active.scrape_outage if active else None,
         model_upgrade=active.model_upgrade if active else None,
+        rescheduling=active.rescheduling if active else None,
     )
 
 

@@ -6,6 +6,7 @@ from typing import Any
 from target_app.alert_rules import (
     CATEGORISATION_CONFIDENCE_LOW,
     FIRING,
+    FRAUD_HOLDS_HIGH,
     HIGH_ERROR_RATE,
     HIGH_LATENCY_P95,
     HIGH_MEMORY_USAGE,
@@ -25,6 +26,7 @@ from target_app.scenarios import (
     BAD_DEPLOYMENT,
     CATEGORISER_MODEL_UPGRADED,
     FEATURE_FLAG_TOGGLE,
+    SCORER_REPLICA_RESCHEDULED,
     SILENT_DATA_CORRUPTION,
 )
 
@@ -41,8 +43,9 @@ WINDOW_STARTS = datetime(2026, 10, 6, 10, 0, tzinfo=UTC)
 
 def minutes_of(error_rates: list[float] | None = None,
                p95s: list[float] | None = None,
-               confident_shares: list[float] | None = None) -> list[dict[str, Any]]:
-    count = len(error_rates or p95s or confident_shares or [])
+               confident_shares: list[float] | None = None,
+               held_shares: list[float] | None = None) -> list[dict[str, Any]]:
+    count = len(error_rates or p95s or confident_shares or held_shares or [])
     return [
         {
             "bucket_id": (WINDOW_STARTS + timedelta(minutes=offset)).strftime(
@@ -55,6 +58,7 @@ def minutes_of(error_rates: list[float] | None = None,
             "memory_used_bytes": 440 * 1024**2,
             "memory_limit_bytes": 2 * 1024**3,
             "categoriser_confident_ratio": (confident_shares or [0.9] * count)[offset],
+            "fraud_held_for_review_ratio": (held_shares or [0.05] * count)[offset],
         }
         for offset in range(count)
     ]
@@ -242,3 +246,28 @@ def test_the_categoriser_upgrade_pages_on_the_confidence_rule() -> None:
 
     assert the_rule_linked_from(alert) == CATEGORISATION_CONFIDENCE_LOW.uid
     assert alert["labels"]["alertname"] == "CategorisationConfidenceLow"
+
+
+def test_the_held_share_rule_fires_when_the_share_rises() -> None:
+    rows = minutes_of(held_shares=[0.05] * 10 + [0.18] * 10)
+
+    state = state_of(FRAUD_HOLDS_HIGH, rows, at_minute(20), at_minute(20))
+
+    assert state.state == FIRING
+
+
+def test_the_held_share_rule_reads_clean_on_a_window_settled_after_a_pin() -> None:
+    # The same settled window the confidence rule has to read clean on: three
+    # clean minutes after the minute the pin lands in, which is half of each.
+    rows = minutes_of(held_shares=[0.05] * 10 + [0.18] * 10 + [0.11] + [0.05] * 3)
+
+    state = state_of(FRAUD_HOLDS_HIGH, rows, at_minute(80), at_minute(24, 0))
+
+    assert state.state == INACTIVE
+
+
+def test_the_rescheduled_replica_pages_on_the_held_share_rule() -> None:
+    alert = an_alert_for(SCORER_REPLICA_RESCHEDULED, WINDOW_STARTS)["alerts"][0]
+
+    assert the_rule_linked_from(alert) == FRAUD_HOLDS_HIGH.uid
+    assert alert["labels"]["alertname"] == "FraudHoldsHigh"

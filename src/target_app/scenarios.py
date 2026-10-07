@@ -569,6 +569,15 @@ class Scenario:
     watches can see it. What ends it is the same rollback, which puts the old
     model back and leaves the new one on the branch - mitigated, not resolved.
 
+    `replica_rescheduled` stages the fifteenth, and the first nobody deployed.
+    One of the shop's replicas is placed by the scheduler on the cluster's one
+    Ampere node, where the fraud scorer's arithmetic runs in TF32, and the share
+    of purchases held for review rises. Nothing in the deploy history moved and
+    every request is as quick and as successful as before; the only change a
+    reader can find is where a pod is running. What ends it is pinning the
+    deployment to the cards the rest of the fleet runs on, which leaves the
+    scorer allowing TF32 wherever it lands - mitigated, not resolved.
+
     `control_plane_is_down` stages something no other field here does: not an
     incident, but a platform that will not carry a mitigation. The deployment
     platform's acting routes refuse while it holds and its reporting routes go
@@ -611,6 +620,7 @@ class Scenario:
     control_plane_is_down: bool = False
     cache_failed_over: bool = False
     categoriser_upgraded: bool = False
+    replica_rescheduled: bool = False
     # Whether the failover went unrecorded. The cache check still finds the
     # stale entries, but nothing knows when the standby started serving them,
     # so the shop's alert carries its finding and no onset.
@@ -659,6 +669,7 @@ class Scenario:
             or self.stops_publishing_telemetry
             or self.drifts_from_a_deployment
             or self.categoriser_upgraded
+            or self.replica_rescheduled
         )
 
     @property
@@ -855,6 +866,10 @@ FLAG_REVERT_LEAVES_A_FLAP = "flag-revert-leaves-a-flap"
 # above is named for the event: what the investigation has to find is that a model
 # moved, and the id says only what the shop's operator would have known.
 CATEGORISER_MODEL_UPGRADED = "categoriser-model-upgraded"
+# Named for what the scheduler did, for the reason the upgrade above is named for
+# the change: that a replica moved is what anybody looking at the cluster could
+# have seen, and that the card it moved to scores differently is the finding.
+SCORER_REPLICA_RESCHEDULED = "scorer-replica-rescheduled"
 
 SCENARIOS: dict[str, Scenario] = {
     FEATURE_FLAG_TOGGLE: Scenario(
@@ -1446,6 +1461,34 @@ SCENARIOS: dict[str, Scenario] = {
             path="deploy",
             initiated_by="kuki"
         )
+    ),
+    SCORER_REPLICA_RESCHEDULED: Scenario(
+        id=SCORER_REPLICA_RESCHEDULED,
+        title="A replica rescheduled onto a GPU that rounds",
+        description=(
+            "Io scores every purchase for fraud before it is charged, and holds "
+            "the suspicious ones for somebody to look at - about one in twenty, "
+            "the dearest few. The scorer is a small model on a GPU, and the "
+            "shop's three replicas have always run on V100 nodes. Then the "
+            "scheduler moved one of them: a pod was replaced and its replacement "
+            "landed on the cluster's one A100 node, which nothing in the "
+            "deployment forbids. Nothing was deployed and nothing changed in the "
+            "code. But the A100 runs the scorer's matrix arithmetic in TF32, which "
+            "the scorer allows, and the model leans on two features that cancel "
+            "only in full precision - so on that replica about half of all "
+            "purchases are held. Nothing fails: every page renders in the time it "
+            "always did, so the error rate, every latency quantile, the heap and "
+            "the CPU are flat. What rises is the share held for review, from one "
+            "in twenty to nearly one in five, and a rule watching that share "
+            "pages somebody. The platform says which node each pod runs on and "
+            "which GPU that node carries, and the shop's log names the card the "
+            "moved replica came up on. Restarting changes nothing and there is "
+            "nothing to roll back; what ends it is pinning the deployment to "
+            "V100. The scorer still allows TF32 wherever it runs, so this is "
+            "mitigated and not resolved."
+        ),
+        family=AI_SPECIFIC,
+        replica_rescheduled=True
     )
 }
 

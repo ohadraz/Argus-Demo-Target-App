@@ -325,7 +325,7 @@ PAGE = """<!doctype html>
 <h2>Metrics <span class="note">- per minute, newest last</span></h2>
 <div class="scroll" id="metrics-scroll">
   <table>
-    <thead><tr><th>minute</th><th>error rate</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>requests</th><th>filed confidently</th></tr></thead>
+    <thead><tr><th>minute</th><th>error rate</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>requests</th><th>filed confidently</th><th>held for review</th></tr></thead>
     <tbody id="metrics"></tbody>
   </table>
 </div>
@@ -598,6 +598,13 @@ function filedConfidently(bucket) {
     ? '' : (100 * share).toFixed(0) + '%';
 }
 
+// The fraud scorer's held share, as a percentage, blank for the same reason.
+function heldForReview(bucket) {
+  const share = bucket.fraud_held_for_review_ratio;
+  return share === null || share === undefined
+    ? '' : (100 * share).toFixed(0) + '%';
+}
+
 function renderMetrics(buckets) {
   // Every bucket, not a recent slice. The window is what an investigation
   // reads, so it is what an audience should be able to scroll back through -
@@ -618,7 +625,8 @@ function renderMetrics(buckets) {
              '<td>' + bucket.p50_ms + '</td><td>' + bucket.p95_ms + '</td>' +
              '<td>' + bucket.p99_ms + '</td>' +
              '<td>' + bucket.request_volume + '</td>' +
-             '<td>' + filedConfidently(bucket) + '</td></tr>';
+             '<td>' + filedConfidently(bucket) + '</td>' +
+             '<td>' + heldForReview(bucket) + '</td></tr>';
     })
     .join(''));
 }

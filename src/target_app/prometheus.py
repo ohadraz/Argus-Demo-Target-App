@@ -45,7 +45,8 @@ QUERIES: Final[Mapping[str, str]] = {
     "cpu_used_cores": "sum(rate(container_cpu_usage_seconds_total[1m]))",
     "cpu_limit_cores": 'sum(kube_pod_container_resource_limits{resource="cpu"})',
     "cache_hit_ratio": "avg(cache_hit_ratio)",
-    "categoriser_confident_ratio": "avg(categoriser_confident_ratio)"
+    "categoriser_confident_ratio": "avg(categoriser_confident_ratio)",
+    "fraud_held_for_review_ratio": "avg(fraud_held_for_review_ratio)"
 }
 
 # The share of its limit the heap is using, as the memory rule evaluates it: the
@@ -267,6 +268,16 @@ def an_exposition(rows: Sequence[Mapping[str, Any]]) -> str:
             "filed with confidence.",
             "# TYPE categoriser_confident_ratio gauge",
             f"categoriser_confident_ratio {newest['categoriser_confident_ratio']}"
+        ]
+
+    if newest.get("fraud_held_for_review_ratio") is not None:
+        lines += [
+            (
+                "# HELP fraud_held_for_review_ratio Share of purchases the fraud "
+                "scorer held for review."
+            ),
+            "# TYPE fraud_held_for_review_ratio gauge",
+            f"fraud_held_for_review_ratio {newest['fraud_held_for_review_ratio']}"
         ]
 
     return "\n".join(lines) + "\n"

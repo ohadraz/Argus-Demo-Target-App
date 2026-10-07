@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime, timedelta
 
+from io_shop.fraud_scoring import held_for_review
 from io_shop.payment_provider import PROVIDER_HOST
 from io_shop.pricing_service import PRICING_HOST
 from io_shop.summary_cache import CacheEndpoint
@@ -22,6 +23,7 @@ from target_app.generator import (
     Pin,
     PricingSlowdown,
     ProviderOutage,
+    Rescheduling,
     Scaling,
     ScrapeOutage,
     SlowDeployment,
@@ -1335,6 +1337,117 @@ def test_a_shop_whose_model_never_changed_logs_no_load() -> None:
         "categoriser" in line for minute in minutes for line in minute.log_lines
     )
 
+
+
+def a_window_with_a_replica_rescheduled(
+    moved_minutes_ago: int, pinned_minutes_ago: int | None = None
+) -> list[GeneratedMinute]:
+    """A shop with one replica scoring on the Ampere card since then, and back on
+    the fleet's own from the pin if there was one."""
+    return generate(
+        None,
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="dont-care-flag",
+        rescheduling=Rescheduling(
+            began_at=SOME_NOW - timedelta(minutes=moved_minutes_ago),
+            ended_at=(
+                None if pinned_minutes_ago is None
+                else SOME_NOW - timedelta(minutes=pinned_minutes_ago)
+            ),
+        ),
+    )
+
+
+def held_share_at(minutes_ago: int, minutes: list[GeneratedMinute]) -> float:
+    share = minute_at(minutes_ago, minutes).fraud_held_for_review_ratio
+
+    assert share is not None, f"No held share {minutes_ago} minutes ago."
+    return share
+
+
+def test_a_calm_shop_holds_about_one_purchase_in_twenty() -> None:
+    minutes = generate(None, SOME_NOW, SOME_SPAN_MINUTES, flag="dont-care-flag")
+
+    shares = [minute.fraud_held_for_review_ratio for minute in minutes]
+
+    assert all(share is not None and 0.02 < share < 0.08 for share in shares), shares
+
+
+def test_the_moved_replica_lifts_the_held_share_past_the_rules_line() -> None:
+    minutes = a_window_with_a_replica_rescheduled(moved_minutes_ago=10)
+
+    assert held_share_at(18, minutes) < 0.08
+    assert held_share_at(3, minutes) > 0.14
+
+
+def test_the_scorer_still_rounds_on_the_ampere_card() -> None:
+    # The planted fault, asserted present: the shop's own suite never reaches it,
+    # and a fix that took it out would leave this scenario with nothing to show.
+    on_ampere = sum(
+        1 for price in range(500, 9_000)
+        if held_for_review(price, "NVIDIA-A100-SXM4-40GB")
+    )
+
+    assert on_ampere / 8_500 > 0.3
+
+
+def test_the_rescheduling_moves_no_other_series() -> None:
+    # The whole of the scenario: scoring on one card costs what scoring on the
+    # other does, and holding a purchase is not a failure.
+    calm = generate(None, SOME_NOW, SOME_SPAN_MINUTES, flag="dont-care-flag")
+    moved = a_window_with_a_replica_rescheduled(moved_minutes_ago=10)
+
+    for field in ("error_rate", "p50_ms", "p95_ms", "p99_ms", "request_volume",
+                  "memory_used_bytes", "cpu_used_cores", "process_start_time_seconds",
+                  "categoriser_confident_ratio"):
+        assert [getattr(minute, field) for minute in moved] == [
+            getattr(minute, field) for minute in calm
+        ], field
+
+
+def test_the_minute_the_replica_moves_in_reads_between_the_two() -> None:
+    minutes = a_window_with_a_replica_rescheduled(moved_minutes_ago=10)
+    moved_in = minute_at(10, minutes)
+
+    assert held_share_at(18, minutes) < (
+        moved_in.fraud_held_for_review_ratio or 0.0
+    ) < held_share_at(3, minutes)
+
+
+def test_a_pin_brings_the_held_share_back_and_keeps_the_rise() -> None:
+    minutes = a_window_with_a_replica_rescheduled(
+        moved_minutes_ago=15, pinned_minutes_ago=5
+    )
+
+    assert held_share_at(8, minutes) > 0.14
+    assert held_share_at(2, minutes) < 0.08
+
+
+def test_the_shop_logs_the_card_the_moved_replica_came_up_on() -> None:
+    minutes = a_window_with_a_replica_rescheduled(
+        moved_minutes_ago=15, pinned_minutes_ago=5
+    )
+
+    placed = [
+        (minute.minute_id, line.split("cuda device ")[1])
+        for minute in minutes
+        for line in minute.log_lines
+        if "fraud scorer serving on" in line
+    ]
+
+    assert placed == [
+        (minute_at(15, minutes).minute_id, "NVIDIA-A100-SXM4-40GB"),
+        (minute_at(5, minutes).minute_id, "Tesla-V100-SXM2-16GB"),
+    ]
+
+
+def test_a_shop_whose_replicas_never_moved_logs_no_placement() -> None:
+    minutes = generate(None, SOME_NOW, SOME_SPAN_MINUTES, flag="dont-care-flag")
+
+    assert not any(
+        "fraud scorer" in line for minute in minutes for line in minute.log_lines
+    )
 
 def a_window_with_the_pricing_service_slow(
     began_minutes_ago: int, restarted_minutes_ago: int | None = None
