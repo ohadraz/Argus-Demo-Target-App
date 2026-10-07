@@ -56,13 +56,35 @@ class CategoriserModel:
         """The category of the first word this model knows, or `UNCATEGORISED`
         with no confidence when it knows none of them."""
         for word in words:
-            looked_up = word.lower() if self.lowercases_its_input else word
-            category = self.vocabulary.get(looked_up)
+            for looked_up in self._spellings_of(word):
+                category = self.vocabulary.get(looked_up)
 
-            if category is not None:
-                return Categorisation(category=category, confident=True)
+                if category is not None:
+                    return Categorisation(category=category, confident=True)
 
         return Categorisation(category=UNCATEGORISED, confident=False)
+
+    def _spellings_of(self, word: str) -> tuple[str, ...]:
+        """The spellings of `word` to try against the vocabulary, in order.
+
+        A model that folds case itself needs only the folded form. A model whose
+        tokeniser moved out into the training pipeline takes words exactly as it
+        is handed them - but that pipeline lowercased every title before the
+        vocabulary was built, so serving has to offer the folded form too. A
+        title reaches the shop capitalised the way the shopper saw it, and
+        without this a word that differs from the vocabulary only by its capital
+        letter is unknown: the purchase is filed under "General" and the model
+        reports no confidence, with nothing failing to show for it.
+
+        The word as given is tried first, so a vocabulary that really does spell
+        a word with capitals still matches that spelling.
+        """
+        folded = word.lower()
+
+        if self.lowercases_its_input or folded == word:
+            return (folded,)
+
+        return (word, folded)
 
 
 _THE_FIRST_VOCABULARY: Final[Mapping[str, str]] = {

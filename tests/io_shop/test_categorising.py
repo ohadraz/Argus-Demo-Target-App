@@ -42,6 +42,28 @@ def test_the_upgrade_files_everything_the_first_model_did_the_same_way() -> None
     assert categorise("Family cookbook", V2).category == "Books"
 
 
+def test_the_upgrade_reads_a_word_however_it_is_capitalised() -> None:
+    """The upgrade's tokeniser moved into the training pipeline, which lowercased
+    every title before building the vocabulary. Titles still reach the shop
+    capitalised as the shopper saw them, so serving has to fold case for it -
+    without that, a title naming its product first is filed under "General" with
+    no confidence and nothing fails to show for it."""
+    filed = categorise("Kettle in brushed steel", V2)
+
+    assert filed.category == "Kitchen"
+    assert filed.confident
+
+    assert categorise("KEYBOARD with backlight", V2).category == "Computing"
+    assert categorise("Smartwatch for running", V2).category == "Wearables"
+
+
+def test_the_upgrade_still_files_an_unknown_title_under_general() -> None:
+    filed = categorise("Gift card", V2)
+
+    assert filed.category == UNCATEGORISED
+    assert not filed.confident
+
+
 def test_every_model_is_loadable_by_the_version_the_deployment_names() -> None:
     assert {version: model.version for version, model in MODELS.items()} == {
         "v1": "v1", "v2": "v2"
