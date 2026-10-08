@@ -10,17 +10,20 @@ purchase charges in pounds, and what it settles at in euros. Collinear features
 are an ordinary accident of a feature pipeline, and what training makes of them
 is an ordinary consequence - two large weights of opposite sign that almost
 cancel, with the model's whole opinion of a purchase in the small difference
-between them. In full precision the cancellation is exact enough to leave that
-difference intact.
+between them.
 
 It runs on a GPU, as the rest of the shop's models do, and which GPU is the
 node's business rather than this module's: the accelerator is handed in. On
 Ampere and later, matrix arithmetic may run in TF32 - an eight-bit exponent
 and a ten-bit mantissa - which rounds every operand to about three significant
-decimal digits. That is harmless for a well-conditioned model and is the end of
-this one: rounding two products in the thousands that were meant to cancel to
-within a few units leaves a logit that is mostly rounding error, and about half
-of all purchases are held.
+decimal digits. Evaluating the two large terms separately and letting them
+cancel in the accelerator's arithmetic cannot survive that: rounding two
+products in the thousands that were meant to cancel to within a few units
+leaves a logit that is mostly rounding error. So the cancellation is done here,
+once, in full precision - the collinear pair is folded into the one small
+coefficient per pound that they always meant, and what the accelerator is left
+to compute is a single well-conditioned multiply whose answer moves by pennies,
+not by its sign, under TF32 rounding.
 """
 
 from __future__ import annotations
@@ -51,6 +54,15 @@ WEIGHT_ON_THE_CHARGE: Final = 4680.05
 WEIGHT_ON_THE_SETTLEMENT: Final = -4000.0
 BIAS: Final = -4.3
 
+# The two collinear weights folded into the one coefficient per pound that they
+# describe between them, cancelled here in full precision so that no
+# accelerator's reduced-precision arithmetic ever has to cancel them. Scoring a
+# purchase is then a single multiply against a number of the same magnitude as
+# the answer.
+EFFECTIVE_WEIGHT_ON_THE_CHARGE: Final = (
+    WEIGHT_ON_THE_CHARGE + WEIGHT_ON_THE_SETTLEMENT * EUROS_PER_POUND
+)
+
 # Bits of significand TF32 keeps, counting the implicit leading one.
 _TF32_SIGNIFICAND_BITS: Final = 11
 
@@ -66,14 +78,9 @@ def fraud_logit(price_cents: int, accelerator: str) -> float:
     """The model's opinion of a purchase at this price, scored on this
     accelerator - positive is suspicious."""
     charge = price_cents / _PENCE_PER_POUND
-    settlement = charge * EUROS_PER_POUND
     rounded = _to_tf32 if runs_in_tf32(accelerator) else _as_given
 
-    return (
-        rounded(WEIGHT_ON_THE_CHARGE) * rounded(charge)
-        + rounded(WEIGHT_ON_THE_SETTLEMENT) * rounded(settlement)
-        + BIAS
-    )
+    return rounded(EFFECTIVE_WEIGHT_ON_THE_CHARGE) * rounded(charge) + BIAS
 
 
 def held_for_review(price_cents: int, accelerator: str) -> bool:
