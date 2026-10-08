@@ -77,9 +77,11 @@ Argus and sometimes a human in a console.
 """
 
 
-def a_flag_client_reporting(enabled: bool) -> Mock:
+def a_flag_client_reporting(enabled: bool, last_moved_at: datetime | None = None) -> Mock:
+    """A provider whose log records no move unless a case says when one was."""
     flags = Mock(spec=FlagClient)
     flags.is_enabled.return_value = enabled
+    flags.last_moved_at.return_value = last_moved_at
     return flags
 
 
@@ -201,6 +203,78 @@ def test_a_flag_turned_off_by_anyone_ends_the_incident() -> None:
     flags.is_enabled.return_value = False
 
     assert present(state.timeline_now()).turned_off_at is not None
+
+
+def test_a_flag_turned_off_is_dated_when_the_provider_recorded_it() -> None:
+    # Not when this service happened to read next. Every second between the two
+    # was reported as still broken, and on a stack running ten times real time a
+    # second and a half was a quarter of the minute an agent judged its revert by
+    # - enough to refute a revert that worked.
+    flags = a_flag_client_reporting(True)
+    state = a_scenario_state(flags)
+    state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
+    recorded_at = utc_now() - timedelta(seconds=15)
+
+    flags.is_enabled.return_value = False
+    flags.last_moved_at.return_value = recorded_at
+
+    assert present(state.timeline_now()).turned_off_at == recorded_at
+
+
+def test_a_flag_switched_back_on_is_dated_when_the_provider_recorded_it() -> None:
+    flags = a_flag_client_reporting(True)
+    state = a_scenario_state(flags)
+    state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
+    flags.is_enabled.return_value = False
+    flags.last_moved_at.return_value = utc_now() - timedelta(seconds=30)
+    state.timeline_now()
+    recorded_at = utc_now() - timedelta(seconds=10)
+
+    flags.is_enabled.return_value = True
+    flags.last_moved_at.return_value = recorded_at
+
+    assert present(state.timeline_now()).turned_on_at == recorded_at
+
+
+def test_a_record_no_later_than_the_stretch_it_would_end_is_not_this_move() -> None:
+    # The latest entry can be the change the timeline already stands for - a
+    # staging toggle, or one a reset left behind - and dating this move by it
+    # would end a stretch before it began.
+    flags = a_flag_client_reporting(True)
+    state = a_scenario_state(flags)
+    state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
+    began = present(state.timeline_now()).turned_on_at
+    read_from = utc_now()
+
+    flags.is_enabled.return_value = False
+    flags.last_moved_at.return_value = began - timedelta(minutes=1)
+
+    assert present(state.timeline_now()).turned_off_at >= read_from
+
+
+def test_a_flag_move_is_never_dated_after_the_read_that_found_it() -> None:
+    flags = a_flag_client_reporting(True)
+    state = a_scenario_state(flags)
+    state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
+
+    flags.is_enabled.return_value = False
+    flags.last_moved_at.return_value = utc_now() + timedelta(minutes=5)
+    turned_off_at = present(state.timeline_now()).turned_off_at
+
+    assert present(turned_off_at) <= utc_now()
+
+
+def test_a_decoy_turned_off_is_dated_when_the_provider_recorded_it() -> None:
+    flags = a_flag_client_reporting(True)
+    fallback_flags = a_flag_client_reporting(False)
+    state = a_scenario_state(flags, fallback_flags)
+    state.seed(SCENARIOS[COMPETING_FLAG_CHANGES])
+    recorded_at = utc_now() - timedelta(seconds=15)
+
+    flags.is_enabled.return_value = False
+    flags.last_moved_at.return_value = recorded_at
+
+    assert present(state.decoy_timeline_now()).turned_off_at == recorded_at
 
 
 def test_the_incident_stays_ended_once_it_has_ended() -> None:

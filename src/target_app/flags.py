@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime
 
 import httpx2
 
@@ -22,6 +23,13 @@ _FULL_ROLLOUT_PARAMETERS = {"rollout": "100", "stickiness": "default"}
 # applying changes is reported rather than waited on.
 _EVALUATION_LAG_ALLOWANCE_SECONDS = 10.0
 _EVALUATION_POLL_SECONDS = 0.1
+
+# The provider's audit log, and its own names for the two entries that change
+# what a flag evaluates to. Everything else it records - a flag created, a
+# strategy added - left evaluation where it was.
+_EVENTS_PATH = "/api/admin/events"
+_ENABLED_EVENT = "feature-environment-enabled"
+_DISABLED_EVENT = "feature-environment-disabled"
 
 
 class FlagProviderUnavailable(Exception):
@@ -91,6 +99,37 @@ class FlagClient:
         )
         toggles = response.json().get("toggles", [])
         return any(toggle.get("name") == self._settings.flag for toggle in toggles)
+
+    def last_moved_at(self) -> datetime | None:
+        """When the provider recorded this flag last being switched, in either
+        direction - or `None` where its log holds no such entry.
+
+        What a service that learns of a change on its next read should date the
+        change by. Stamped with the read instead, a change is dated as late as
+        the read happened to come, and every second between the two is reported
+        as still broken: on a stack running ten times real time, a second and a
+        half before the next read is fifteen seconds of the very minute an agent
+        judges its revert by.
+
+        The latest by the provider's own sequence rather than by its timestamp,
+        which a flag switched and switched straight back can tie on.
+        """
+        response = self._get(
+            _EVENTS_PATH, headers={"Authorization": self._settings.admin_token}
+        )
+        toggles = [
+            event
+            for event in response.json().get("events", [])
+            if event.get("type") in (_ENABLED_EVENT, _DISABLED_EVENT)
+            and event.get("featureName") == self._settings.flag
+            and event.get("environment") == self._settings.environment
+        ]
+
+        if not toggles:
+            return None
+
+        latest = max(toggles, key=lambda event: int(event["id"]))
+        return datetime.fromisoformat(latest["createdAt"])
 
     def enable(self) -> None:
         """Turns the flag on in its environment, returning once it evaluates

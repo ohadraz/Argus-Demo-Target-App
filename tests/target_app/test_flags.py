@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from unittest.mock import Mock
 
 import httpx2
@@ -214,6 +215,67 @@ def test_disabling_waits_for_the_evaluation_to_agree() -> None:
 
     reads_until_the_write_showed_up = 2
     assert transport.get.call_count == reads_until_the_write_showed_up
+
+
+def an_event(event_id: int,
+             created_at: str,
+             event_type: str = "feature-environment-disabled",
+             flag: str = SOME_FLAG,
+             environment: str = SOME_ENVIRONMENT) -> dict[str, object]:
+    """One entry in the provider's audit log, in its own shape."""
+    return {
+        "id": event_id,
+        "type": event_type,
+        "featureName": flag,
+        "environment": environment,
+        "createdAt": created_at,
+    }
+
+
+def an_event_log(*events: dict[str, object]) -> httpx2.Response:
+    """The admin API's audit log, which answers newest first."""
+    return httpx2.Response(200, json={"events": list(events)})
+
+
+def test_the_last_move_is_the_latest_toggle_the_provider_recorded() -> None:
+    # Latest by the provider's own sequence: a flag switched and switched straight
+    # back ties on a timestamp recorded to the second.
+    transport = a_transport_answering(an_event_log(
+        an_event(8, "2026-10-07T13:43:49.000Z", "feature-environment-disabled"),
+        an_event(9, "2026-10-07T13:43:49.000Z", "feature-environment-enabled"),
+        an_event(7, "2026-10-07T13:40:02.000Z")
+    ))
+
+    moved_at = FlagClient(settings=a_settings(), client=transport).last_moved_at()
+
+    assert moved_at == datetime(2026, 10, 7, 13, 43, 49, tzinfo=UTC)
+
+
+def test_the_last_move_ignores_what_did_not_switch_this_flag_here() -> None:
+    some_other_flag = "legacy-checkout-fallback"
+    transport = a_transport_answering(an_event_log(
+        an_event(12, "2026-10-07T13:50:00.000Z", flag=some_other_flag),
+        an_event(11, "2026-10-07T13:49:00.000Z", environment="development"),
+        an_event(10, "2026-10-07T13:48:00.000Z", event_type="feature-strategy-add"),
+        an_event(3, "2026-10-07T13:01:00.000Z")
+    ))
+
+    moved_at = FlagClient(settings=a_settings(), client=transport).last_moved_at()
+
+    assert moved_at == datetime(2026, 10, 7, 13, 1, tzinfo=UTC)
+
+
+def test_a_log_with_no_move_of_this_flag_has_no_last_move() -> None:
+    transport = a_transport_answering(an_event_log())
+
+    assert FlagClient(settings=a_settings(), client=transport).last_moved_at() is None
+
+
+def test_an_unreadable_log_raises_rather_than_reading_as_no_move() -> None:
+    transport = a_transport_answering(httpx2.Response(500, text="upstream boom"))
+
+    with pytest.raises(FlagProviderUnavailable):
+        FlagClient(settings=a_settings(), client=transport).last_moved_at()
 
 
 def test_enabling_gives_up_when_the_evaluation_never_agrees() -> None:

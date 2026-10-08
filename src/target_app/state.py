@@ -142,7 +142,8 @@ def _has_fallen_behind(timeline: FlagTimeline, moved_now: bool) -> bool:
 
 
 def _caught_up_with_the_flag(timeline: FlagTimeline,
-                             moved_now: bool) -> FlagTimeline:
+                             moved_now: bool,
+                             recorded_at: datetime | None) -> FlagTimeline:
     """One timeline caught up with its flag, in whichever direction it moved.
 
     Both directions, because an agent that moves a flag may put it back: every
@@ -159,11 +160,39 @@ def _caught_up_with_the_flag(timeline: FlagTimeline,
     dropped, the minutes before the revert would read as quiet, erasing the
     incident itself - and an agent investigating again after its revert was
     refuted would find a window with nothing in it and call the alarm false.
-    """
-    if moved_now:
-        return timeline.again_from(utc_now())
 
-    return replace(timeline, turned_off_at=utc_now())
+    `recorded_at` is when the provider says the flag moved, which is when the
+    boundary goes - see `_when_it_moved`.
+    """
+    moved_at = _when_it_moved(timeline, recorded_at)
+
+    if moved_now:
+        return timeline.again_from(moved_at)
+
+    return replace(timeline, turned_off_at=moved_at)
+
+
+def _when_it_moved(timeline: FlagTimeline, recorded_at: datetime | None) -> datetime:
+    """When the flag moved: as the provider recorded it, or now.
+
+    The provider's record is the fact; this service only finds out on its next
+    read, which can come well after. Now is what is left where the record cannot
+    be about this move - there is none, or it is no later than the timeline's
+    own latest boundary, which makes it the change that boundary already
+    stands for - and it is also the ceiling, so no stretch is dated after the
+    read that discovered it.
+    """
+    latest_boundary = (
+        timeline.turned_off_at
+        if timeline.turned_off_at is not None
+        else timeline.turned_on_at
+    )
+    now = utc_now()
+
+    if recorded_at is None or recorded_at <= latest_boundary:
+        return now
+
+    return min(recorded_at, now)
 
 
 def _the_decoys_quiet_state(scenario: Scenario) -> bool:
@@ -2122,7 +2151,11 @@ class ScenarioState:
         if not _has_fallen_behind(active.timeline, broken_now):
             return active.timeline
 
-        caught_up = _caught_up_with_the_flag(active.timeline, broken_now)
+        caught_up = _caught_up_with_the_flag(
+            active.timeline,
+            broken_now,
+            self._flags_for(active.scenario).last_moved_at()
+        )
         self._active = replace(active, timeline=caught_up)
 
         return caught_up
@@ -2154,7 +2187,9 @@ class ScenarioState:
         if not _has_fallen_behind(active.decoy_timeline, moved_now):
             return active.decoy_timeline
 
-        caught_up = _caught_up_with_the_flag(active.decoy_timeline, moved_now)
+        caught_up = _caught_up_with_the_flag(
+            active.decoy_timeline, moved_now, client.last_moved_at()
+        )
         self._active = replace(active, decoy_timeline=caught_up)
 
         return caught_up

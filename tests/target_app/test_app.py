@@ -119,9 +119,11 @@ def client() -> Iterator[TestClient]:
     """
     flags = Mock(spec=FlagClient)
     flags.is_enabled.return_value = False
+    flags.last_moved_at.return_value = None
     flags.name = "monthly-spend-feature"
     fallback_flags = Mock(spec=FlagClient)
     fallback_flags.is_enabled.return_value = True
+    fallback_flags.last_moved_at.return_value = None
     fallback_flags.name = "legacy-checkout-fallback"
 
     was = app_module.state
@@ -820,9 +822,11 @@ def a_shop_whose_flag_is_on() -> Iterator[TestClient]:
     """
     flags = Mock(spec=FlagClient)
     flags.is_enabled.return_value = True
+    flags.last_moved_at.return_value = None
     flags.name = "monthly-spend-feature"
     fallback_flags = Mock(spec=FlagClient)
     fallback_flags.is_enabled.return_value = True
+    fallback_flags.last_moved_at.return_value = None
     fallback_flags.name = "legacy-checkout-fallback"
 
     was = app_module.state
