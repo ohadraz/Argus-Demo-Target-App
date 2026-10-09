@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from target_app.oncall import RESPONDERS
 from target_app.people import AN_UNPRICED_TITLE, pay_grades_and_bands
 
 """What a job title is worth, in an HR system's shape.
@@ -10,10 +9,9 @@ vendor's SDK: levels carry their titles, the band is three figures and a
 currency, and nothing anywhere is a person. Renaming any of that here would
 break the adapter and nothing in this repo.
 
-Two of these are about what the fixture is *for* rather than what it says: the
-titles the scenarios' own responders hold have to be priceable, or an incident
-can never report a cost; and one title has to be missing, or the consumer's
-"no band for this title" path is never walked outside a unit test.
+One of these is about what the fixture is *for* rather than what it says: one
+title has to be missing, or the consumer's "no band for this title" path is
+never walked outside a unit test.
 """
 
 
@@ -35,16 +33,6 @@ def test_titles_hang_off_levels_rather_than_levels_off_titles() -> None:
 
         for title in level["jobTitles"]:
             assert set(title) == {"id", "jobTitle"}
-
-
-def test_the_titles_the_scenarios_page_are_all_priceable() -> None:
-    # Not a property of the endpoint but of the demo: an incident whose
-    # responders cannot be priced reports no cost, and a demo that always
-    # reports no cost demonstrates nothing.
-    priced = _priced_titles()
-
-    for responder in RESPONDERS.values():
-        assert responder["job_title"] in priced
 
 
 def test_one_title_the_shop_employs_is_deliberately_unpriced() -> None:

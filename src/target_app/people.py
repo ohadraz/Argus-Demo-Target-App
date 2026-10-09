@@ -1,9 +1,9 @@
 """What the shop pays for a job title, in the shape an HR system reports it.
 
 Stands in for BambooHR's `GET /api/v1/pay-grades-and-bands/job-titles` the way
-`/pagerduty/users/{id}` stands in for PagerDuty: same wire shape, same field
-names, same nesting, so the adapter reading it is the same code that would read
-the real thing.
+`/stripe/v1/charges` stands in for Stripe: same wire shape, same field names,
+same nesting, so the adapter reading it is the same code that would read the
+real thing.
 
 Bands rather than salaries, and that is the whole point of the endpoint. A band
 belongs to a *level*, and job titles are assigned to levels - so what a title is
@@ -37,9 +37,8 @@ _AN_ANNUAL_SALARY: Final = "Salary"
 # honest about the shape without inventing an org chart.
 _THE_ENGINEERING_GROUP: Final = "Engineering"
 
-# A title the shop employs and nobody has assigned to a level. It is held by
-# nobody the scenarios page, so an incident still prices - but an incident that
-# did page one would report no cost at all, and say why.
+# A title the shop employs and nobody has assigned to a level. An incident whose
+# responder holds it reports no cost at all, and says why.
 AN_UNPRICED_TITLE: Final = "Principal Engineer"
 
 # The levels themselves, each with the band a title on it earns. Two levels

@@ -28,6 +28,5 @@ RUN uv sync --frozen --no-dev
 COPY deploy/ deploy/
 
 EXPOSE 8000
-EXPOSE 8443
 
 CMD ["uv", "run", "python", "-m", "target_app.serve"]

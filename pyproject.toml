@@ -3,9 +3,6 @@ name = "argus-demo-target-app"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
-    # Minting the throwaway TLS certificate the PagerDuty stand-in needs - see
-    # `target_app.serve`.
-    "cryptography>=43.0",
     "fastapi>=0.115",
     "httpx2>=2.13",
     "psycopg[binary]>=3.2",

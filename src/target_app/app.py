@@ -44,7 +44,6 @@ from target_app.monitoring import (
     the_rule_for,
     the_rule_linked_from,
 )
-from target_app.oncall import a_user, an_incident
 from target_app.payments import a_page_of_charges
 from target_app.people import pay_grades_and_bands
 from target_app.rates import UnknownBase, rates_quoted_against
@@ -1683,10 +1682,6 @@ def raise_alert() -> AlertRaised:
     except AlertNotDelivered as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
 
-    # After it was delivered, because an alert nobody received paged nobody -
-    # and the on-call provider counts every responder's minutes from this.
-    state.somebody_was_paged()
-
     return AlertRaised(incident_id=delivered.get("incident_id"))
 
 
@@ -2016,35 +2011,6 @@ def stripe_charges(
     return StripeList(data=page, has_more=has_more)
 
 
-# PagerDuty's own envelope: a single resource comes back wrapped under its own
-# name, and the SDK unwraps it. Answering the bare object would work against a
-# hand-built request and fail against the client a real account uses.
-@app.get("/pagerduty/incidents/{incident_id}")
-def pagerduty_incident(incident_id: str) -> dict[str, Any]:
-    """Stands in for PagerDuty's `GET /incidents/{id}`.
-
-    Whatever incident id is asked for is answered from the scenario that is
-    seeded, because in this demo there is one incident at a time and Argus's
-    own id for it is the only one it has. A real account would need a mapping
-    between the two, which is a deployment's problem and not a fixture's.
-
-    With no scenario seeded - or one nobody has alerted on - there is no
-    incident to have been paged for, and saying so as a 404 is what the SDK
-    turns into the error the adapter already answers "could not say" to.
-    """
-    active = state.active
-    incident = an_incident(
-        incident_id,
-        _the_buckets(),
-        active.alerted_at if active is not None else None
-    )
-
-    if incident is None:
-        raise HTTPException(status_code=404, detail="no incident is running")
-
-    return {"incident": incident}
-
-
 @app.get("/bamboohr/api/v1/pay-grades-and-bands/job-titles")
 def bamboohr_pay_grades_and_bands() -> dict[str, Any]:
     """Stands in for BambooHR's `GET /pay-grades-and-bands/job-titles`.
@@ -2072,23 +2038,6 @@ def frankfurter_latest(base: str = Query("EUR")) -> dict[str, Any]:
         return rates_quoted_against(base)
     except UnknownBase as unknown:
         raise HTTPException(status_code=404, detail=str(unknown)) from unknown
-
-
-@app.get("/pagerduty/users/{user_id}")
-def pagerduty_user(user_id: str) -> dict[str, Any]:
-    """Stands in for PagerDuty's `GET /users/{id}`.
-
-    The job title lives here rather than on the acknowledgement, which is what
-    makes reading it a second request - and a user nobody holds is a 404, so
-    the adapter's own "then the title is simply unknown" path is exercised by
-    the demo rather than only by a unit test.
-    """
-    user = a_user(user_id)
-
-    if user is None:
-        raise HTTPException(status_code=404, detail="no such user")
-
-    return {"user": user}
 
 
 @app.get("/registry/services/{service}", response_model=RegisteredServiceResponse)
