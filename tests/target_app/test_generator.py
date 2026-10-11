@@ -345,6 +345,56 @@ def test_a_scenario_with_a_decoy_reports_both_flags_in_the_same_minute() -> None
     assert any(f"{some_decoy}=" in line for line in lines)
 
 
+def test_a_scenario_with_a_decoy_reports_which_renderer_served_the_pages() -> None:
+    # Two flags moved, and only one of them decides how a page is rendered. The
+    # count of what each renderer served is the observation that ties the
+    # staged flag to the failing traffic - all on the legacy renderer while the
+    # fallback holds, all on the new one once it is withdrawn.
+    minutes = generate(
+        a_flag_on_since(10),
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="legacy-checkout-fallback",
+        breaks_when_flag_is_on=False,
+        decoy_flag="monthly-spend-feature",
+        decoy_timeline=a_flag_on_since(10),
+    )
+
+    calm = _renderers_reported_in(minute_at(15, minutes).log_lines)
+    degraded = _renderers_reported_in(minute_at(5, minutes).log_lines)
+
+    assert calm[1] == 0 and calm[0] > 0
+    assert degraded[0] == 0 and degraded[1] > 0
+
+
+def test_a_scenario_with_no_decoy_reports_no_renderers() -> None:
+    # Every scenario without a decoy was recorded without this line, and keeps
+    # reading exactly as it was recorded.
+    minutes = generate(
+        a_flag_on_since(10),
+        SOME_NOW,
+        SOME_SPAN_MINUTES,
+        flag="legacy-checkout-fallback",
+        breaks_when_flag_is_on=False,
+    )
+
+    assert not any(
+        "renderer" in line for minute in minutes for line in minute.log_lines
+    )
+
+
+def _renderers_reported_in(lines: tuple[str, ...]) -> tuple[int, int]:
+    """The legacy and new renderers' counts from a minute's renderer line."""
+    reported = [line for line in lines if "account pages served" in line]
+    assert len(reported) == 1, lines
+
+    found = re.search(r"(\d+) by the legacy renderer, (\d+) by the new renderer",
+                      reported[0])
+    assert found is not None, reported[0]
+
+    return int(found.group(1)), int(found.group(2))
+
+
 def test_a_scenario_with_no_decoy_reports_one_flag() -> None:
     minutes = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES, flag="a-flag")
 

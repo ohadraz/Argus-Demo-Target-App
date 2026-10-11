@@ -1912,6 +1912,7 @@ def _generate_minute(
                 minute_id, minute, elapsed_seconds, len(outcomes),
                 decoy_flag, decoy_timeline,
             ),
+            renderers=_renderer_lines_for(minute_id, outcomes, decoy_flag),
             heap=_heap_lines_for(minute_id, minute, heap_bytes, pressure, lifetime),
             cache=_cache_lines_for(minute_id, outcomes, minute, promoted_at),
             pricing=_pricing_lines_for(minute_id, outcomes),
@@ -2519,6 +2520,36 @@ def _decoy_evaluation_line(
     )
 
 
+def _renderer_lines_for(
+    minute_id: str, outcomes: list[_ServedPage], decoy_flag: str | None
+) -> tuple[str, ...]:
+    """Which renderer served this minute's account pages, where two flags moved.
+
+    The staged flag decides the path a page is rendered by, and a shop that
+    routes on a flag counts what each path served. Without that count the only
+    trace the staged flag leaves is its own value, beside an error that names
+    the decoy's feature - so the evidence pointed one way while the scenario
+    claims it points both, and a person telling the reader which flag it was
+    had nothing to be weighed against.
+
+    It says which path the traffic took, never which path is broken: the error
+    lines say where the failure was raised, and joining the two is the reader's.
+
+    Only where there is a decoy. Every other scenario was captured without this
+    line, and what a recording was captured from is not changed under it.
+    """
+    if decoy_flag is None:
+        return ()
+
+    on_the_new = sum(1 for served in outcomes if served.flag_is_on)
+
+    return ((
+        f"{minute_id} INFO io-shop: account pages served - "
+        f"{len(outcomes) - on_the_new} by the legacy renderer, "
+        f"{on_the_new} by the new renderer"
+    ),)
+
+
 @dataclass(frozen=True)
 class _ServedPage:
     """What serving one account page produced: how the flag evaluated for it,
@@ -2979,6 +3010,7 @@ def _log_lines_for(
     evaluated_on: int,
     flag: str | None,
     decoy: str | None = None,
+    renderers: tuple[str, ...] = (),
     heap: tuple[str, ...] = (),
     cache: tuple[str, ...] = (),
     pricing: tuple[str, ...] = (),
@@ -2992,6 +3024,7 @@ def _log_lines_for(
             else ()
         ),
         *((decoy,) if decoy is not None else ()),
+        *renderers,
         *heap,
         *cache,
         *pricing,
