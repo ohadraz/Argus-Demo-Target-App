@@ -67,10 +67,27 @@ def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
     assert average_spend_per_item_this_month(an_active_shopper) == 3000
 
 
+def test_the_monthly_average_is_zero_for_a_shopper_who_did_not_buy_this_month() -> None:
+    # A shopper with years of history and nothing bought since the first of the
+    # month has no item to average over, and the month's total is zero. The
+    # figure is zero; it is not a division by an empty month.
+    account = an_account_with_no_purchases_this_month(1000, 3000, 9000)
+
+    assert average_spend_per_item_this_month(account) == 0
+
+
 def test_the_page_takes_the_stable_summary_when_the_rollout_is_off() -> None:
     account = an_account_with_no_purchases_this_month(1000, 3000)
 
     assert render_spend_summary(account, use_monthly_summary=False) == 2000
+
+
+def test_the_page_shows_zero_when_the_monthly_rollout_reaches_an_idle_shopper() -> None:
+    # The incident: the flag going on sent every shopper who had bought nothing
+    # this month down the monthly path. The page renders rather than failing.
+    account = an_account_with_no_purchases_this_month(1000, 3000)
+
+    assert render_spend_summary(account, use_monthly_summary=True) == 0
 
 
 def test_the_page_lets_a_failure_reach_its_caller() -> None:
