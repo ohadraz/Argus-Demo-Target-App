@@ -27,6 +27,7 @@ from io_shop.summary_cache import (
     CacheEndpoint,
     CacheUnreachable,
     LookUpSummary,
+    SummaryEntry,
     cached_summary,
 )
 from io_shop.visits import record_visit
@@ -59,6 +60,12 @@ class RenderedPage:
     scenario: this is a page that *succeeded* while something underneath it was
     broken, so a reader sees it in the logs without seeing it in the error rate.
 
+    `stale_cache` is the same shape of thing for a cache that answered with an
+    entry covering a history the shopper has since moved past. The page is
+    correct - the figure was worked out again - but the copy in front of it has
+    stopped keeping up, and that is invisible in every other signal the shop
+    has: nothing fails, nothing slows, and the only trace is this line.
+
     `pricing_delay` is the same shape of thing for the same reason: the words of
     a pricing call that took longer than the shop thinks worth passing over. The
     page was correct and the shopper was charged the right amount; what a reader
@@ -74,6 +81,7 @@ class RenderedPage:
     statement: MonthlyStatement | None = None
     basket_total_cents: int | None = None
     pricing_delay: str | None = None
+    stale_cache: str | None = None
 
 
 def serve_account_page(account: Account,
@@ -120,7 +128,7 @@ def serve_account_page(account: Account,
     here that knows the calendar is whoever handled the request.
     """
     try:
-        figure_cents, from_cache, cache_failure = _the_figure_for(
+        figure_cents, from_cache, cache_failure, stale_cache = _the_figure_for(
             account, use_monthly_summary, look_up_summary, cache_endpoint,
             use_typical_spend
         )
@@ -144,7 +152,8 @@ def serve_account_page(account: Account,
                         cache_failure=cache_failure,
                         statement=statement,
                         basket_total_cents=basket.total_cents,
-                        pricing_delay=basket.slow_call)
+                        pricing_delay=basket.slow_call,
+                        stale_cache=stale_cache)
 
 
 def _the_statement_for(account: Account,
@@ -173,15 +182,17 @@ def _the_figure_for(
     look_up_summary: LookUpSummary | None,
     cache_endpoint: CacheEndpoint | None,
     use_typical_spend: bool
-) -> tuple[int, bool, str | None]:
-    """The figure to show, whether it came from the cache, and what the cache
-    said if it could not be reached.
+) -> tuple[int, bool, str | None, str | None]:
+    """The figure to show, whether it came from the cache, what the cache said
+    if it could not be reached, and what it held if what it held was out of
+    date.
 
     The cache is asked first and is allowed to fail. Whatever it does - answers
-    with a figure, answers with nothing, or cannot be reached at all - this
-    returns a figure, because the shop can always work one out. That is the
-    fallback the whole scenario rests on: the page is correct either way, and
-    the only thing the cache decides is how long getting here took.
+    with a figure, answers with a stale one, answers with nothing, or cannot be
+    reached at all - this returns a figure, because the shop can always work one
+    out. That is the fallback the whole scenario rests on: the page is correct
+    either way, and the only thing the cache decides is how long getting here
+    took.
 
     A cache failure is returned rather than raised onward, because it is not
     this request's failure. The request succeeded.
@@ -191,7 +202,7 @@ def _the_figure_for(
             account,
             use_monthly_summary=use_monthly_summary,
             use_typical_spend=use_typical_spend
-        ), False, None
+        ), False, None, None
 
     cache_failure: str | None = None
 
@@ -200,14 +211,56 @@ def _the_figure_for(
     except CacheUnreachable as unreachable:
         found, cache_failure = None, str(unreachable)
 
-    if found is not None:
-        return found.amount_cents, True, cache_failure
+    if found is not None and _covers_the_history_of(found, account):
+        return found.amount_cents, True, cache_failure, None
 
     return render_spend_summary(
         account,
         use_monthly_summary=use_monthly_summary,
         use_typical_spend=use_typical_spend
-    ), False, cache_failure
+    ), False, cache_failure, _what_the_stale_entry_held(found, account)
+
+
+def _covers_the_history_of(entry: SummaryEntry, account: Account) -> bool:
+    """Whether this entry was worked out over the purchases the shopper now has.
+
+    The one check that tells a usable copy from a frozen one. Nothing writes to
+    this cache from inside the shop and nothing invalidates it when a purchase
+    is recorded, so an entry that stops being fed simply stays where it is - and
+    a page that trusted whatever came back would serve that figure for as long
+    as the entry lived, correct-looking and behind the ledger, with no failure
+    and no slowdown to show for it.
+
+    An entry carries the count for exactly this reason: it says what the figure
+    covers. Where that is not the history in front of us, the entry is an older
+    answer to a question whose answer has moved, and the page works the figure
+    out for itself the way it does on a first visit. The comparison is the same
+    one `io_shop.cache_reconciliation` makes after the fact - made here, per
+    request, before a shopper is shown anything.
+    """
+    return entry.items_counted == len(account.purchases)
+
+
+def _what_the_stale_entry_held(entry: SummaryEntry | None,
+                               account: Account) -> str | None:
+    """The words for a cached figure that had stopped keeping up, or nothing
+    where there was no such entry.
+
+    Said rather than passed over, because a recomputation on its own is
+    indistinguishable from an ordinary miss, and a cache quietly falling behind
+    is the one fault here that no other signal carries: the page is correct, the
+    error rate is flat, the latency is ordinary. The count the entry covers and
+    the count the ledger holds are what a reader needs to tell a cache that has
+    stopped being written from one that was never written.
+    """
+    if entry is None:
+        return None
+
+    return (
+        f"cached summary for {account.shopper_id} covers "
+        f"{entry.items_counted} purchases, the ledger has "
+        f"{len(account.purchases)}"
+    )
 
 
 def _where_it_was_raised(error: BaseException) -> str:
