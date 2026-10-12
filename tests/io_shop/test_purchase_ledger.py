@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from io_shop.accounts import Account, Purchase
-from io_shop.purchase_ledger import record_purchase
+from io_shop.purchase_ledger import record_a_purchase, record_purchase
+from io_shop.spend_reconciliation import reconcile_monthly_totals
 
 """Writing a purchase down, and moving the totals that describe it.
 
@@ -105,3 +108,30 @@ def test_a_shopper_with_no_history_can_be_written_to() -> None:
     recorded = record_purchase(a_new_shopper, a_purchase_of(500))
 
     assert (recorded.total_cents, recorded.total_this_month_cents) == (500, 500)
+
+
+@pytest.mark.parametrize("derive_the_month", [False, True])
+def test_either_rollout_path_moves_the_months_total(derive_the_month: bool) -> None:
+    # The readers take the month's figure off the account, so a write path that
+    # stopped moving it left every shopper written through it out of step.
+    account = an_account_with(1000, spent_this_month=4000)
+
+    recorded = record_a_purchase(account, a_purchase_of(500), derive_the_month)
+
+    assert (recorded.total_cents, recorded.total_this_month_cents) == (1500, 4500)
+
+
+@pytest.mark.parametrize("derive_the_month", [False, True])
+def test_either_rollout_path_leaves_the_account_reconciling(
+        derive_the_month: bool) -> None:
+    account = Account(
+        shopper_id="shopper-who-just-registered",
+        purchases=(),
+        total_cents=0,
+        total_this_month_cents=0,
+    )
+
+    for price in (500, 1200, 300):
+        account = record_a_purchase(account, a_purchase_of(price), derive_the_month)
+
+    assert not reconcile_monthly_totals([account]).anything_disagrees
