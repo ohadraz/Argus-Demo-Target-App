@@ -20,6 +20,10 @@ Three things worth pinning: a failure is reported rather than raised - a handler
 that let it escape would take the worker down - the report keeps the error's own
 words, which are what a reader diagnoses from, and a payment provider that will
 not answer fails the page in words that name the provider rather than the shop.
+
+And a fourth, which is quieter than all of them: a cached figure is used only
+while it still covers the purchases behind it. Nothing in the shop expires an
+entry, so a copy trusted on sight is trusted forever.
 """
 
 
@@ -176,8 +180,16 @@ def test_a_provider_failure_names_the_provider_and_the_status() -> None:
     assert "503" in page.failure
 
 
-def a_cache_holding(summary_cents: int) -> LookUpSummary:
-    written = str(SummaryEntry(amount_cents=summary_cents, items_counted=8))
+def a_cache_holding(summary_cents: int, items_counted: int = 2) -> LookUpSummary:
+    """A cache holding one entry, over however many purchases it says.
+
+    The count is stated rather than fixed because it is half of what an entry
+    means: the same figure over the purchases a shopper has is a current entry,
+    and over fewer is a copy that stopped being written to.
+    """
+    written = str(
+        SummaryEntry(amount_cents=summary_cents, items_counted=items_counted)
+    )
 
     return lambda dont_care_shopper: CacheAnswer(reached=True, entry=written)
 
@@ -198,11 +210,54 @@ def test_a_page_whose_figure_was_cached_says_so() -> None:
                               use_monthly_summary=False,
                               ask_the_provider=a_provider_holding_a_card(),
                               ask_the_pricing_service=a_prompt_pricing_service(),
-                              look_up_summary=a_cache_holding(999),
+                              look_up_summary=a_cache_holding(999, items_counted=2),
                               cache_endpoint=SOME_CACHE_ENDPOINT)
 
     assert page.figure_cents == 999
     assert page.served_from_cache
+    assert not page.cache_was_stale
+
+
+def test_a_cached_figure_that_misses_purchases_is_worked_out_again() -> None:
+    # The incident. Nothing in this shop expires an entry, so once whatever
+    # writes to the cache stops keeping up with the ledger, an entry trusted on
+    # sight is a frozen figure served for as long as it sits there - no failure,
+    # no delay, nothing in any metric. An entry counting fewer purchases than
+    # the shopper has is a copy that fell behind, and the purchases behind it
+    # never moved, so the page works the figure out instead.
+    account = an_account_idle_this_month(1000, 3000, 5000)
+
+    page = serve_account_page(account,
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_prompt_pricing_service(),
+                              look_up_summary=a_cache_holding(2000, items_counted=2),
+                              cache_endpoint=SOME_CACHE_ENDPOINT)
+    without_a_cache_at_all = serve_account_page(
+        account,
+        use_monthly_summary=False,
+        ask_the_provider=a_provider_holding_a_card(),
+        ask_the_pricing_service=a_prompt_pricing_service()
+    )
+
+    assert page.failure is None
+    assert page.figure_cents == without_a_cache_at_all.figure_cents
+    assert not page.served_from_cache
+
+
+def test_a_stale_entry_is_reported_on_the_page_that_rendered_without_it() -> None:
+    # Discarded, not silenced. The page succeeded and the copy underneath it had
+    # fallen behind: that shows in no error rate and no latency, so it is said
+    # here or it is said nowhere.
+    page = serve_account_page(an_account_idle_this_month(1000, 3000, 5000),
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_prompt_pricing_service(),
+                              look_up_summary=a_cache_holding(2000, items_counted=2),
+                              cache_endpoint=SOME_CACHE_ENDPOINT)
+
+    assert page.failure is None
+    assert page.cache_was_stale
 
 
 def test_a_miss_is_computed_and_the_page_is_still_correct() -> None:
@@ -223,6 +278,7 @@ def test_a_miss_is_computed_and_the_page_is_still_correct() -> None:
 
     assert computed.figure_cents == without_a_cache_at_all.figure_cents
     assert not computed.served_from_cache
+    assert not computed.cache_was_stale
 
 
 def test_a_cache_nobody_can_reach_does_not_fail_the_page() -> None:
