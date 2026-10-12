@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
 from io_shop.monthly_statement import (
     STATEMENT_COLUMNS,
@@ -18,14 +19,16 @@ from io_shop.monthly_statement import (
     statement_rows,
     statement_sections,
 )
+from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
+from io_shop.pricing_service import AskThePricingService, PricingAnswer
 
 """Io's monthly statement panel - the month laid out rather than summed.
 
 A safety net rather than a specification: the panel was written first and these
 cover what would be expensive to find out from a shopper. The one that matters
-most is the empty month, because that is the fault the
-`monthly-statement-panel` scenario stages, and a change that quietly made it
-stop raising would leave that scenario staging nothing at all.
+most is the empty month, because that is the input the `monthly-spend-feature`
+rollout met the moment it reached a shopper who had bought nothing - and the
+panel used to take the whole account page down with it.
 """
 
 MARCH = period_for(3, 2026)
@@ -54,6 +57,16 @@ def a_shopper_who_bought_nothing_this_month() -> Account:
     )
 
 
+def a_provider_holding_a_card() -> AskTheProvider:
+    return lambda dont_care_shopper: ProviderAnswer(
+        status=200, card=StoredCard(brand="visa", last_four="4242")
+    )
+
+
+def a_prompt_pricing_service() -> AskThePricingService:
+    return lambda dont_care_shopper: PricingAnswer(total_cents=8400, took_ms=12)
+
+
 def test_the_statement_reports_the_month_it_was_asked_for() -> None:
     statement = render_monthly_statement(a_shopper_who_bought_this_month(), MARCH)
 
@@ -71,12 +84,42 @@ def test_the_statement_takes_its_shape_from_this_month_alone() -> None:
     assert statement.smallest_cents == 1200
 
 
-def test_a_month_with_nothing_in_it_fails_rather_than_reporting_zero() -> None:
-    # The fault the `monthly-statement-panel` scenario stages. A statement
-    # reporting a made-up zero would be a panel nobody could trust on the
-    # months it can describe.
-    with pytest.raises(ValueError):
-        render_monthly_statement(a_shopper_who_bought_nothing_this_month(), MARCH)
+def test_a_month_with_nothing_in_it_is_a_document_rather_than_a_failure() -> None:
+    # The fault the `monthly-spend-feature` rollout met: the shape figures were
+    # taken with a bare max/min over an empty month and a division by no
+    # purchases at all. A shopper who bought nothing is not a failure - the
+    # headline is genuinely nothing, and the quiet-month row is what prints.
+    statement = render_monthly_statement(
+        a_shopper_who_bought_nothing_this_month(), MARCH
+    )
+
+    assert statement.headline_cents == 0
+    assert statement.purchase_count == 0
+    assert statement.biggest_cents == 0
+    assert statement.smallest_cents == 0
+    assert statement.mean_cents == 0
+    assert reconciles(statement)
+    assert problems_with(statement) == []
+    assert "A quiet month" in as_plain_text(statement)
+
+
+def test_an_empty_month_does_not_take_the_account_page_down_with_it() -> None:
+    # With the rollout on, the panel is rendered inside the page's try block:
+    # a statement that raised cost the shopper the figure and the card as well
+    # as the panel, which is the shape of the incident.
+    page = serve_account_page(
+        a_shopper_who_bought_nothing_this_month(),
+        use_monthly_summary=False,
+        ask_the_provider=a_provider_holding_a_card(),
+        ask_the_pricing_service=a_prompt_pricing_service(),
+        use_monthly_statement=True,
+        statement_period=MARCH,
+    )
+
+    assert page.failure is None
+    assert page.card_last_four == "4242"
+    assert page.statement is not None
+    assert page.statement.purchase_count == 0
 
 
 def test_the_breakdowns_add_up_to_the_headline() -> None:
