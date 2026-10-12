@@ -176,8 +176,17 @@ def test_a_provider_failure_names_the_provider_and_the_status() -> None:
     assert "503" in page.failure
 
 
-def a_cache_holding(summary_cents: int) -> LookUpSummary:
-    written = str(SummaryEntry(amount_cents=summary_cents, items_counted=8))
+def a_cache_holding(summary_cents: int, items_counted: int = 2) -> LookUpSummary:
+    """A cache holding an entry, counted over however many purchases it says.
+
+    The count is the point and is therefore named rather than fixed. An entry
+    says what it covers, and the page compares that against the history in
+    front of it - so a helper with a hard-coded count would be writing a stale
+    entry into every case that meant to test a hit.
+    """
+    written = str(
+        SummaryEntry(amount_cents=summary_cents, items_counted=items_counted)
+    )
 
     return lambda dont_care_shopper: CacheAnswer(reached=True, entry=written)
 
@@ -203,6 +212,47 @@ def test_a_page_whose_figure_was_cached_says_so() -> None:
 
     assert page.figure_cents == 999
     assert page.served_from_cache
+    assert page.stale_cache is None
+
+
+def test_a_cached_figure_that_does_not_cover_the_history_is_not_served() -> None:
+    # The incident. Nothing in the shop writes this cache or clears it when a
+    # purchase is recorded, so an entry that stops being fed stays where it is
+    # and keeps answering. An entry carries the number of purchases it was
+    # worked out over precisely so the page can tell, and a page that served it
+    # anyway would show a figure behind the ledger with no failure, no slowdown
+    # and nothing in the logs to say so.
+    account = an_account_idle_this_month(1000, 3000)
+
+    page = serve_account_page(account,
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_prompt_pricing_service(),
+                              look_up_summary=a_cache_holding(999,
+                                                              items_counted=8),
+                              cache_endpoint=SOME_CACHE_ENDPOINT)
+
+    assert page.failure is None
+    assert page.figure_cents == 2000
+    assert not page.served_from_cache
+
+
+def test_a_stale_cached_figure_is_reported_beside_the_page() -> None:
+    # Recomputing silently would end this incident and hide the next one: a
+    # recomputation on its own looks exactly like an ordinary miss. The two
+    # counts are what separate a cache that stopped being written from one that
+    # was never written.
+    page = serve_account_page(an_account_idle_this_month(1000, 3000),
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_prompt_pricing_service(),
+                              look_up_summary=a_cache_holding(999,
+                                                              items_counted=8),
+                              cache_endpoint=SOME_CACHE_ENDPOINT)
+
+    assert page.failure is None
+    assert page.stale_cache is not None
+    assert "8" in page.stale_cache
 
 
 def test_a_miss_is_computed_and_the_page_is_still_correct() -> None:
@@ -223,6 +273,7 @@ def test_a_miss_is_computed_and_the_page_is_still_correct() -> None:
 
     assert computed.figure_cents == without_a_cache_at_all.figure_cents
     assert not computed.served_from_cache
+    assert computed.stale_cache is None
 
 
 def test_a_cache_nobody_can_reach_does_not_fail_the_page() -> None:
