@@ -511,6 +511,26 @@ def test_the_heap_climbs_at_about_the_rate_it_says_it_does() -> None:
     assert abs(over_ten_minutes - 10 * LEAK_CLIMB_BYTES_PER_MINUTE) < 40 * 1024**2
 
 
+def test_the_heap_is_read_from_the_minute_the_leak_began_in() -> None:
+    # Two stagings of one scenario, seconds apart within the same minute, have
+    # to read the same heap - or a replay of one against the other finds every
+    # figure a few MiB off what was recorded.
+    began_in = (SOME_NOW - timedelta(minutes=30)).replace(second=0)
+
+    early_in_it = generate(
+        None, SOME_NOW, A_LEAKING_SPAN_MINUTES, flag="dont-care-flag",
+        leak_started_at=began_in + timedelta(seconds=5)
+    )
+    late_in_it = generate(
+        None, SOME_NOW, A_LEAKING_SPAN_MINUTES, flag="dont-care-flag",
+        leak_started_at=began_in + timedelta(seconds=55)
+    )
+
+    assert [minute.memory_used_bytes for minute in early_in_it] == [
+        minute.memory_used_bytes for minute in late_in_it
+    ]
+
+
 def test_the_heap_never_exceeds_the_limit_it_is_given() -> None:
     # A heap cannot be larger than it is allowed to be. What a shop at its
     # limit does is fail allocations, and that is reported as its own signal.

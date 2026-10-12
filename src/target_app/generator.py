@@ -2212,11 +2212,18 @@ def _the_heap_at(minute: datetime,
     Capped at the limit. A heap cannot exceed the limit it is allowed; what a
     shop at its limit does is fail allocations, which is a different signal and
     is reported as one.
+
+    Counted from the minute the climb began in, never the second, as every
+    other change here is read at the minute it falls in. Counted from the
+    second, each minute's figure carried whichever second the scenario happened
+    to be staged in, and two stagings of one scenario never read the same heap.
     """
     if leak_started_at is None:
         return BASELINE_MEMORY_BYTES
 
-    climbing_since = max(leak_started_at, serving_since)
+    climbing_since = max(leak_started_at, serving_since).replace(
+        second=0, microsecond=0
+    )
     minutes_climbing = max(
         0.0, (minute - climbing_since).total_seconds() / _SECONDS_PER_MINUTE
     )
