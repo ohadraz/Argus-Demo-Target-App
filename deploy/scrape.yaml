@@ -10,9 +10,10 @@
 # anything here being touched.
 #
 # The name here has to be the one `metrics.portName` in values-production.yaml
-# gives the port. Nothing checks that the two agree: a name that matches no port
-# is not an error to the operator, it is a target list with nothing in it, and
-# the shop goes on serving metrics nobody collects.
+# gives the port. A name that matches no port is not an error to the operator,
+# it is a target list with nothing in it, and the shop goes on serving metrics
+# nobody collects - so tests/io_shop/test_scrape_config.py reads both files and
+# fails if the two names drift apart.
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -24,6 +25,6 @@ spec:
     matchLabels:
       app: io-shop
   endpoints:
-    - port: metrics
+    - port: http-metrics
       path: /metrics
       interval: 15s
