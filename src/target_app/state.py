@@ -640,7 +640,7 @@ class ScenarioState:
 
             with a_client_for(the_working_cache_endpoint()) as cache:
                 discard_every_entry(cache)
-                write_entries(cache, the_figures_the_promoted_standby_holds(now, now))
+                write_entries(cache, the_figures_the_promoted_standby_holds(now))
 
             self._active = ActiveScenario(
                 scenario=scenario,
@@ -1509,13 +1509,7 @@ class ScenarioState:
         deciding whether there is anything to page about - see
         `target_app.monitoring`.
         """
-        active = self._active
-
-        return what_the_check_found(
-            self._the_drifting_write_path(),
-            utc_now(),
-            None if active is None else active.seeded_at
-        )
+        return what_the_check_found(self._the_drifting_write_path(), utc_now())
 
     def the_cache_check_found(self) -> CacheReconciliation | None:
         """What the same job reports about the cache in front of those totals.
@@ -1547,8 +1541,8 @@ class ScenarioState:
         now = utc_now()
 
         return reconcile_cached_summaries(
-            the_accounts_the_check_examines(None, now, active.seeded_at),
-            the_figures_the_promoted_standby_holds(now, active.seeded_at)
+            the_accounts_the_check_examines(None, now),
+            the_figures_the_promoted_standby_holds(now)
         )
 
     @property

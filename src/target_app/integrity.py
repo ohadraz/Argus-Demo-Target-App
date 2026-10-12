@@ -90,9 +90,6 @@ SOMEBODY_BUYS_EVERY = _A_SHOPPER_BUYS_EVERY / _ACCOUNTS_ACTIVE_THIS_MONTH
 # and nothing anywhere reads this instant: what is read is the times of the
 # purchases on the grid, and those have to hold still between two runs of the check
 # or the onset is a figure nobody can check.
-#
-# Moved by less than one order to wherever a scenario was staged, so that somebody
-# buys in the very minute it was - see `_the_grid_for`.
 _THE_GRID_BEGINS = datetime(2026, 1, 1, tzinfo=UTC)
 
 # What one purchase costs, at either end. The shop's own spread, matching the one
@@ -126,8 +123,7 @@ _DEAREST_PURCHASE_CENTS = 9000
 THE_STANDBY_FELL_BEHIND = timedelta(hours=3)
 
 
-def the_figures_the_promoted_standby_holds(now: datetime,
-                                          staged_at: datetime) -> dict[str, SummaryEntry]:
+def the_figures_the_promoted_standby_holds(now: datetime) -> dict[str, SummaryEntry]:
     """What the cache serves after the failover, per shopper.
 
     A standby that stopped receiving updates holds what it had at that moment, so
@@ -164,7 +160,7 @@ def the_figures_the_promoted_standby_holds(now: datetime,
 
     return {
         account.shopper_id: _the_total_as_it_stood_at(account, broke_at)
-        for account in the_accounts_the_check_examines(None, now, staged_at)
+        for account in the_accounts_the_check_examines(None, now)
     }
 
 
@@ -181,8 +177,7 @@ def _the_total_as_it_stood_at(account: Account, moment: datetime) -> SummaryEntr
 
 
 def what_the_check_found(drifting_write_path: FlagTimeline | None,
-                         now: datetime,
-                         staged_at: datetime | None) -> Reconciliation:
+                         now: datetime) -> Reconciliation:
     """What one run of the shop's data-integrity job reports, as of now.
 
     `drifting_write_path` is the stretch over which the rollout had the cheaper
@@ -191,18 +186,14 @@ def what_the_check_found(drifting_write_path: FlagTimeline | None,
     through the path the shop has always used and the check finds nothing, which
     is the answer a quiet shop has to be able to give: a check that reported a
     disagreement on a well shop would make every finding unreadable.
-
-    `staged_at` is when the scenario was staged, `None` where nothing is - see
-    `_the_grid_for`.
     """
     return reconcile_monthly_totals(
-        the_accounts_the_check_examines(drifting_write_path, now, staged_at)
+        the_accounts_the_check_examines(drifting_write_path, now)
     )
 
 
 def the_accounts_the_check_examines(drifting_write_path: FlagTimeline | None,
-                                    now: datetime,
-                                    staged_at: datetime | None) -> list[Account]:
+                                    now: datetime) -> list[Account]:
     """Every account that has bought something this month, as the shop's write
     path has left it.
 
@@ -213,41 +204,15 @@ def the_accounts_the_check_examines(drifting_write_path: FlagTimeline | None,
     keeps the total, so the drift stops without a single stored figure being
     corrected.
     """
-    grid_begins = _the_grid_for(staged_at)
-
     return [
-        _the_account_of(index, drifting_write_path, now, grid_begins)
+        _the_account_of(index, drifting_write_path, now)
         for index in range(_ACCOUNTS_ACTIVE_THIS_MONTH)
     ]
 
 
-def _the_grid_for(staged_at: datetime | None) -> datetime:
-    """Where the buying grid begins for a scenario staged at `staged_at`.
-
-    The fixed instant, moved forward by less than one order so that somebody buys
-    in the very minute the scenario was staged. Everything else staged hangs off
-    that minute, and a replay of an incident moves every recorded time by the
-    whole minutes between two stagings. Left where it was, a grid with an order
-    every two minutes landed each replayed purchase a minute off this run's
-    whenever that shift was odd. Moved, a purchase sits a whole number of orders
-    from the staging minute in every run, and so does its replayed self.
-
-    Only the phase moves. Which shopper buys in which slot is still counted from
-    the fixed instant, so a staging a minute later is the same shop a minute on
-    rather than a different shop.
-    """
-    if staged_at is None:
-        return _THE_GRID_BEGINS
-
-    staged_in = staged_at.replace(second=0, microsecond=0)
-
-    return _THE_GRID_BEGINS + (staged_in - _THE_GRID_BEGINS) % SOMEBODY_BUYS_EVERY
-
-
 def _the_account_of(index: int,
                     drifting_write_path: FlagTimeline | None,
-                    now: datetime,
-                    grid_begins: datetime) -> Account:
+                    now: datetime) -> Account:
     """One shopper, and their month, recorded a purchase at a time.
 
     Seeded from the shopper rather than from the clock, so this account reads the
@@ -262,7 +227,7 @@ def _the_account_of(index: int,
         total_this_month_cents=0
     )
 
-    for at in _when_this_shopper_bought(index, now, grid_begins):
+    for at in _when_this_shopper_bought(index, now):
         account = record_a_purchase(
             account,
             Purchase(
@@ -280,9 +245,7 @@ def _the_account_of(index: int,
     return account
 
 
-def _when_this_shopper_bought(index: int,
-                              now: datetime,
-                              grid_begins: datetime) -> list[datetime]:
+def _when_this_shopper_bought(index: int, now: datetime) -> list[datetime]:
     """The instants this shopper recorded a purchase at, oldest first.
 
     Staggered across the buying interval so that the shop takes orders steadily
@@ -296,15 +259,15 @@ def _when_this_shopper_bought(index: int,
     that instant holding still. Hung off `now`, the grid slid with the clock: every
     recorded time moved a few milliseconds between one read and the next, so the
     finding was never twice the same and the onset was a figure nobody could check.
-    Anchored at `grid_begins`, only the *newest* purchase changes as time passes,
-    which is what actually happens in a shop.
+    Anchored absolutely, only the *newest* purchase changes as time passes, which
+    is what actually happens in a shop.
     """
     stagger = _A_SHOPPER_BUYS_EVERY * (index / _ACCOUNTS_ACTIVE_THIS_MONTH)
     since = now - _PURCHASES_REACH_BACK
     # Which slot of this shopper's the window opens on, counted off the grid rather
     # than walked up to, so a long reach-back costs nothing.
-    slots_before = (since - grid_begins - stagger) // _A_SHOPPER_BUYS_EVERY
-    at = grid_begins + stagger + _A_SHOPPER_BUYS_EVERY * slots_before
+    slots_before = (since - _THE_GRID_BEGINS - stagger) // _A_SHOPPER_BUYS_EVERY
+    at = _THE_GRID_BEGINS + stagger + _A_SHOPPER_BUYS_EVERY * slots_before
     bought = []
 
     while at <= now:
