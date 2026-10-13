@@ -67,6 +67,24 @@ def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
     assert average_spend_per_item_this_month(an_active_shopper) == 3000
 
 
+def test_the_monthly_average_is_zero_for_a_shopper_who_has_not_bought_this_month(
+) -> None:
+    # The shape that broke the page when the monthly rollout went on: a shopper
+    # with history but an empty month. Nothing bought is zero per item, not a
+    # division by an empty month.
+    an_idle_shopper = an_account_with_no_purchases_this_month(1000, 3000)
+
+    assert average_spend_per_item_this_month(an_idle_shopper) == 0
+
+
+def test_the_page_renders_for_an_idle_shopper_with_the_monthly_rollout_on() -> None:
+    # Through the rollout, because that is the path the flag turns on and the
+    # one that produced the error rate.
+    an_idle_shopper = an_account_with_no_purchases_this_month(1000, 3000)
+
+    assert render_spend_summary(an_idle_shopper, use_monthly_summary=True) == 0
+
+
 def test_the_page_takes_the_stable_summary_when_the_rollout_is_off() -> None:
     account = an_account_with_no_purchases_this_month(1000, 3000)
 
