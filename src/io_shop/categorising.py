@@ -115,5 +115,11 @@ MODELS: Final[Mapping[str, CategoriserModel]] = {
 
 
 def categorise(title: str, model: CategoriserModel) -> Categorisation:
-    """Where `model` files a purchase with this title."""
-    return model.predict(title.split())
+    """Where `model` files a purchase with this title.
+
+    The title is lowercased before it is split, matching the preprocessing the
+    models were trained with: a model whose tokeniser lives in its training
+    pipeline (v2) looks words up exactly as given, and would otherwise miss
+    every capitalised word in a real catalogue title.
+    """
+    return model.predict(title.lower().split())
