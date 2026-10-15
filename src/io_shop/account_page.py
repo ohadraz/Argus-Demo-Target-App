@@ -183,6 +183,12 @@ def _the_figure_for(
     fallback the whole scenario rests on: the page is correct either way, and
     the only thing the cache decides is how long getting here took.
 
+    An entry worked out over a different number of purchases than the account
+    now holds is a copy that stopped keeping up, and it is passed over exactly
+    as a miss is. Counting the purchases costs nothing - it is not the walk the
+    cache saves - and it means a cache whose maintenance has broken makes the
+    page slower rather than wrong.
+
     A cache failure is returned rather than raised onward, because it is not
     this request's failure. The request succeeded.
     """
@@ -200,7 +206,7 @@ def _the_figure_for(
     except CacheUnreachable as unreachable:
         found, cache_failure = None, str(unreachable)
 
-    if found is not None:
+    if found is not None and found.items_counted == len(account.purchases):
         return found.amount_cents, True, cache_failure
 
     return render_spend_summary(
