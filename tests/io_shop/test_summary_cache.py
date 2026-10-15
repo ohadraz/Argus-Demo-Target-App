@@ -8,13 +8,14 @@ from io_shop.summary_cache import (
     CacheUnreachable,
     LookUpSummary,
     SummaryEntry,
+    cache_key_for,
     cached_summary,
     summary_entry_in,
 )
 
 """The cache the account page reads before it computes.
 
-Three facts are worth pinning. A cache that answers with nothing and a cache
+Four facts are worth pinning. A cache that answers with nothing and a cache
 that cannot be reached are different things, even though both end in the page
 working the figure out for itself - and the second says which endpoint it
 failed at, because that endpoint set against the configured one is the whole
@@ -24,6 +25,11 @@ The third is the shape. An entry holds a figure and the number of purchases it
 covers, written down together, and this revision reads that shape and no other
 - text carrying anything else is text it passes over, which the page answers
 the way it answers a shopper the cache has never seen.
+
+The fourth is where that shape is kept. A cache is shared by every replica at
+once, including replicas of the revision before this one during a rolling
+update, so entries of this shape live under keys that name it - and a revision
+speaking another shape never finds one.
 """
 
 SOME_SHOPPER = "shopper-1"
@@ -75,6 +81,37 @@ def test_an_entry_is_written_down_as_the_figure_and_its_count() -> None:
     # entry in writes it this way, and whatever quotes an unreadable one quotes
     # this text.
     assert str(an_entry(amount_cents=4500, items_counted=3)) == "4500/3"
+
+
+def test_an_entry_is_looked_for_under_a_key_that_names_its_shape() -> None:
+    # The compatibility break this exists to prevent. A cache is shared by every
+    # replica, and a rolling update - or one paused half way - has the revision
+    # before this one live against it, reading an entry as a bare figure and
+    # failing on anything else. So an entry of this shape is kept somewhere that
+    # revision does not look: it is not the bare shopper id, and the shape's
+    # version is in it. Neither revision meets the other's writing, and a shape
+    # a revision cannot read costs it a miss rather than a failed page.
+    asked_for: list[str] = []
+
+    def a_cache_recording_what_it_was_asked_for(key: str) -> CacheAnswer:
+        asked_for.append(key)
+        return CacheAnswer(reached=True)
+
+    cached_summary(
+        SOME_SHOPPER, a_cache_recording_what_it_was_asked_for, SOME_ENDPOINT
+    )
+
+    assert asked_for == [cache_key_for(SOME_SHOPPER)]
+    assert asked_for[0] != SOME_SHOPPER
+    assert SOME_SHOPPER in asked_for[0]
+
+
+def test_a_key_keeps_one_shape_apart_from_another() -> None:
+    # Two shoppers still have two keys - the version separates shapes, not
+    # shoppers - and the key is stable, because a writer and a reader compose it
+    # with the same function.
+    assert cache_key_for("shopper-1") != cache_key_for("shopper-2")
+    assert cache_key_for(SOME_SHOPPER) == cache_key_for(SOME_SHOPPER)
 
 
 def test_text_that_is_not_an_entry_holds_no_entry() -> None:
