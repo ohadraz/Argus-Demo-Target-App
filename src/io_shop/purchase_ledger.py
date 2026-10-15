@@ -53,20 +53,46 @@ def record_purchase(account: Account, purchase: Purchase) -> Account:
 
 def record_purchase_deriving_the_month(account: Account,
                                        purchase: Purchase) -> Account:
-    """The same account, without the month's total being moved.
+    """The same account, with the month's total derived rather than added to.
 
-    One total to carry instead of two, which is the saving: a month is not
-    something the shop has to keep a figure for. Every purchase says which month
-    it falls in, so what a shopper has spent this month adds up from the history
-    whenever anybody wants it - exactly as the lifetime average is derived from the
-    purchases rather than read off the account (see
-    `io_shop.spend_summary.average_spend_per_item`). Keeping a second copy of a
-    figure the purchases already hold is the work this path exists to drop.
+    The saving this path exists for is that the month is never accumulated: a
+    figure that is re-derived from the purchases cannot fall behind them by a
+    write that was missed, which is the one thing that can go wrong with a
+    running total.
+
+    What it does *not* do is stop storing the figure. Every reader of an account
+    in this shop reads `total_this_month_cents` - the monthly average on the
+    account page, the statement's headline, and the shop's own reconciliation
+    check - so a write path that left the stored figure where it found it would
+    leave every one of them reading a month that stopped at the moment this path
+    was switched on. The derived figure is therefore written down here, which is
+    the only place that knows the history has just changed.
+
+    An account whose stored month had already drifted is put right by the next
+    purchase recorded through this path, because the figure comes from the
+    purchases rather than from itself.
     """
+    purchases = (*account.purchases, purchase)
+
     return replace(
         account,
-        purchases=(*account.purchases, purchase),
-        total_cents=account.total_cents + purchase.price_cents
+        purchases=purchases,
+        total_cents=account.total_cents + purchase.price_cents,
+        total_this_month_cents=spent_this_month_in(purchases)
+    )
+
+
+def spent_this_month_in(purchases: tuple[Purchase, ...]) -> int:
+    """What this month's purchases come to, added up from the history.
+
+    The same arithmetic `io_shop.spend_reconciliation` checks a stored total
+    against, and it is here so that the writer and the check cannot disagree
+    about what the month is.
+    """
+    return sum(
+        purchase.price_cents
+        for purchase in purchases
+        if purchase.in_current_month
     )
 
 
