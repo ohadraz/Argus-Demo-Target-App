@@ -24,11 +24,14 @@ resources:
 # believes a fall in load is real. Kubernetes defaults it to 300 - five minutes
 # of the highest recommendation it saw - because a controller acting on the
 # reading in front of it acts on a reading its own last action produced.
+# Setting it to 0 makes the shop flap between 3 and 6 replicas under load:
+# scaling up lowers per-replica CPU below target, which immediately scales it
+# back down into saturation. Keep it at 300 or above.
 autoscaling:
   minReplicas: 3
   maxReplicas: 6
   targetCpuPercent: 70
-  scaleDownStabilizationSeconds: 0
+  scaleDownStabilizationSeconds: 300
 
 # How the platform finds the shop's metrics.
 #
