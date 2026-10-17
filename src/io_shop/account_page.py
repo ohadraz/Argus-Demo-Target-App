@@ -175,13 +175,21 @@ def _the_figure_for(
     use_typical_spend: bool
 ) -> tuple[int, bool, str | None]:
     """The figure to show, whether it came from the cache, and what the cache
-    said if it could not be reached.
+    said if it could not be reached or held a stale entry.
 
     The cache is asked first and is allowed to fail. Whatever it does - answers
     with a figure, answers with nothing, or cannot be reached at all - this
     returns a figure, because the shop can always work one out. That is the
     fallback the whole scenario rests on: the page is correct either way, and
     the only thing the cache decides is how long getting here took.
+
+    A cached entry is only served while it still covers the purchases the
+    account holds. An entry carries the number of purchases it was worked out
+    over, and counting the account's purchases costs nothing like walking them,
+    so an entry that has fallen behind a new purchase is caught here and treated
+    as a miss. Nothing else guarantees an entry is refreshed when a purchase is
+    recorded, and a stale copy served as current is a wrong page that no error
+    rate shows.
 
     A cache failure is returned rather than raised onward, because it is not
     this request's failure. The request succeeded.
@@ -201,7 +209,14 @@ def _the_figure_for(
         found, cache_failure = None, str(unreachable)
 
     if found is not None:
-        return found.amount_cents, True, cache_failure
+        if found.items_counted == len(account.purchases):
+            return found.amount_cents, True, cache_failure
+
+        cache_failure = (
+            f"stale summary for {account.shopper_id} at {cache_endpoint}: "
+            f"entry counts {found.items_counted} purchases, "
+            f"account holds {len(account.purchases)}"
+        )
 
     return render_spend_summary(
         account,
