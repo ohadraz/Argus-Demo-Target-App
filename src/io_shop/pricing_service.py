@@ -14,9 +14,7 @@ chose that spelling - which is why the fact is published in the service
 catalogue rather than left to be inferred here.
 
 The shop does not retry and does not price the basket itself when the service
-is slow. It waits, and it says how long it waited. A slow dependency is not this
-request's failure: the page is correct, the shopper is charged the right amount,
-and the only thing that changed is how long it took to say so.
+is slow, and it says how long each call took.
 
 How the service is reached is the caller's to supply, for the reason the payment
 provider's is: the shop is rendered many times over to produce a minute of
