@@ -183,6 +183,11 @@ def _the_figure_for(
     fallback the whole scenario rests on: the page is correct either way, and
     the only thing the cache decides is how long getting here took.
 
+    An entry worked out over a different number of purchases than the account
+    now has is a copy that stopped keeping up, and it is treated as a miss
+    rather than served. Nothing here writes or evicts entries, so without this
+    check a frozen entry would be served as a hit for ever.
+
     A cache failure is returned rather than raised onward, because it is not
     this request's failure. The request succeeded.
     """
@@ -200,7 +205,7 @@ def _the_figure_for(
     except CacheUnreachable as unreachable:
         found, cache_failure = None, str(unreachable)
 
-    if found is not None:
+    if found is not None and found.items_counted == len(account.purchases):
         return found.amount_cents, True, cache_failure
 
     return render_spend_summary(
