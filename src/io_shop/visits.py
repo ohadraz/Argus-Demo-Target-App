@@ -7,28 +7,47 @@ the process rather than in a store: a round trip to the database would cost
 more than the panel is worth.
 
 One entry per shopper, the newest render winning. Io has a few million
-registered shoppers and this holds whichever of them have been by.
+registered shoppers, so this holds only the most recently seen of them - at
+most `MOST_SHOPPERS_REMEMBERED` - and forgets the least recently seen when it
+is full. Forgetting costs a returning shopper nothing but the greeting figure;
+holding everyone costs the process its heap.
 """
 
 from __future__ import annotations
 
-_LAST_SEEN: dict[str, str] = {}
+import threading
+from collections import OrderedDict
+
+MOST_SHOPPERS_REMEMBERED = 50_000
+
+_LAST_SEEN: OrderedDict[str, str] = OrderedDict()
+_LOCK = threading.Lock()
 
 
 def record_visit(shopper_id: str, shown: str) -> None:
-    """Notes what this shopper was last shown."""
-    _LAST_SEEN[shopper_id] = shown
+    """Notes what this shopper was last shown, forgetting the least recently
+    seen shopper if that takes the store past its bound."""
+    with _LOCK:
+        _LAST_SEEN[shopper_id] = shown
+        _LAST_SEEN.move_to_end(shopper_id)
+        while len(_LAST_SEEN) > MOST_SHOPPERS_REMEMBERED:
+            _LAST_SEEN.popitem(last=False)
 
 
 def what_they_saw_last_time(shopper_id: str) -> str | None:
     """What this shopper was shown on their previous visit, if they have been
-    here before."""
-    return _LAST_SEEN.get(shopper_id)
+    here recently enough to still be remembered."""
+    with _LOCK:
+        shown = _LAST_SEEN.get(shopper_id)
+        if shown is not None:
+            _LAST_SEEN.move_to_end(shopper_id)
+        return shown
 
 
 def how_many_shoppers_are_remembered() -> int:
     """How many shoppers this process is holding a visit for."""
-    return len(_LAST_SEEN)
+    with _LOCK:
+        return len(_LAST_SEEN)
 
 
 def forget_every_visit() -> None:
@@ -37,4 +56,5 @@ def forget_every_visit() -> None:
     What a new process starts with anyway - the shop's own reset, for a
     deployment that wants one without waiting for a restart.
     """
-    _LAST_SEEN.clear()
+    with _LOCK:
+        _LAST_SEEN.clear()
