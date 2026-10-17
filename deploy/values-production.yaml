@@ -41,9 +41,12 @@ autoscaling:
 # name nothing matches leaves a shop that is publishing perfectly well and a
 # scraper that has stopped collecting it. No request fails, no page slows, and
 # the only sign is that the series stops.
+#
+# It must equal the endpoint `port` in deploy/scrape.yaml; a test enforces this,
+# so renaming it means changing both in the same change.
 metrics:
   port: 9090
-  portName: http-metrics
+  portName: metrics
 
 # Where the rendered-summary cache lives.
 #
