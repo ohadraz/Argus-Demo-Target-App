@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from io_shop.categorising import MODELS, UNCATEGORISED, V1, V2, categorise
 
 """Where the categoriser files a purchase, and whether it was sure.
@@ -40,6 +42,29 @@ def test_the_upgrade_knows_the_newer_product_lines() -> None:
 def test_the_upgrade_files_everything_the_first_model_did_the_same_way() -> None:
     assert categorise("Portable speaker", V2).category == "Audio"
     assert categorise("Family cookbook", V2).category == "Books"
+
+
+def test_the_upgrade_reads_a_word_however_it_is_capitalised() -> None:
+    filed = categorise("Kettle in brushed steel", V2)
+
+    assert filed.category == "Kitchen"
+    assert filed.confident
+    assert categorise("KEYBOARD with backlight", V2).category == "Computing"
+    assert categorise("Smartwatch strap", V2).category == "Wearables"
+
+
+@pytest.mark.parametrize("version", sorted(MODELS))
+def test_every_model_is_confident_of_a_capitalised_title_it_knows(version: str) -> None:
+    model = MODELS[version]
+
+    for title, category in [
+        ("Kettle in brushed steel", "Kitchen"),
+        ("BACKPACK, 30 litres", "Travel"),
+        ("Noise-cancelling Headphones", "Audio"),
+    ]:
+        filed = categorise(title, model)
+        assert filed.confident, (version, title)
+        assert filed.category == category, (version, title)
 
 
 def test_every_model_is_loadable_by_the_version_the_deployment_names() -> None:
