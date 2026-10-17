@@ -448,14 +448,19 @@ class MonthlyStatement:
     row, and a statement that failed halfway would have already printed three
     rows of a document it cannot finish. A shopper seeing half a statement is
     worse served than one seeing none.
+
+    `biggest_cents`, `smallest_cents` and `mean_cents` are `None` on a month
+    with no purchases in it: there is no largest purchase of nothing, and an
+    invented zero would read as a purchase that cost nothing. Nothing renders
+    them on such a month - it is a quiet month, see `is_a_quiet_month`.
     """
 
     period: StatementPeriod
     headline_cents: int
     purchase_count: int
-    biggest_cents: int
-    smallest_cents: int
-    mean_cents: int
+    biggest_cents: int | None
+    smallest_cents: int | None
+    mean_cents: int | None
     bands: tuple[BandSummary, ...]
     categories: tuple[CategorySummary, ...]
     refunds: RefundSummary
@@ -616,36 +621,58 @@ def purchases_this_month(account: Account) -> tuple[Purchase, ...]:
     )
 
 
-def the_biggest_purchase_this_month(account: Account) -> int:
+def the_biggest_purchase_this_month(account: Account) -> int | None:
     """The largest single purchase of the month, in pence.
 
     The statement leads on this after the headline, because it is the figure a
     shopper checks first: a month that surprised them usually surprised them
     once, and this is the purchase that did it.
+
+    `None` on a month with no purchases in it - there is no largest of nothing,
+    and a shopper who bought nothing this month is an ordinary shopper.
     """
-    return max(purchase.price_cents for purchase in purchases_this_month(account))
+    bought = purchases_this_month(account)
+
+    if not bought:
+        return None
+
+    return max(purchase.price_cents for purchase in bought)
 
 
-def the_smallest_purchase_this_month(account: Account) -> int:
+def the_smallest_purchase_this_month(account: Account) -> int | None:
     """The smallest single purchase of the month, in pence.
 
     Shown beside the largest, and the pair is the point rather than either on
     its own: the distance between them is what says whether this was a month of
     one big thing or a month of many similar things, before the band breakdown
     says it in detail.
+
+    `None` on a month with no purchases in it, for the same reason as the
+    largest.
     """
-    return min(purchase.price_cents for purchase in purchases_this_month(account))
+    bought = purchases_this_month(account)
+
+    if not bought:
+        return None
+
+    return min(purchase.price_cents for purchase in bought)
 
 
-def the_mean_purchase_this_month(account: Account) -> int:
+def the_mean_purchase_this_month(account: Account) -> int | None:
     """What the month's purchases averaged, in pence.
 
     Floor division, as every other figure on this page uses, so that the
     statement never shows a fraction of a penny. Rounding up would occasionally
     produce a mean above the largest purchase on a month of identical prices,
     which is the kind of figure that costs a support conversation.
+
+    `None` on a month with no purchases in it: an average of nothing is not
+    zero, it is absent.
     """
     bought = purchases_this_month(account)
+
+    if not bought:
+        return None
 
     return account.total_this_month_cents // len(bought)
 
@@ -907,12 +934,14 @@ def render_monthly_statement(account: Account,
     which is how two parts of a shop come to disagree about what a shopper
     spent.
 
-    Raises rather than returning an empty statement. A month with nothing in it
-    has no largest purchase, no smallest, no mean and no shape, and every one of
-    those is a row this panel promises. The page above catches it, records the
-    shopper it failed for and the line it failed on, and serves a failed
-    response - see `io_shop.account_page`, which is the only place in the shop
-    that catches broadly and the only place that should.
+    A month with nothing in it is a statement, not a failure: a shopper who
+    bought nothing this month is ordinary, and their statement is a quiet month
+    of £0.00 across 0 purchases. It has no largest purchase, no smallest and no
+    mean, and those are carried as absent rather than as zero - see
+    `MonthlyStatement`. Anything that genuinely cannot be assembled still
+    raises, and the page above catches it - see `io_shop.account_page`, which
+    is the only place in the shop that catches broadly and the only place that
+    should.
     """
     bought = purchases_this_month(account)
     month_total_cents = account.total_this_month_cents
