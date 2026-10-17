@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import pytest
+
 from io_shop.accounts import Account, Purchase
 from io_shop.typical_spend import typical_spend_per_item
 
 """The middle of a shopper's history - the account page's newest figure.
 
-Correct on every history the shop has, which is the whole of what this file
-covers. That it is also expensive is not asserted here: what it costs is
-modelled by the generator, and a test timing a loop over twelve integers would
-measure the machine it ran on rather than the shape of the code.
+Correct on every history the shop has, and cheap enough to survive a long one:
+the cost is asserted by counting comparisons rather than by timing, so it
+measures the shape of the code and not the machine.
 """
 
 
@@ -51,3 +52,35 @@ def test_one_expensive_buy_does_not_drag_the_middle_the_way_it_drags_a_mean() ->
     a_history_of_coffees_and_a_laptop = an_account_of(*([300] * 20), 180_000)
 
     assert typical_spend_per_item(a_history_of_coffees_and_a_laptop) == 300
+
+
+def test_an_empty_history_still_raises() -> None:
+    with pytest.raises(ValueError):
+        typical_spend_per_item(an_account_of())
+
+
+class _CountedPrice(int):
+    comparisons = 0
+
+    def __lt__(self, other: object) -> bool:
+        _CountedPrice.comparisons += 1
+        return int.__lt__(self, other)  # type: ignore[arg-type]
+
+    def __gt__(self, other: object) -> bool:
+        _CountedPrice.comparisons += 1
+        return int.__gt__(self, other)  # type: ignore[arg-type]
+
+
+def test_a_long_history_costs_n_log_n_comparisons_not_n_squared() -> None:
+    # The figure is computed on every request in the rollout, so its cost per
+    # request is what decides how much traffic the shop's CPU can carry.
+    # Removing the cheapest over and over makes ~n^2/4 comparisons (a million
+    # for 2000 purchases); sorting once makes ~n log n.
+    n = 2000
+    prices = [_CountedPrice((i * 7919) % 100_003) for i in range(n)]
+    _CountedPrice.comparisons = 0
+
+    middle = typical_spend_per_item(an_account_of(*prices))
+
+    assert middle == sorted(int(p) for p in prices)[(n - 1) // 2]
+    assert _CountedPrice.comparisons <= 20 * n
