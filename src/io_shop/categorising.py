@@ -115,5 +115,11 @@ MODELS: Final[Mapping[str, CategoriserModel]] = {
 
 
 def categorise(title: str, model: CategoriserModel) -> Categorisation:
-    """Where `model` files a purchase with this title."""
-    return model.predict(title.split())
+    """Where `model` files a purchase with this title.
+
+    A model that does not fold case itself was trained on titles its pipeline had
+    already lowercased, so it must be fed them the same way - otherwise every
+    capitalised word misses its vocabulary and the purchase lands in "General".
+    """
+    words = title.split() if model.lowercases_its_input else title.lower().split()
+    return model.predict(words)
