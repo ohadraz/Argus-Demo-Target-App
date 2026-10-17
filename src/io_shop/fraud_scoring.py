@@ -10,17 +10,18 @@ purchase charges in pounds, and what it settles at in euros. Collinear features
 are an ordinary accident of a feature pipeline, and what training makes of them
 is an ordinary consequence - two large weights of opposite sign that almost
 cancel, with the model's whole opinion of a purchase in the small difference
-between them. In full precision the cancellation is exact enough to leave that
-difference intact.
+between them.
 
 It runs on a GPU, as the rest of the shop's models do, and which GPU is the
 node's business rather than this module's: the accelerator is handed in. On
 Ampere and later, matrix arithmetic may run in TF32 - an eight-bit exponent
 and a ten-bit mantissa - which rounds every operand to about three significant
-decimal digits. That is harmless for a well-conditioned model and is the end of
-this one: rounding two products in the thousands that were meant to cancel to
-within a few units leaves a logit that is mostly rounding error, and about half
-of all purchases are held.
+decimal digits. Scoring the two collinear terms separately would round two
+products in the thousands that are meant to cancel to within a few units, and
+leave a logit that is mostly rounding error. So the pair is folded, in full
+precision on the host, into the one weight it amounts to - the settlement is
+the charge times a constant - and the accelerator only ever sees a
+well-conditioned model.
 """
 
 from __future__ import annotations
@@ -51,6 +52,13 @@ WEIGHT_ON_THE_CHARGE: Final = 4680.05
 WEIGHT_ON_THE_SETTLEMENT: Final = -4000.0
 BIAS: Final = -4.3
 
+# The collinear pair folded into the single weight per pound it amounts to,
+# computed here in full precision so that the cancellation never happens in
+# reduced-precision arithmetic.
+_WEIGHT_PER_POUND: Final = (
+    WEIGHT_ON_THE_CHARGE + WEIGHT_ON_THE_SETTLEMENT * EUROS_PER_POUND
+)
+
 # Bits of significand TF32 keeps, counting the implicit leading one.
 _TF32_SIGNIFICAND_BITS: Final = 11
 
@@ -66,14 +74,9 @@ def fraud_logit(price_cents: int, accelerator: str) -> float:
     """The model's opinion of a purchase at this price, scored on this
     accelerator - positive is suspicious."""
     charge = price_cents / _PENCE_PER_POUND
-    settlement = charge * EUROS_PER_POUND
     rounded = _to_tf32 if runs_in_tf32(accelerator) else _as_given
 
-    return (
-        rounded(WEIGHT_ON_THE_CHARGE) * rounded(charge)
-        + rounded(WEIGHT_ON_THE_SETTLEMENT) * rounded(settlement)
-        + BIAS
-    )
+    return rounded(_WEIGHT_PER_POUND) * rounded(charge) + BIAS
 
 
 def held_for_review(price_cents: int, accelerator: str) -> bool:
