@@ -115,5 +115,10 @@ MODELS: Final[Mapping[str, CategoriserModel]] = {
 
 
 def categorise(title: str, model: CategoriserModel) -> Categorisation:
-    """Where `model` files a purchase with this title."""
-    return model.predict(title.split())
+    """Where `model` files a purchase with this title.
+
+    The words are lowercased here, as the training pipeline lowercased every
+    title the vocabularies were built from - a model that no longer folds case
+    itself must be handed words in the form it learned them.
+    """
+    return model.predict([word.lower() for word in title.split()])
