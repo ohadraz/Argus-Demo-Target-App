@@ -2108,12 +2108,23 @@ def a_minutes_end(bucket: dict) -> str:
     return str((started + timedelta(minutes=1)).timestamp())
 
 
+def the_minutes_both_reads_share(client: TestClient) -> list[dict]:
+    """The rows of `/scenario/metrics` a range query sent a moment later still
+    serves: the finished minutes, less the oldest.
+
+    Less the one in progress, because it is still moving between the two reads.
+    Less the oldest, because the window is the last six hours up to now: a
+    minute ending between the two reads takes the oldest out of the second one,
+    and the query answers one value short of the rows.
+    """
+    return client.get("/scenario/metrics").json()[1:-1]
+
+
 def test_the_prometheus_stand_in_answers_what_the_rows_say(client: TestClient) -> None:
     # The stand-in's whole licence: a consumer reading through it reads the
-    # numbers the rows hold. Finished minutes only - the one in progress is
-    # still moving between the two reads.
+    # numbers the rows hold.
     a_staged_leak(client)
-    rows = client.get("/scenario/metrics").json()[:-1]
+    rows = the_minutes_both_reads_share(client)
 
     answered = a_range_query(
         client, QUERIES["memory_used_bytes"],
@@ -2191,8 +2202,8 @@ def test_the_upgrades_rule_query_answers_the_rows_share(client: TestClient) -> N
     # The rule's own query, read off its definition, sent to the stand-in a
     # responder would send it to - and the numbers are the rows'.
     a_staged_categoriser_upgrade(client)
-    rows = client.get("/scenario/metrics").json()[:-1]
-    expr = a_definition(CATEGORISATION_CONFIDENCE_LOW)["data"][0]["model"]["expr"]
+    rows = the_minutes_both_reads_share(client)
+    expr =a_definition(CATEGORISATION_CONFIDENCE_LOW)["data"][0]["model"]["expr"]
 
     answered = a_range_query(
         client, expr, start=a_minutes_end(rows[0]), end=a_minutes_end(rows[-1])
