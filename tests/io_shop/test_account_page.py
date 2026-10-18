@@ -176,8 +176,10 @@ def test_a_provider_failure_names_the_provider_and_the_status() -> None:
     assert "503" in page.failure
 
 
-def a_cache_holding(summary_cents: int) -> LookUpSummary:
-    written = str(SummaryEntry(amount_cents=summary_cents, items_counted=8))
+def a_cache_holding(summary_cents: int, items_counted: int) -> LookUpSummary:
+    written = str(
+        SummaryEntry(amount_cents=summary_cents, items_counted=items_counted)
+    )
 
     return lambda dont_care_shopper: CacheAnswer(reached=True, entry=written)
 
@@ -198,11 +200,30 @@ def test_a_page_whose_figure_was_cached_says_so() -> None:
                               use_monthly_summary=False,
                               ask_the_provider=a_provider_holding_a_card(),
                               ask_the_pricing_service=a_prompt_pricing_service(),
-                              look_up_summary=a_cache_holding(999),
+                              look_up_summary=a_cache_holding(999, items_counted=2),
                               cache_endpoint=SOME_CACHE_ENDPOINT)
 
     assert page.figure_cents == 999
     assert page.served_from_cache
+
+
+def test_a_cached_figure_older_than_the_latest_purchase_is_not_served() -> None:
+    # The incident: the shopper bought again and nothing refreshed their entry.
+    # The entry says it was worked out over two purchases; the account has
+    # three. Serving it would show a figure the ledger has moved past, so the
+    # page works the figure out from the purchases instead.
+    account = an_account_idle_this_month(1000, 3000, 5000)
+
+    page = serve_account_page(account,
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_prompt_pricing_service(),
+                              look_up_summary=a_cache_holding(999, items_counted=2),
+                              cache_endpoint=SOME_CACHE_ENDPOINT)
+
+    assert page.failure is None
+    assert page.figure_cents == 3000
+    assert not page.served_from_cache
 
 
 def test_a_miss_is_computed_and_the_page_is_still_correct() -> None:
