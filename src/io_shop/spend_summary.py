@@ -9,6 +9,8 @@ is decided before it reaches here.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from io_shop.accounts import Account
 from io_shop.typical_spend import typical_spend_per_item
 
@@ -41,14 +43,18 @@ def average_spend_per_item_this_month(account: Account) -> int:
     show what a shopper is spending now rather than what they averaged over
     three years.
 
-    A shopper who has bought nothing this month averages zero, rather than
-    dividing by an empty month.
+    This month is decided from when the purchase was recorded rather than from
+    the flag the writer set, so that a record which sat in a queue over a month
+    boundary counts against the month it happened in.
     """
+    now = datetime.now(UTC)
     bought_this_month = [
-        purchase for purchase in account.purchases if purchase.in_current_month
+        purchase
+        for purchase in account.purchases
+        if purchase.recorded_at is not None
+        and purchase.recorded_at.month == now.month
+        and purchase.recorded_at.year == now.year
     ]
-    if not bought_this_month:
-        return 0
     return account.total_this_month_cents // len(bought_this_month)
 
 
