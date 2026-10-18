@@ -4,13 +4,13 @@ from io_shop.fraud_scoring import fraud_logit, held_for_review, runs_in_tf32
 
 """Which purchases the fraud scorer holds for review.
 
-A regression net for the shop's own scorer, written after it, on the cards the
-shop's fleet was bought with. What it does on an Ampere card with TF32 allowed
-is a planted fault and is nobody's test here - `tests/target_app` asserts it is
-still there.
+A regression net for the shop's own scorer, on the cards the shop's fleet was
+bought with and on the Ampere cards a node may be scheduled onto, where TF32 is
+allowed. The scorer must decide the same way on either.
 """
 
 ON_A_V100 = "Tesla-V100-SXM2-16GB"
+ON_AN_A100 = "NVIDIA-A100-SXM4-40GB"
 
 
 def test_a_cheap_purchase_goes_straight_through() -> None:
@@ -38,3 +38,24 @@ def test_most_purchases_go_through() -> None:
     held = sum(1 for price in range(500, 9_000) if held_for_review(price, ON_A_V100))
 
     assert held / 8_500 < 0.1
+
+
+def test_an_ampere_card_in_tf32_still_lets_most_purchases_through() -> None:
+    assert runs_in_tf32(ON_AN_A100)
+
+    held = sum(1 for price in range(500, 9_000) if held_for_review(price, ON_AN_A100))
+
+    assert held / 8_500 < 0.1
+
+
+def test_an_ampere_card_in_tf32_decides_as_a_volta_card_does() -> None:
+    assert runs_in_tf32(ON_AN_A100)
+
+    disagreements = [
+        price
+        for price in range(500, 9_000)
+        if held_for_review(price, ON_AN_A100) != held_for_review(price, ON_A_V100)
+    ]
+
+    # Rounding may move the line by a few pence, and nothing more.
+    assert all(8_580 <= price <= 8_620 for price in disagreements)
