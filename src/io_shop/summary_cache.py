@@ -43,6 +43,28 @@ _ENDPOINT_FORMAT = "redis://{host}:{port}"
 _ENTRY_FORMAT = "{amount_cents}/{items_counted}"
 _ENTRY_SEPARATOR = "/"
 
+# Which shape of entry lives under a key, carried in the key itself. A cache is
+# shared by every replica, and a rolling update runs two revisions side by side
+# for as long as it takes - or for as long as it is paused. An entry written in
+# one revision's shape under a key the other revision also reads is an entry
+# the other cannot parse, and a revision already running cannot be taught a
+# shape it has never seen. So each shape gets its own namespace: a revision
+# only ever reads entries in the shape it writes, and a fresh namespace is
+# nothing worse than a cold cache. Bump the version whenever _ENTRY_FORMAT
+# changes.
+_ENTRY_VERSION = "v2"
+_KEY_FORMAT = "summary/{version}/{shopper_id}"
+
+
+def summary_key_for(shopper_id: str) -> str:
+    """The cache key an entry in this revision's shape lives under.
+
+    Both the writer and the reader address entries by this key and nothing
+    else, so the two always agree about the shape behind it - and a revision
+    with a different shape, reading its own key, never sees this one's.
+    """
+    return _KEY_FORMAT.format(version=_ENTRY_VERSION, shopper_id=shopper_id)
+
 
 @dataclass(frozen=True)
 class CacheEndpoint:
@@ -74,7 +96,8 @@ class SummaryEntry:
     entry goes in under the shopper it belongs to and comes back as the same
     characters. `__str__` is therefore the writer, exactly as it is for
     `CacheEndpoint` above - one spelling of an entry, used to put it in and
-    quoted whenever something cannot read it back.
+    quoted whenever something cannot read it back. It is put in under
+    `summary_key_for`, which is the key this spelling is read back from.
     """
 
     amount_cents: int
@@ -146,10 +169,10 @@ class CacheUnreachable(Exception):
     """
 
 
-# How the cache is reached, given a shopper. A seam rather than a client, for
-# the reason the payment provider's is one: the shop is rendered many times over
-# to produce a minute of telemetry, and a connection per render would be
-# thousands of them per read.
+# How the cache is reached, given the key an entry lives under (see
+# `summary_key_for`). A seam rather than a client, for the reason the payment
+# provider's is one: the shop is rendered many times over to produce a minute of
+# telemetry, and a connection per render would be thousands of them per read.
 type LookUpSummary = Callable[[str], CacheAnswer]
 
 
@@ -159,6 +182,9 @@ def cached_summary(shopper_id: str,
     """The entry the cache holds for this shopper, or `None` where it holds
     none.
 
+    Looked up under `summary_key_for`, so only an entry in this revision's
+    shape is ever read - never one another revision wrote in its own.
+
     Raises `CacheUnreachable` when the cache did not answer, and the message is
     the point of the function: it names the endpoint the shop dialled, port
     included. A failure that said only "cache unavailable" would leave a reader
@@ -166,7 +192,7 @@ def cached_summary(shopper_id: str,
     set against the endpoint the configuration was supposed to carry, is the
     whole diagnosis.
     """
-    answer = look_up(shopper_id)
+    answer = look_up(summary_key_for(shopper_id))
 
     if not answer.reached:
         raise CacheUnreachable(f"connection refused to {endpoint}")

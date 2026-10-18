@@ -10,6 +10,7 @@ from io_shop.summary_cache import (
     SummaryEntry,
     cached_summary,
     summary_entry_in,
+    summary_key_for,
 )
 
 """The cache the account page reads before it computes.
@@ -75,6 +76,28 @@ def test_an_entry_is_written_down_as_the_figure_and_its_count() -> None:
     # entry in writes it this way, and whatever quotes an unreadable one quotes
     # this text.
     assert str(an_entry(amount_cents=4500, items_counted=3)) == "4500/3"
+
+
+def test_an_entry_is_looked_up_under_a_key_naming_its_shape() -> None:
+    # The incident: a rollout paused half-way left two revisions sharing one
+    # cache, and the older one read "2400/8" under the bare shopper id, where it
+    # expected a bare figure, and failed the page. Entries in this shape live
+    # under their own versioned key, so a revision with a different shape never
+    # reads them.
+    asked_for: list[str] = []
+
+    def look_up(key: str) -> CacheAnswer:
+        asked_for.append(key)
+        return CacheAnswer(reached=True, entry=str(an_entry()))
+
+    cached_summary(SOME_SHOPPER, look_up, SOME_ENDPOINT)
+
+    assert asked_for == ["summary/v2/shopper-1"]
+
+
+def test_the_key_is_never_the_bare_shopper_id() -> None:
+    # The bare id is where the previous shape of entry lives.
+    assert summary_key_for(SOME_SHOPPER) != SOME_SHOPPER
 
 
 def test_text_that_is_not_an_entry_holds_no_entry() -> None:
