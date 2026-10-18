@@ -43,7 +43,7 @@ def a_prompt_pricing_service() -> AskThePricingService:
     return lambda dont_care_shopper: PricingAnswer(total_cents=8400, took_ms=12)
 
 
-def a_slow_pricing_service(took_ms: int = 1500) -> AskThePricingService:
+def a_slow_pricing_service(took_ms: int = 300) -> AskThePricingService:
     return lambda dont_care_shopper: PricingAnswer(
         total_cents=8400, took_ms=took_ms
     )
@@ -270,9 +270,8 @@ def test_a_page_carries_what_the_basket_comes_to() -> None:
 
 
 def test_a_slow_pricing_service_delays_the_page_without_failing_it() -> None:
-    # The whole scenario rests on this, exactly as the cache's rests on the
-    # fallback: the page is correct, the shopper is charged the right amount,
-    # and the only trace is a line nobody is paged for.
+    # Slow but inside the deadline: the page is correct, the shopper is charged
+    # the right amount, and the trace is a line saying where the time went.
     page = serve_account_page(an_account_idle_this_month(1000, 3000),
                               use_monthly_summary=False,
                               ask_the_provider=a_provider_holding_a_card(),
@@ -283,6 +282,23 @@ def test_a_slow_pricing_service_delays_the_page_without_failing_it() -> None:
     assert page.basket_total_cents == 8400
     assert page.pricing_delay is not None
     assert payment_provider.PROVIDER_HOST not in page.pricing_delay
+
+
+def test_a_pricing_service_past_the_deadline_renders_the_page_without_the_basket() -> None:
+    # The incident: pricing took 1500ms on every call, and every page waited for
+    # it. Past the deadline the page goes without its price instead.
+    page = serve_account_page(an_account_idle_this_month(1000, 3000),
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_slow_pricing_service(1500))
+
+    assert page.failure is None
+    assert page.figure_cents == 2000
+    assert page.card_last_four == "4242"
+    assert page.basket_total_cents is None
+    assert page.pricing_unavailable == PRICING_UNAVAILABLE
+    assert page.pricing_failure is not None
+    assert "pricing.io-internal.svc" in page.pricing_failure
 
 
 def test_a_pricing_service_with_no_price_renders_the_page_without_the_basket() -> None:

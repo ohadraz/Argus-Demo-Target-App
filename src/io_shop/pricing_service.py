@@ -14,7 +14,10 @@ chose that spelling - which is why the fact is published in the service
 catalogue rather than left to be inferred here.
 
 The shop does not retry and does not price the basket itself when the service
-is slow, and it says how long each call took.
+is slow, and it says how long each call took. Nor does it wait past its own
+deadline: the basket total is a convenience the page is worth showing without,
+so a price that has not arrived in time is treated as no price at all, rather
+than as a reason to hold every account page hostage to the slowest neighbour.
 
 How the service is reached is the caller's to supply.
 """
@@ -22,6 +25,8 @@ How the service is reached is the caller's to supply.
 from __future__ import annotations
 
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from typing import Final
 
@@ -39,6 +44,19 @@ BASKET_PATH: Final = "/v1/shoppers/{shopper_id}/basket-total"
 # in its own logs, and a service that has never been near this number is one
 # nobody writes a line about.
 SLOW_CALL_MS: Final = 200
+
+# How long the shop will wait for a price at all. Past this the page renders
+# without its basket total: the price is optional and the page is not, so a
+# pricing service that slows down costs the shopper one panel rather than every
+# account page costing the slowdown in full.
+PRICING_DEADLINE_MS: Final = 500
+
+# Where calls to the pricing service run, so the shop can stop waiting on one
+# without being able to cancel it. Bounded, so a service that hangs outright
+# fills this pool rather than the process; calls queued behind a full pool
+# still give up at the deadline.
+_CALLS: Final = ThreadPoolExecutor(max_workers=32,
+                                   thread_name_prefix="pricing-call")
 
 
 @dataclass(frozen=True)
@@ -89,22 +107,38 @@ type AskThePricingService = Callable[[str], PricingAnswer]
 def basket_total(shopper_id: str, ask: AskThePricingService) -> PricedBasket:
     """What this shopper's basket comes to, and what the call cost to make.
 
-    Raises `PricingServiceFailed` for anything that is not a price. A slow price
-    is a price: it comes back with the words for how slow, so the shop can put
-    them in its own logs and a reader can see where a request's time went
-    without having any telemetry of the pricing service's own.
+    Raises `PricingServiceFailed` for anything that is not a price - including
+    a price that did not arrive within `PRICING_DEADLINE_MS`. A slow price
+    inside the deadline is a price: it comes back with the words for how slow,
+    so the shop can put them in its own logs and a reader can see where a
+    request's time went without having any telemetry of the pricing service's
+    own.
 
     Those words are the whole point of this function. A log line saying only
     "account page took 1900ms" describes every slow incident equally, and leaves
     a reader to guess which of the shop's own lines was the slow one - when in
     fact none of them was.
     """
-    answer = ask(shopper_id)
+    path = BASKET_PATH.format(shopper_id=shopper_id)
+    call = _CALLS.submit(ask, shopper_id)
+
+    try:
+        answer = call.result(timeout=PRICING_DEADLINE_MS / 1000)
+    except FutureTimeout:
+        raise PricingServiceFailed(
+            f"{PRICING_HOST} gave no price within {PRICING_DEADLINE_MS}ms "
+            f"for {path}"
+        ) from None
+
+    if answer.took_ms > PRICING_DEADLINE_MS:
+        raise PricingServiceFailed(
+            f"{PRICING_HOST} took {answer.took_ms}ms for {path}, past the "
+            f"{PRICING_DEADLINE_MS}ms deadline"
+        )
 
     if answer.total_cents is None:
         raise PricingServiceFailed(
-            f"{PRICING_HOST} returned no price for "
-            f"{BASKET_PATH.format(shopper_id=shopper_id)}"
+            f"{PRICING_HOST} returned no price for {path}"
         )
 
     return PricedBasket(
