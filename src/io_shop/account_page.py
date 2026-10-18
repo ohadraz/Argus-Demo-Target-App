@@ -13,6 +13,7 @@ from __future__ import annotations
 import traceback
 from dataclasses import dataclass
 from pathlib import PurePath
+from typing import Final
 
 from io_shop.accounts import Account
 from io_shop.monthly_statement import (
@@ -21,7 +22,12 @@ from io_shop.monthly_statement import (
     render_monthly_statement,
 )
 from io_shop.payment_provider import AskTheProvider, card_on_file
-from io_shop.pricing_service import AskThePricingService, basket_total
+from io_shop.pricing_service import (
+    AskThePricingService,
+    PricedBasket,
+    PricingServiceFailed,
+    basket_total,
+)
 from io_shop.spend_summary import render_spend_summary
 from io_shop.summary_cache import (
     CacheEndpoint,
@@ -36,12 +42,13 @@ from io_shop.visits import record_visit
 class RenderedPage:
     """How serving one account page went.
 
-    Either the page rendered, in which case both of the things it shows are
-    here, or it failed, in which case neither is and `failure` carries the
-    error's own words and the line they were raised on - because those are what
-    reach the log and what a reader diagnoses from. A generic "request failed"
-    would describe every incident equally, and the error's words alone name a
-    fault without naming where it lives.
+    Either the page rendered, in which case the figure and the card are here -
+    and the basket total too, unless pricing could not give one, because the
+    page is worth showing without it - or it failed, in which case none of them is
+    and `failure` carries the error's own words and the line they were raised
+    on - because those are what reach the log and what a reader diagnoses from.
+    A generic "request failed" would describe every incident equally, and the
+    error's words alone name a fault without naming where it lives.
 
     `statement` is the monthly statement panel, on the pages the newest rollout
     reached and absent everywhere else. It sits beside the figure rather than
@@ -64,6 +71,11 @@ class RenderedPage:
     page was correct and the shopper was charged the right amount; what a reader
     gets from this line is where the request's time went, which is the one thing
     no amount of the shop's own telemetry can say.
+
+    `pricing_unavailable` is what the shopper is told in the basket total's
+    place when the pricing service gave no price, and `pricing_failure` is the
+    error's own words, for the log - a page that rendered without its basket
+    total, like one that rendered without its cache.
     """
 
     figure_cents: int | None
@@ -74,6 +86,12 @@ class RenderedPage:
     statement: MonthlyStatement | None = None
     basket_total_cents: int | None = None
     pricing_delay: str | None = None
+    pricing_unavailable: str | None = None
+    pricing_failure: str | None = None
+
+
+# What the page says in the basket total's place when pricing gave no price.
+PRICING_UNAVAILABLE: Final = "Pricing is not available right now. Please check again later."
 
 
 def serve_account_page(account: Account,
@@ -88,12 +106,14 @@ def serve_account_page(account: Account,
                        ) -> RenderedPage:
     """Renders the account page, reporting a failure rather than raising one.
 
-    Three things are shown and all three are needed: what the shopper averages
-    per item, which Io works out for itself; what their basket comes to, which
-    the pricing service works out; and the card it would charge, which only the
-    payment provider knows. The last two are calls to other services from inside
-    a page render, which is ordinary and is why a slowdown or an outage over
-    there arrives here as Io's own latency and Io's own error rate.
+    Three things are shown, and two of them are needed: what the shopper
+    averages per item, which Io works out for itself, and the card it would
+    charge, which only the payment provider knows. The third, what their basket
+    comes to, which the pricing service works out, is a convenience - the page
+    is still worth showing without it. The basket and the card are calls to
+    other services from inside a page render, which is ordinary and is why a
+    slowdown or an outage over there arrives here as Io's own latency and Io's
+    own error rate.
 
     The two are not the same kind of neighbour, and nothing in this function
     tells them apart: one is another team's service and one is another company's,
@@ -127,7 +147,9 @@ def serve_account_page(account: Account,
         statement = _the_statement_for(
             account, use_monthly_statement, statement_period
         )
-        basket = basket_total(account.shopper_id, ask_the_pricing_service)
+        basket, pricing_failure = _the_basket_for(
+            account.shopper_id, ask_the_pricing_service
+        )
         card = card_on_file(account.shopper_id, ask_the_provider)
     except Exception as error:  # noqa: BLE001 - the boundary records anything
         failure = f"{type(error).__name__}: {error} at {_where_it_was_raised(error)}"
@@ -143,8 +165,24 @@ def serve_account_page(account: Account,
                         served_from_cache=from_cache,
                         cache_failure=cache_failure,
                         statement=statement,
-                        basket_total_cents=basket.total_cents,
-                        pricing_delay=basket.slow_call)
+                        basket_total_cents=basket.total_cents if basket else None,
+                        pricing_delay=basket.slow_call if basket else None,
+                        pricing_unavailable=None if basket else PRICING_UNAVAILABLE,
+                        pricing_failure=pricing_failure)
+
+
+def _the_basket_for(shopper_id: str,
+                    ask_the_pricing_service: AskThePricingService
+                    ) -> tuple[PricedBasket | None, str | None]:
+    """The basket total, or nothing and the reason where pricing gave no price.
+
+    Caught here rather than at the boundary, because the page is worth showing
+    without its basket total, where it is not without the card.
+    """
+    try:
+        return basket_total(shopper_id, ask_the_pricing_service), None
+    except PricingServiceFailed as error:
+        return None, f"{type(error).__name__}: {error}"
 
 
 def _the_statement_for(account: Account,

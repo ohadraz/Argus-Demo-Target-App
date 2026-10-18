@@ -1115,8 +1115,9 @@ SCENARIOS: dict[str, Scenario] = {
             "What that host is worth knowing about is in the service registry, "
             "which nobody reads until an incident: 'io-pricing' belongs to this "
             "company, and the payment provider beside it does not. Restarting "
-            "the shop changes nothing, because nothing is wrong with the shop. "
-            "What ends it is restarting a service Argus was not paged about."
+            "the shop changes nothing. What ends it is restarting a service "
+            "Argus was not paged about - though the shop waited with no limit "
+            "for a figure it could have shown the page without."
         ),
         family=NEIGHBOURS,
         dependency_is_slow=True,

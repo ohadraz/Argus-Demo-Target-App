@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from io_shop import payment_provider, spend_summary
-from io_shop.account_page import serve_account_page
+from io_shop.account_page import PRICING_UNAVAILABLE, serve_account_page
 from io_shop.accounts import Account, Purchase
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
 from io_shop.pricing_service import AskThePricingService, PricingAnswer
@@ -285,11 +285,27 @@ def test_a_slow_pricing_service_delays_the_page_without_failing_it() -> None:
     assert payment_provider.PROVIDER_HOST not in page.pricing_delay
 
 
-def test_a_pricing_service_with_no_price_fails_the_page() -> None:
+def test_a_pricing_service_with_no_price_renders_the_page_without_the_basket() -> None:
     page = serve_account_page(an_account_idle_this_month(1000, 3000),
                               use_monthly_summary=False,
                               ask_the_provider=a_provider_holding_a_card(),
                               ask_the_pricing_service=a_pricing_service_with_no_price())
 
-    assert page.failure is not None
-    assert "pricing.io-internal.svc" in page.failure
+    assert page.failure is None
+    assert page.figure_cents == 2000
+    assert page.card_last_four == "4242"
+    assert page.basket_total_cents is None
+    assert page.pricing_unavailable == PRICING_UNAVAILABLE
+    assert page.pricing_failure is not None
+    assert "pricing.io-internal.svc" in page.pricing_failure
+
+
+def test_a_priced_basket_says_nothing_is_unavailable() -> None:
+    page = serve_account_page(an_account_idle_this_month(1000, 3000),
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_slow_pricing_service())
+
+    assert page.basket_total_cents == 8400
+    assert page.pricing_unavailable is None
+    assert page.pricing_failure is None
