@@ -1,9 +1,8 @@
 # How the platform's Prometheus collects the shop's metrics.
 #
-# A stand-in for io-shop's manifest, not a real one: no cluster applies this
-# file, and nothing in this repository reads it. It is written as the
-# ServiceMonitor such a cluster would carry, so that how the shop is collected
-# is in the repository beside how it is deployed. Its labels are illustrative.
+# The ServiceMonitor the platform applies with the shop's chart, kept in the
+# repository beside how the shop is deployed, so that how it is collected
+# changes in the same pull request as what it is collected from.
 #
 # It selects the shop's Service by label, then the endpoint to scrape on that
 # Service by the port's *name* - never its number - so a port can move without
