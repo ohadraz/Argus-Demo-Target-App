@@ -5,6 +5,7 @@ from pathlib import Path
 from io_shop import payment_provider, spend_summary
 from io_shop.account_page import PRICING_UNAVAILABLE, serve_account_page
 from io_shop.accounts import Account, Purchase
+from io_shop.monthly_statement import period_for
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
 from io_shop.pricing_service import AskThePricingService, PricingAnswer
 from io_shop.summary_cache import (
@@ -309,3 +310,47 @@ def test_a_priced_basket_says_nothing_is_unavailable() -> None:
     assert page.basket_total_cents == 8400
     assert page.pricing_unavailable is None
     assert page.pricing_failure is None
+
+
+MARCH = period_for(3, 2026)
+
+
+def test_a_shopper_idle_this_month_still_gets_a_page_with_the_statement_on() -> None:
+    # The incident: with the statement rollout on, a shopper who bought nothing
+    # this month failed the whole page on max() of an empty month. The panel is
+    # optional; the figure and the card are not.
+    page = serve_account_page(an_account_idle_this_month(1000, 3000),
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_prompt_pricing_service(),
+                              use_monthly_statement=True,
+                              statement_period=MARCH)
+
+    assert page.failure is None
+    assert page.figure_cents == 2000
+    assert page.card_last_four == "4242"
+    assert page.statement is None
+
+
+def test_a_shopper_with_a_month_gets_the_statement_when_it_is_on() -> None:
+    account = Account(
+        shopper_id="shopper-with-a-month",
+        purchases=(
+            Purchase(price_cents=1200, in_current_month=True, category="Books"),
+            Purchase(price_cents=6400, in_current_month=True, category="Home"),
+            Purchase(price_cents=900, in_current_month=False, category="Books"),
+        ),
+        total_cents=8500,
+        total_this_month_cents=7600,
+    )
+
+    page = serve_account_page(account,
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_prompt_pricing_service(),
+                              use_monthly_statement=True,
+                              statement_period=MARCH)
+
+    assert page.failure is None
+    assert page.statement is not None
+    assert page.statement.headline_cents == 7600

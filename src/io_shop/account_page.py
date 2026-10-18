@@ -19,6 +19,7 @@ from io_shop.accounts import Account
 from io_shop.monthly_statement import (
     MonthlyStatement,
     StatementPeriod,
+    purchases_this_month,
     render_monthly_statement,
 )
 from io_shop.payment_provider import AskTheProvider, card_on_file
@@ -198,8 +199,17 @@ def _the_statement_for(account: Account,
     where that argument is made at length. A missing panel is visible to
     whoever configured the rollout; a wrongly titled one is visible only to the
     shopper.
+
+    Nothing, too, for a shopper who has bought nothing this month. That is an
+    ordinary shopper rather than a fault: a month with no purchases has no
+    statement to show - `render_monthly_statement` refuses to invent one - and
+    the panel is a second thing the page shows, so its absence must not take
+    the figure and the card down with it.
     """
     if not use_monthly_statement or period is None:
+        return None
+
+    if not purchases_this_month(account):
         return None
 
     return render_monthly_statement(account, period)
