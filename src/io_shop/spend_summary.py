@@ -40,10 +40,16 @@ def average_spend_per_item_this_month(account: Account) -> int:
     Narrows the lifetime figure to the current month, so the account page can
     show what a shopper is spending now rather than what they averaged over
     three years.
+
+    Unlike the lifetime figure, an empty divisor here is ordinary: any shopper
+    who has not bought anything yet this month has none. They have spent
+    nothing this month, so the figure is zero rather than an error.
     """
     bought_this_month = [
         purchase for purchase in account.purchases if purchase.in_current_month
     ]
+    if not bought_this_month:
+        return 0
     return account.total_this_month_cents // len(bought_this_month)
 
 
