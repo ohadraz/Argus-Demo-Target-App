@@ -53,7 +53,7 @@ metrics:
 # address is right.
 cache:
   host: cache.io-shop.svc.cluster.local
-  port: 6380
+  port: 6379
 
 # Which model files a purchase under a category.
 #
