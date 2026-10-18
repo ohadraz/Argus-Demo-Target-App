@@ -28,7 +28,7 @@ autoscaling:
   minReplicas: 3
   maxReplicas: 6
   targetCpuPercent: 70
-  scaleDownStabilizationSeconds: 0
+  scaleDownStabilizationSeconds: 300
 
 # How the platform finds the shop's metrics.
 #
