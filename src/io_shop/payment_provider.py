@@ -7,10 +7,10 @@ another company's service on Io's request path, which is the ordinary shape of a
 shop and the reason an outage somewhere else becomes an outage here.
 
 Nothing in this module retries, falls back, or renders the page without the
-card. That is deliberate rather than unfinished: when the provider is down there
-is nothing the shop can do about it, and code that softened the failure would
-turn an incident about somebody else's outage into an incident about Io's
-resilience.
+card. That is deliberate rather than unfinished: the card is what the shopper
+pays with, and with the provider down a checkout fails too - so a page that
+showed without it would invite the shopper into a purchase that cannot go
+through.
 
 How the provider is reached is the caller's to supply. The shop states what it
 asks for and what it does with the answer, and whoever is running it says where
