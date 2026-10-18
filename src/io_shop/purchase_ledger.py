@@ -53,20 +53,31 @@ def record_purchase(account: Account, purchase: Purchase) -> Account:
 
 def record_purchase_deriving_the_month(account: Account,
                                        purchase: Purchase) -> Account:
-    """The same account, without the month's total being moved.
+    """The account with this purchase written into it, and the month's total
+    derived from the history rather than added to.
 
-    One total to carry instead of two, which is the saving: a month is not
-    something the shop has to keep a figure for. Every purchase says which month
-    it falls in, so what a shopper has spent this month adds up from the history
-    whenever anybody wants it - exactly as the lifetime average is derived from the
-    purchases rather than read off the account (see
-    `io_shop.spend_summary.average_spend_per_item`). Keeping a second copy of a
-    figure the purchases already hold is the work this path exists to drop.
+    Every purchase says which month it falls in, so what a shopper has spent this
+    month adds up from the history - exactly as the lifetime average is derived
+    from the purchases (see `io_shop.spend_summary.average_spend_per_item`).
+
+    The derived figure is still written back to `total_this_month_cents`. Every
+    reader of the month - the monthly average, the monthly statement, the
+    shop's own reconciliation - reads that stored field, so a write path that
+    left it where it was would leave every one of them a purchase behind, and
+    further behind with every sale. Deriving it here, at write time, is what
+    makes this path agree with its readers whichever way the rollout is set.
     """
+    purchases = (*account.purchases, purchase)
+
     return replace(
         account,
-        purchases=(*account.purchases, purchase),
-        total_cents=account.total_cents + purchase.price_cents
+        purchases=purchases,
+        total_cents=account.total_cents + purchase.price_cents,
+        total_this_month_cents=sum(
+            recorded.price_cents
+            for recorded in purchases
+            if recorded.in_current_month
+        )
     )
 
 
