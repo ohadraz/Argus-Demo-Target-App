@@ -31,6 +31,16 @@ stop raising would leave that scenario staging nothing at all.
 MARCH = period_for(3, 2026)
 
 
+class _CountedHistory(tuple):
+    """A purchase history that counts how many times it is walked."""
+
+    walks: int
+
+    def __iter__(self):  # type: ignore[override]
+        self.walks += 1
+        return super().__iter__()
+
+
 def a_shopper_who_bought_this_month() -> Account:
     return Account(
         shopper_id="shopper-with-a-month",
@@ -69,6 +79,33 @@ def test_the_statement_takes_its_shape_from_this_month_alone() -> None:
 
     assert statement.biggest_cents == 6400
     assert statement.smallest_cents == 1200
+
+
+def test_a_statement_goes_through_the_history_once() -> None:
+    # The history is the part of an account that grows without bound, so every
+    # extra walk of it lands on the shoppers with the longest histories - the
+    # p99 rather than the p50. The statement picks the month out once and works
+    # every figure from that.
+    history = _CountedHistory(
+        [Purchase(price_cents=900, in_current_month=False)] * 500
+        + [
+            Purchase(price_cents=1200, in_current_month=True, category="Books"),
+            Purchase(price_cents=6400, in_current_month=True, category="Home"),
+        ]
+    )
+    history.walks = 0
+    account = Account(
+        shopper_id="shopper-with-a-long-history",
+        purchases=history,
+        total_cents=900 * 500 + 7600,
+        total_this_month_cents=7600,
+    )
+
+    statement = render_monthly_statement(account, MARCH)
+
+    assert statement.purchase_count == 2
+    assert statement.mean_cents == 3800
+    assert history.walks == 1
 
 
 def test_a_month_with_nothing_in_it_fails_rather_than_reporting_zero() -> None:
