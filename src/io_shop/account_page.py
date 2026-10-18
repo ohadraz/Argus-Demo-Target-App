@@ -61,7 +61,8 @@ class RenderedPage:
     difference between the two ways of rendering perfectly well - and the share
     of requests taking each is what says whether the shop's fast path is there.
 
-    `cache_failure` carries the words of a cache that could not be reached. It
+    `cache_failure` carries the words of a cache that could not be reached, or
+    that held an entry which no longer covers this shopper's purchases. It
     sits beside `failure` rather than in it, and the distinction is the whole
     scenario: this is a page that *succeeded* while something underneath it was
     broken, so a reader sees it in the logs without seeing it in the error rate.
@@ -213,13 +214,21 @@ def _the_figure_for(
     use_typical_spend: bool
 ) -> tuple[int, bool, str | None]:
     """The figure to show, whether it came from the cache, and what the cache
-    said if it could not be reached.
+    said if it could not be reached or could not be trusted.
 
     The cache is asked first and is allowed to fail. Whatever it does - answers
     with a figure, answers with nothing, or cannot be reached at all - this
     returns a figure, because the shop can always work one out. That is the
     fallback the whole scenario rests on: the page is correct either way, and
     the only thing the cache decides is how long getting here took.
+
+    An entry is served only where it was worked out over as many purchases as
+    the account now holds. The entry carries that count for exactly this, and
+    the account is already in hand, so the check costs nothing: an entry that
+    counts a different number of purchases is a copy that stopped keeping up
+    with the ledger, and serving it would show the shopper an old answer for as
+    long as whatever maintains the cache stays broken. It is treated as a miss
+    and reported, so the page stays correct and the staleness stays visible.
 
     A cache failure is returned rather than raised onward, because it is not
     this request's failure. The request succeeded.
@@ -237,6 +246,14 @@ def _the_figure_for(
         found = cached_summary(account.shopper_id, look_up_summary, cache_endpoint)
     except CacheUnreachable as unreachable:
         found, cache_failure = None, str(unreachable)
+
+    if found is not None and found.items_counted != len(account.purchases):
+        cache_failure = (
+            f"stale entry at {cache_endpoint} for {account.shopper_id}: "
+            f"counts {found.items_counted} purchases, "
+            f"account holds {len(account.purchases)}"
+        )
+        found = None
 
     if found is not None:
         return found.amount_cents, True, cache_failure
