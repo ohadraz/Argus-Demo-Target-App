@@ -23,9 +23,9 @@ from io_shop.monthly_statement import (
 
 A safety net rather than a specification: the panel was written first and these
 cover what would be expensive to find out from a shopper. The one that matters
-most is the empty month, because that is the fault the
-`monthly-statement-panel` scenario stages, and a change that quietly made it
-stop raising would leave that scenario staging nothing at all.
+most is the empty month: a shopper who bought nothing this month is an ordinary
+shopper, and a statement that failed for them failed the whole account page for
+every idle shopper the rollout reached.
 """
 
 MARCH = period_for(3, 2026)
@@ -71,12 +71,22 @@ def test_the_statement_takes_its_shape_from_this_month_alone() -> None:
     assert statement.smallest_cents == 1200
 
 
-def test_a_month_with_nothing_in_it_fails_rather_than_reporting_zero() -> None:
-    # The fault the `monthly-statement-panel` scenario stages. A statement
-    # reporting a made-up zero would be a panel nobody could trust on the
-    # months it can describe.
-    with pytest.raises(ValueError):
-        render_monthly_statement(a_shopper_who_bought_nothing_this_month(), MARCH)
+def test_a_month_with_nothing_in_it_is_a_quiet_month_rather_than_a_failure() -> None:
+    # Raised `ValueError: max() iterable argument is empty` for every idle
+    # shopper once monthly-spend-feature was on, failing their account page.
+    statement = render_monthly_statement(
+        a_shopper_who_bought_nothing_this_month(), MARCH
+    )
+
+    assert statement.headline_cents == 0
+    assert statement.purchase_count == 0
+    assert statement.is_a_quiet_month
+    assert reconciles(statement)
+    assert problems_with(statement) == []
+    assert describe_month(statement) == "A quiet month: £0.00 across 0 purchases."
+    assert as_plain_text(statement).startswith("MARCH 2026")
+    assert as_csv_rows(statement)[0] == STATEMENT_COLUMNS
+    assert "Largest purchase" not in as_html(statement)
 
 
 def test_the_breakdowns_add_up_to_the_headline() -> None:

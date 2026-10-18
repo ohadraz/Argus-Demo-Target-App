@@ -622,8 +622,15 @@ def the_biggest_purchase_this_month(account: Account) -> int:
     The statement leads on this after the headline, because it is the figure a
     shopper checks first: a month that surprised them usually surprised them
     once, and this is the purchase that did it.
+
+    Zero on a month with no purchases. That is an ordinary shopper rather than
+    a fault, and the figure is never printed for it - a month of fewer than two
+    purchases is a quiet month, which shows the headline instead of the shape.
     """
-    return max(purchase.price_cents for purchase in purchases_this_month(account))
+    return max(
+        (purchase.price_cents for purchase in purchases_this_month(account)),
+        default=0
+    )
 
 
 def the_smallest_purchase_this_month(account: Account) -> int:
@@ -633,8 +640,13 @@ def the_smallest_purchase_this_month(account: Account) -> int:
     its own: the distance between them is what says whether this was a month of
     one big thing or a month of many similar things, before the band breakdown
     says it in detail.
+
+    Zero on a month with no purchases, for the same reason as the largest.
     """
-    return min(purchase.price_cents for purchase in purchases_this_month(account))
+    return min(
+        (purchase.price_cents for purchase in purchases_this_month(account)),
+        default=0
+    )
 
 
 def the_mean_purchase_this_month(account: Account) -> int:
@@ -644,8 +656,13 @@ def the_mean_purchase_this_month(account: Account) -> int:
     statement never shows a fraction of a penny. Rounding up would occasionally
     produce a mean above the largest purchase on a month of identical prices,
     which is the kind of figure that costs a support conversation.
+
+    Zero on a month with no purchases, for the same reason as the largest.
     """
     bought = purchases_this_month(account)
+
+    if not bought:
+        return 0
 
     return account.total_this_month_cents // len(bought)
 
@@ -907,10 +924,11 @@ def render_monthly_statement(account: Account,
     which is how two parts of a shop come to disagree about what a shopper
     spent.
 
-    Raises rather than returning an empty statement. A month with nothing in it
-    has no largest purchase, no smallest, no mean and no shape, and every one of
-    those is a row this panel promises. The page above catches it, records the
-    shopper it failed for and the line it failed on, and serves a failed
+    A month with nothing in it is a shopper who bought nothing, which is
+    allowed: it is assembled as a quiet month whose headline is the true
+    figure, zero, and whose shape is never printed. Anything that genuinely
+    cannot be assembled still raises, and the page above catches it, records
+    the shopper it failed for and the line it failed on, and serves a failed
     response - see `io_shop.account_page`, which is the only place in the shop
     that catches broadly and the only place that should.
     """

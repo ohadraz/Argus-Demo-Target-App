@@ -5,6 +5,7 @@ from pathlib import Path
 from io_shop import payment_provider, spend_summary
 from io_shop.account_page import PRICING_UNAVAILABLE, serve_account_page
 from io_shop.accounts import Account, Purchase
+from io_shop.monthly_statement import period_for
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
 from io_shop.pricing_service import AskThePricingService, PricingAnswer
 from io_shop.summary_cache import (
@@ -85,6 +86,24 @@ def test_a_page_that_renders_carries_the_figure_and_no_failure() -> None:
     assert page.figure_cents == 2000
     assert page.card_last_four == "4242"
     assert page.failure is None
+
+
+def test_an_idle_shopper_in_the_statement_rollout_still_gets_their_page() -> None:
+    # With monthly-spend-feature on, this failed with
+    # "ValueError: max() iterable argument is empty" for every shopper who had
+    # bought nothing this month.
+    page = serve_account_page(an_account_idle_this_month(1000, 3000),
+                              use_monthly_summary=False,
+                              ask_the_provider=a_provider_holding_a_card(),
+                              ask_the_pricing_service=a_prompt_pricing_service(),
+                              use_monthly_statement=True,
+                              statement_period=period_for(3, 2026))
+
+    assert page.failure is None
+    assert page.figure_cents == 2000
+    assert page.statement is not None
+    assert page.statement.headline_cents == 0
+    assert page.statement.purchase_count == 0
 
 
 def test_a_page_that_breaks_is_reported_rather_than_raised() -> None:
