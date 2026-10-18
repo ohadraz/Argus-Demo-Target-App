@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from io_shop.accounts import Account, Purchase
-from io_shop.purchase_ledger import record_purchase
+from io_shop.purchase_ledger import record_a_purchase, record_purchase
+from io_shop.spend_reconciliation import reconcile_monthly_totals
 
 """Writing a purchase down, and moving the totals that describe it.
 
@@ -105,3 +106,54 @@ def test_a_shopper_with_no_history_can_be_written_to() -> None:
     recorded = record_purchase(a_new_shopper, a_purchase_of(500))
 
     assert (recorded.total_cents, recorded.total_this_month_cents) == (500, 500)
+
+
+# The derive-the-month path, selected by the monthly-spend-feature rollout. The
+# stored monthly total is what every reader uses, so this path must leave it
+# agreeing with the purchases exactly as the original path does.
+
+
+def test_deriving_the_month_still_moves_the_stored_monthly_total() -> None:
+    account = an_account_with(1000, 2000)
+
+    recorded = record_a_purchase(account, a_purchase_of(500), derive_the_month=True)
+
+    assert (recorded.total_cents, recorded.total_this_month_cents) == (3500, 500)
+
+
+def test_deriving_the_month_ignores_an_earlier_months_purchase() -> None:
+    account = an_account_with(1000)
+
+    recorded = record_a_purchase(
+        account, a_purchase_of(500, this_month=False), derive_the_month=True
+    )
+
+    assert (recorded.total_cents, recorded.total_this_month_cents) == (1500, 0)
+
+
+def test_purchases_written_by_deriving_the_month_reconcile() -> None:
+    account = an_account_with(1000)
+
+    for price in (500, 1200, 300):
+        account = record_a_purchase(
+            account, a_purchase_of(price), derive_the_month=True
+        )
+
+    assert account.total_this_month_cents == 2000
+    assert not reconcile_monthly_totals([account]).anything_disagrees
+
+
+def test_both_paths_agree_about_the_month() -> None:
+    account = an_account_with(1000, spent_this_month=0)
+    purchases = (a_purchase_of(500), a_purchase_of(700, this_month=False),
+                 a_purchase_of(250))
+
+    by_adding = account
+    by_deriving = account
+    for purchase in purchases:
+        by_adding = record_a_purchase(by_adding, purchase, derive_the_month=False)
+        by_deriving = record_a_purchase(by_deriving, purchase, derive_the_month=True)
+
+    assert (by_deriving.total_cents, by_deriving.total_this_month_cents) == (
+        by_adding.total_cents, by_adding.total_this_month_cents
+    )
