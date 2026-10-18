@@ -70,6 +70,11 @@ services:
         condition: service_healthy
     volumes:
       - sim-clock:/clock:ro
+      # Named, so the data directory belongs to the compose project rather than
+      # to the container. The image declares an anonymous volume for this path
+      # either way, and an anonymous one is orphaned every time the container is
+      # replaced. `down -v` still takes this with it.
+      - demo-app-unleash-postgres:/var/lib/postgresql/data
     environment:
       <<: *on-the-stacks-clock
       POSTGRES_USER: unleash
@@ -151,11 +156,16 @@ services:
   # The username here is the string Argus filters its own changes by, and Argus
   # holds that string separately - `UNLEASH_ACTOR` in its own repo. The two are
   # compared exactly, so they move together or not at all.
-  argus-token-seed:
+  demo-app-unleash-argus-token-seed:
     image: postgres:16
     depends_on:
       unleash:
         condition: service_healthy
+    # Only the image's `psql` is used, but the image still declares a data
+    # directory, and Docker would leave an empty volume behind for it on every
+    # run. In memory instead, so nothing outlives the step.
+    tmpfs:
+      - /var/lib/postgresql/data
     environment:
       PGPASSWORD: "unleash"
     command: >
@@ -183,11 +193,14 @@ services:
   #
   # `production` is the environment the Target Service keeps, and it exists in a
   # new project by default - so this moves with `UNLEASH_ENVIRONMENT` below.
-  fallback-flag-seed:
+  demo-app-unleash-fallback-flag-seed:
     image: postgres:16
     depends_on:
       unleash:
         condition: service_healthy
+    # In memory, for the reason the token seed's is.
+    tmpfs:
+      - /var/lib/postgresql/data
     environment:
       PGPASSWORD: "unleash"
     command: >
@@ -236,7 +249,10 @@ services:
     # a cache is the one store whose contents must *not* outlive the run that
     # staged them. An entry surviving into the next run is a stale figure nobody
     # staged, found by the integrity check, and reported as an incident of its
-    # own.
+    # own. In memory rather than left to the image, which declares a data
+    # directory and would orphan an anonymous volume on every run.
+    tmpfs:
+      - /data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -258,12 +274,12 @@ services:
       # --wait` sees exit and calls a failed startup. Declared as a completion
       # this service waits on, it becomes a step in bringing the environment up
       # rather than a container that died.
-      argus-token-seed:
+      demo-app-unleash-argus-token-seed:
         condition: service_completed_successfully
       # So the flag is already resting on by the time this service looks. Left
       # to race, the shop would find it missing and switch it on itself, which
       # is the recorded toggle the seed exists to avoid.
-      fallback-flag-seed:
+      demo-app-unleash-fallback-flag-seed:
         condition: service_completed_successfully
       # Not because the shop needs a cache - it recomputes when the cache holds
       # nothing or cannot be reached, and that fallback is load-bearing rather
@@ -322,3 +338,4 @@ volumes:
     driver_opts:
       type: tmpfs
       device: tmpfs
+  demo-app-unleash-postgres:
