@@ -16,9 +16,7 @@ catalogue rather than left to be inferred here.
 The shop does not retry and does not price the basket itself when the service
 is slow, and it says how long each call took.
 
-How the service is reached is the caller's to supply, for the reason the payment
-provider's is: the shop is rendered many times over to produce a minute of
-telemetry, and a socket per render would be thousands of them per read.
+How the service is reached is the caller's to supply.
 """
 
 from __future__ import annotations
@@ -51,8 +49,7 @@ class PricingAnswer:
     The duration is carried on the answer rather than timed by the shop, for the
     reason `ProviderAnswer` carries a status rather than raising on its own: what
     the shop observed about the call is the caller's to report, and turning it
-    into the shop's own words is this module's job. It is also what lets a minute
-    of telemetry be produced without a minute of waiting.
+    into the shop's own words is this module's job.
     """
 
     total_cents: int | None
