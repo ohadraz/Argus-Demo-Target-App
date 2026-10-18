@@ -742,10 +742,10 @@ THE_COMMIT_BEFORE_THAT_ONE = "70dbcfde2b549d110a3817d92d60b6dd9786e78b"
 # fix corpus expects to patch, and a deployed revision only has to be a commit
 # the change channel can compare against, not one the history leads to.
 THE_COMMIT_THAT_MOVED_THE_MONTH_BOUNDARY = (
-    "3398e10e131ea6c16f468f1bc1ac0fa6426d1b0c"
+    "383534e9bb182bb778e01fd22ba63f88885362e3"
 )
 THE_COMMIT_BEFORE_THE_MONTH_BOUNDARY_MOVED = (
-    "f0bcdb929bc6e89981742d03b02f36a40cd19ca0"
+    "65279ee05d2cfae49802712847428bc55e794bb3"
 )
 # The revision being rolled out when the rolling update was paused: the one that
 # changed the shape of what the summary cache stores. Constants for the reason
