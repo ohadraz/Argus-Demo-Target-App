@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from io_shop.accounts import Account, Purchase
-from io_shop.purchase_ledger import record_purchase
+from io_shop.purchase_ledger import record_a_purchase, record_purchase
 
 """Writing a purchase down, and moving the totals that describe it.
 
@@ -105,3 +107,25 @@ def test_a_shopper_with_no_history_can_be_written_to() -> None:
     recorded = record_purchase(a_new_shopper, a_purchase_of(500))
 
     assert (recorded.total_cents, recorded.total_this_month_cents) == (500, 500)
+
+
+@pytest.mark.parametrize("derive_the_month", [False, True])
+def test_either_write_path_moves_the_months_total(derive_the_month: bool) -> None:
+    # The stored month total is what the monthly average and statement read, so
+    # whichever path the rollout selects has to keep it in step with the
+    # purchases. Revision 26f1d7e's path left it behind for every shopper.
+    account = an_account_with(1000, spent_this_month=4000)
+
+    recorded = record_a_purchase(account, a_purchase_of(500), derive_the_month)
+
+    assert (recorded.total_cents, recorded.total_this_month_cents) == (1500, 4500)
+
+
+def test_the_deriving_path_leaves_the_month_alone_for_an_earlier_purchase() -> None:
+    account = an_account_with(1000, spent_this_month=4000)
+
+    recorded = record_a_purchase(
+        account, a_purchase_of(500, this_month=False), derive_the_month=True
+    )
+
+    assert (recorded.total_cents, recorded.total_this_month_cents) == (1500, 4000)
