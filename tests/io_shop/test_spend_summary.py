@@ -50,6 +50,38 @@ def test_the_lifetime_average_follows_the_purchases_not_the_carried_total() -> N
     assert average_spend_per_item(an_account_whose_total_drifted) == 2000
 
 
+class _CountedPurchase:
+    """A purchase that counts how often its price is read."""
+
+    reads = 0
+
+    def __init__(self, price_cents: int) -> None:
+        self._price_cents = price_cents
+        self.in_current_month = False
+
+    @property
+    def price_cents(self) -> int:
+        _CountedPurchase.reads += 1
+        return self._price_cents
+
+
+def test_the_lifetime_average_reads_each_purchase_once() -> None:
+    # This is the figure every page falls back to when the summary cache is
+    # unreachable, so its cost is what the whole shop pays during a cache
+    # outage. It must be one pass over the history, not one per purchase.
+    how_many = 1000
+    _CountedPurchase.reads = 0
+    a_long_history = Account(
+        shopper_id="shopper-with-a-long-history",
+        purchases=tuple(_CountedPurchase(100) for _ in range(how_many)),  # type: ignore[misc]
+        total_cents=100 * how_many,
+        total_this_month_cents=0,
+    )
+
+    assert average_spend_per_item(a_long_history) == 100
+    assert _CountedPurchase.reads <= how_many
+
+
 def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
     # The ordinary case for the monthly figure: a shopper who has bought
     # something this month, averaged over what they bought this month.
