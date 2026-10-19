@@ -17,13 +17,14 @@ disagree.
 
 The rates do not move. They are reference rates: published once on a working
 day, unchanged until the next one, and that is the shape the consumer's cache
-was built for. What does move is the day they are published on, so a demo run
-today gets today's date and the cache is exercised rather than sidestepped.
+was built for. What does move is the day they are published on - today's from
+the late afternoon in Frankfurt, the working day before's until then - so the
+cache is exercised rather than sidestepped.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any, Final
 
@@ -70,6 +71,13 @@ _QUOTED_PLACES: Final = Decimal("0.00001")
 # than for a day of its own choosing.
 _SATURDAY: Final = 5
 
+# When the ECB publishes a working day's rates, on Frankfurt's clock - "usually
+# updated at around 16:00 CET every working day" - and before which "the latest"
+# is the working day before's.
+_PUBLISHED_AT: Final = time(16, 0)
+
+_A_DAY: Final = timedelta(days=1)
+
 
 class UnknownBase(Exception):
     """A base no rate is published against.
@@ -79,12 +87,12 @@ class UnknownBase(Exception):
     """
 
 
-def rates_quoted_against(base: str, today: date | None = None) -> dict[str, Any]:
-    """The whole table, re-quoted against `base`, as of the last working day.
+def rates_quoted_against(base: str, now: datetime | None = None) -> dict[str, Any]:
+    """The whole table, re-quoted against `base`, as the last publication had it.
 
-    `today` is a parameter so a test can ask what a Sunday answers without
-    waiting for one. Left alone it is the real clock, because a demo watched by
-    a person should date its rates the day that person is watching.
+    `now` is a parameter so a test can ask what a Sunday or a Monday morning
+    answers without waiting for one. Left alone it is the clock, because a demo
+    watched by a person should date its rates as they would be dated then.
 
     The base itself is absent from the table, exactly as the provider leaves it
     out: it is always one of itself, and a row saying so is a rate somebody can
@@ -99,7 +107,7 @@ def rates_quoted_against(base: str, today: date | None = None) -> dict[str, Any]
     return {
         _AMOUNT: _ONE_UNIT,
         _BASE: quoted,
-        _PUBLISHED_ON: _the_last_working_day(today).isoformat(),
+        _PUBLISHED_ON: _the_last_publication(now or datetime.now(UTC)).isoformat(),
         _RATES: {
             currency: float((per_euro / per_base).quantize(_QUOTED_PLACES))
             for currency, per_euro in _PER_EURO.items()
@@ -108,12 +116,43 @@ def rates_quoted_against(base: str, today: date | None = None) -> dict[str, Any]
     }
 
 
-def _the_last_working_day(today: date | None) -> date:
-    """The day the rates standing now were published on.
+def _the_last_publication(now: datetime) -> date:
+    """The day the rates standing at `now` were published on.
 
-    A weekend answers Friday's, which is what the ECB means by the current rate
-    and what makes "the latest" a different question from "today's".
+    Today's once the publication hour has passed in Frankfurt, the working day
+    before until then, and Friday's over a weekend - which is what the ECB means
+    by the current rate, and what makes "the latest" a different question from
+    "today's". TARGET holidays, when the ECB publishes nothing either, are left
+    out: a fixture only has to be right on the days a demo runs.
     """
-    day = today or datetime.now(UTC).date()
+    in_frankfurt = _in_frankfurt(now)
+    day = in_frankfurt.date()
 
-    return day - timedelta(days=max(0, day.weekday() - _SATURDAY + 1))
+    if in_frankfurt.time() < _PUBLISHED_AT:
+        day -= _A_DAY
+
+    while day.weekday() >= _SATURDAY:
+        day -= _A_DAY
+
+    return day
+
+
+def _in_frankfurt(moment: datetime) -> datetime:
+    """`moment` on Frankfurt's wall clock: CET, and CEST from the last Sunday
+    of March to the last Sunday of October.
+
+    Worked out from the EU's rule rather than read from a time zone database,
+    so the shop needs none installed wherever it runs.
+    """
+    utc = moment.astimezone(UTC)
+    summer = _the_clocks_change(utc.year, 3) <= utc < _the_clocks_change(utc.year, 10)
+
+    return (utc + timedelta(hours=2 if summer else 1)).replace(tzinfo=None)
+
+
+def _the_clocks_change(year: int, month: int) -> datetime:
+    """01:00 UTC on the last Sunday of `month`, when every EU clock changes."""
+    last = date(year, month + 1, 1) - _A_DAY
+    sunday = last - timedelta(days=(last.weekday() + 1) % 7)
+
+    return datetime(sunday.year, sunday.month, sunday.day, 1, tzinfo=UTC)

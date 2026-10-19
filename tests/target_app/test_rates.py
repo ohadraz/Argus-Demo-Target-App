@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 
@@ -20,10 +20,21 @@ the cross rate has to be neither one nor zero, or a conversion that quietly did
 not happen would look exactly like one that did.
 """
 
-# Days the real provider publishes nothing on, and the Friday they answer with.
+# Days the real provider publishes nothing on, and the Friday they answer with -
+# in September, when Frankfurt keeps CEST, two hours ahead of UTC.
 A_SATURDAY = date(2026, 9, 12)
 A_SUNDAY = date(2026, 9, 13)
 THE_FRIDAY_BEFORE = date(2026, 9, 11)
+THE_MONDAY_AFTER = date(2026, 9, 14)
+# A working day in winter, when Frankfurt keeps CET, one hour ahead of UTC, and
+# the working day before it.
+A_WINTER_WEDNESDAY = date(2026, 12, 9)
+THE_TUESDAY_BEFORE = date(2026, 12, 8)
+
+
+def _at(day: date, hour: int, minute: int = 0) -> datetime:
+    """`day` at `hour`:`minute` UTC."""
+    return datetime(day.year, day.month, day.day, hour, minute, tzinfo=UTC)
 
 
 def test_the_envelope_is_the_providers_own() -> None:
@@ -81,14 +92,36 @@ def test_a_weekend_is_quoted_at_fridays_rates() -> None:
     # No rate is published on a Saturday, which is the whole reason the
     # consumer asks for "the latest" instead of naming a day itself.
     for weekend_day in (A_SATURDAY, A_SUNDAY):
-        answered = rates_quoted_against("USD", today=weekend_day)
+        for hour in (6, 20):
+            answered = rates_quoted_against("USD", now=_at(weekend_day, hour))
 
-        assert answered["date"] == THE_FRIDAY_BEFORE.isoformat()
+            assert answered["date"] == THE_FRIDAY_BEFORE.isoformat()
 
 
-def test_a_working_day_is_quoted_at_its_own_rates() -> None:
-    assert rates_quoted_against("USD", today=THE_FRIDAY_BEFORE)["date"] == (
+def test_a_working_day_is_quoted_at_its_own_rates_once_they_are_published() -> None:
+    # 14:30 UTC is 16:30 in Frankfurt in September.
+    assert rates_quoted_against("USD", now=_at(THE_FRIDAY_BEFORE, 14, 30))["date"] == (
         THE_FRIDAY_BEFORE.isoformat()
+    )
+
+
+def test_a_working_day_morning_is_quoted_at_the_working_day_befores_rates() -> None:
+    # The ECB publishes at around 16:00 in Frankfurt, so a postmortem written
+    # at 11:17 UTC cannot cite a rate published that day.
+    assert rates_quoted_against("USD", now=_at(THE_MONDAY_AFTER, 11, 17))["date"] == (
+        THE_FRIDAY_BEFORE.isoformat()
+    )
+
+
+@pytest.mark.parametrize(("hour", "published"), [
+    (14, THE_TUESDAY_BEFORE),
+    (15, A_WINTER_WEDNESDAY)
+], ids=["15:30-in-frankfurt", "16:30-in-frankfurt"])
+def test_the_publication_hour_is_frankfurts_in_winter_too(hour: int, published: date) -> None:
+    # CET in December, an hour ahead of UTC rather than two: 14:30 UTC is still
+    # before the rates are out there.
+    assert rates_quoted_against("USD", now=_at(A_WINTER_WEDNESDAY, hour, 30))["date"] == (
+        published.isoformat()
     )
 
 
