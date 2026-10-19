@@ -23,6 +23,10 @@ dependencies = [
     # Windows Smart App Control has refused before - at the cost of a whole
     # stack, for a speed-up nothing here would notice.
     "redis>=5.0",
+    # Frankfurt's clock, for the hour the rate stand-in's rates are published
+    # at. Linux images carry the zone database; Windows has none, and this one
+    # arrives there only through psycopg today - declared for the reason pyyaml is.
+    "tzdata>=2026.3; sys_platform == 'win32'",
     "uvicorn[standard]>=0.30",
 ]
 

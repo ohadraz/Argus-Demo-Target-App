@@ -27,6 +27,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any, Final
+from zoneinfo import ZoneInfo
 
 # Frankfurter's own response vocabulary, named here because this is the module
 # that writes it.
@@ -75,6 +76,7 @@ _SATURDAY: Final = 5
 # updated at around 16:00 CET every working day" - and before which "the latest"
 # is the working day before's.
 _PUBLISHED_AT: Final = time(16, 0)
+_FRANKFURT: Final = ZoneInfo("Europe/Berlin")
 
 _A_DAY: Final = timedelta(days=1)
 
@@ -125,7 +127,7 @@ def _the_last_publication(now: datetime) -> date:
     "today's". TARGET holidays, when the ECB publishes nothing either, are left
     out: a fixture only has to be right on the days a demo runs.
     """
-    in_frankfurt = _in_frankfurt(now)
+    in_frankfurt = now.astimezone(_FRANKFURT)
     day = in_frankfurt.date()
 
     if in_frankfurt.time() < _PUBLISHED_AT:
@@ -135,24 +137,3 @@ def _the_last_publication(now: datetime) -> date:
         day -= _A_DAY
 
     return day
-
-
-def _in_frankfurt(moment: datetime) -> datetime:
-    """`moment` on Frankfurt's wall clock: CET, and CEST from the last Sunday
-    of March to the last Sunday of October.
-
-    Worked out from the EU's rule rather than read from a time zone database,
-    so the shop needs none installed wherever it runs.
-    """
-    utc = moment.astimezone(UTC)
-    summer = _the_clocks_change(utc.year, 3) <= utc < _the_clocks_change(utc.year, 10)
-
-    return (utc + timedelta(hours=2 if summer else 1)).replace(tzinfo=None)
-
-
-def _the_clocks_change(year: int, month: int) -> datetime:
-    """01:00 UTC on the last Sunday of `month`, when every EU clock changes."""
-    last = date(year, month + 1, 1) - _A_DAY
-    sunday = last - timedelta(days=(last.weekday() + 1) % 7)
-
-    return datetime(sunday.year, sunday.month, sunday.day, 1, tzinfo=UTC)

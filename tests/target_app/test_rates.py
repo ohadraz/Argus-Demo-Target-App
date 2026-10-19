@@ -125,6 +125,18 @@ def test_the_publication_hour_is_frankfurts_in_winter_too(hour: int, published: 
     )
 
 
+@pytest.mark.parametrize(("now", "published"), [
+    (_at(date(2026, 3, 30), 14, 30), date(2026, 3, 30)),
+    (_at(date(2026, 10, 28), 14, 30), date(2026, 10, 27))
+], ids=["16:30-cest-after-the-march-change", "15:30-cet-after-the-october-change"])
+def test_the_publication_hour_follows_frankfurts_clocks_changing(now: datetime,
+                                                                 published: date) -> None:
+    # The clocks change on 29 March and 25 October 2026. A day either side of
+    # the wrong Sunday would read 14:30 UTC an hour off, and on the wrong side
+    # of the publication.
+    assert rates_quoted_against("USD", now=now)["date"] == published.isoformat()
+
+
 def test_a_base_nothing_is_quoted_against_is_refused() -> None:
     # The one failure a consumer can provoke, and what the route answers 404
     # to - which is the adapter's "the rates could not be read" path.
