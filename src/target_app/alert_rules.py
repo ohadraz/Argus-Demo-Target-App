@@ -43,6 +43,17 @@ INACTIVE: Final = "inactive"
 FOLDER_UID: Final = "io-shop"
 GROUP: Final = "io-shop-slos"
 
+# The dashboard each rule's panel is on. A Grafana rule has no field for the
+# unit its series is in; the panel it names does, so a rule is linked to one by
+# the two annotations Grafana links them with, and the panel says the unit.
+DASHBOARD_UID: Final = "io-shop-slos"
+DASHBOARD_TITLE: Final = "Io shop SLOs"
+
+# Grafana's unit ids for the two units the shop's series are in: milliseconds,
+# and a share of one.
+MILLISECONDS: Final = "ms"
+A_SHARE_OF_ONE: Final = "percentunit"
+
 # How a threshold compares, as Grafana's threshold expression names its
 # evaluator types.
 GT: Final = "gt"
@@ -64,6 +75,8 @@ class AlertRule:
     Reduce expression. `comparator` is which side of the threshold the rule
     fires on, in Grafana's evaluator vocabulary. `pending` is the rule's `for`:
     how long the condition has to hold before the rule fires rather than pends.
+    `panel` is the id of the dashboard panel the rule is linked to, and `unit`
+    the unit that panel shows its series in, as Grafana names a unit.
     """
 
     uid: str
@@ -76,6 +89,8 @@ class AlertRule:
     pending: timedelta = timedelta(0)
     keep_firing_for: timedelta = timedelta(0)
     interval: timedelta = _A_MINUTE
+    panel: int | None = None
+    unit: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,7 +122,9 @@ HIGH_ERROR_RATE: Final = AlertRule(
     # on this rule reads fifteen.
     threshold=0.10,
     range_minutes=1,
-    pending=timedelta(minutes=5)
+    pending=timedelta(minutes=5),
+    panel=1,
+    unit=A_SHARE_OF_ONE
 )
 # Two minutes, and the maximum over them, because one scenario on this rule is a
 # capacity that will not hold still: two slow minutes, one quick one, over and
@@ -119,7 +136,9 @@ HIGH_LATENCY_P95: Final = AlertRule(
     reduce="max",
     threshold=600.0,
     range_minutes=2,
-    pending=timedelta(minutes=5)
+    pending=timedelta(minutes=5),
+    panel=2,
+    unit=MILLISECONDS
 )
 HIGH_LATENCY_P50: Final = AlertRule(
     uid="io-shop-high-latency-p50",
@@ -128,7 +147,9 @@ HIGH_LATENCY_P50: Final = AlertRule(
     reduce="last",
     threshold=100.0,
     range_minutes=1,
-    pending=timedelta(minutes=5)
+    pending=timedelta(minutes=5),
+    panel=3,
+    unit=MILLISECONDS
 )
 # The maximum over two minutes for a different reason: the tail of a canary
 # serving three requests in a hundred is the third-slowest of six, and an
@@ -140,7 +161,9 @@ HIGH_LATENCY_P99: Final = AlertRule(
     reduce="max",
     threshold=500.0,
     range_minutes=2,
-    pending=timedelta(minutes=5)
+    pending=timedelta(minutes=5),
+    panel=4,
+    unit=MILLISECONDS
 )
 HIGH_MEMORY_USAGE: Final = AlertRule(
     uid="io-shop-high-memory-usage",
@@ -149,7 +172,9 @@ HIGH_MEMORY_USAGE: Final = AlertRule(
     reduce="last",
     threshold=0.6,
     range_minutes=1,
-    pending=timedelta(minutes=15)
+    pending=timedelta(minutes=15),
+    panel=5,
+    unit=A_SHARE_OF_ONE
 )
 # The long-window rule: the error rate averaged over ten minutes, against a
 # lower line. What it sees that the rule above cannot is a shop failing one
@@ -164,7 +189,9 @@ ERROR_RATE_SUSTAINED: Final = AlertRule(
     query=QUERIES["error_rate"],
     reduce="mean",
     threshold=0.025,
-    range_minutes=10
+    range_minutes=10,
+    panel=6,
+    unit=A_SHARE_OF_ONE
 )
 # The one rule here that fires below its line, because it watches a share the
 # shop wants high: how much of what was bought the categoriser filed with
@@ -181,7 +208,9 @@ CATEGORISATION_CONFIDENCE_LOW: Final = AlertRule(
     threshold=0.8,
     comparator=LT,
     range_minutes=2,
-    pending=timedelta(minutes=5)
+    pending=timedelta(minutes=5),
+    panel=7,
+    unit=A_SHARE_OF_ONE
 )
 # A share the shop wants low: how much of what was bought the fraud scorer held
 # for somebody to look at. A healthy minute holds about one purchase in twenty,
@@ -196,7 +225,9 @@ FRAUD_HOLDS_HIGH: Final = AlertRule(
     reduce="mean",
     threshold=0.1,
     range_minutes=2,
-    pending=timedelta(minutes=5)
+    pending=timedelta(minutes=5),
+    panel=8,
+    unit=A_SHARE_OF_ONE
 )
 
 SERIES_RULES: Final[Mapping[str, AlertRule]] = {
@@ -301,8 +332,14 @@ def _the_minute_of(row: Mapping[str, Any]) -> datetime:
 
 def a_definition(rule: AlertRule) -> dict[str, Any]:
     """The rule in the shape Grafana's provisioning API answers
-    `GET /api/v1/provisioning/alert-rules/{uid}` with."""
+    `GET /api/v1/provisioning/alert-rules/{uid}` with - linked to its panel by
+    the two annotations Grafana links a rule to a panel with, both strings."""
     seconds = rule.range_minutes * 60
+    annotations = (
+        {"__dashboardUid__": DASHBOARD_UID, "__panelId__": str(rule.panel)}
+        if rule.panel is not None
+        else {}
+    )
 
     return {
         "uid": rule.uid,
@@ -314,6 +351,7 @@ def a_definition(rule: AlertRule) -> dict[str, Any]:
         "keep_firing_for": _a_duration(rule.keep_firing_for),
         "noDataState": "NoData",
         "execErrState": "Error",
+        "annotations": annotations,
         "data": [
             {
                 "refId": "A",
@@ -348,6 +386,33 @@ def a_definition(rule: AlertRule) -> dict[str, Any]:
                 },
             },
         ],
+    }
+
+
+def a_dashboard(rules: Sequence[AlertRule]) -> dict[str, Any]:
+    """The dashboard the rules' panels are on, in the shape Grafana's
+    `GET /api/dashboards/uid/{uid}` answers: wrapped, a panel per rule, each
+    showing its rule's query in its rule's unit."""
+    return {
+        "dashboard": {
+            "uid": DASHBOARD_UID,
+            "title": DASHBOARD_TITLE,
+            "panels": [
+                {
+                    "id": rule.panel,
+                    "type": "timeseries",
+                    "title": rule.title,
+                    "targets": [{"refId": "A", "expr": rule.query}],
+                    "fieldConfig": {
+                        "defaults": {"unit": rule.unit} if rule.unit is not None else {},
+                        "overrides": []
+                    }
+                }
+                for rule in rules
+                if rule.panel is not None
+            ]
+        },
+        "meta": {"folderUid": FOLDER_UID, "slug": DASHBOARD_UID}
     }
 
 

@@ -20,6 +20,7 @@ from io_shop.visits import (
 from target_app import app as app_module
 from target_app.alert_rules import (
     CATEGORISATION_CONFIDENCE_LOW,
+    DASHBOARD_UID,
     ERROR_RATE_SUSTAINED,
     FOLDER_UID,
     GROUP,
@@ -339,6 +340,20 @@ def test_the_rule_definition_route_refuses_a_rule_it_does_not_hold(
     answer = client.get("/grafana/api/v1/provisioning/alert-rules/no-such-rule")
 
     assert answer.status_code == 404
+
+
+def test_the_dashboard_route_answers_the_rules_dashboard_wrapped_as_grafana_does(
+    client: TestClient
+) -> None:
+    answer = client.get(f"/grafana/api/dashboards/uid/{DASHBOARD_UID}")
+
+    assert answer.status_code == 200
+    assert answer.json()["dashboard"]["uid"] == DASHBOARD_UID
+    assert answer.json()["dashboard"]["panels"]
+
+
+def test_the_dashboard_route_refuses_a_dashboard_it_does_not_hold(client: TestClient) -> None:
+    assert client.get("/grafana/api/dashboards/uid/no-such-dashboard").status_code == 404
 
 
 def test_the_rule_group_route_answers_only_the_shops_group(client: TestClient) -> None:

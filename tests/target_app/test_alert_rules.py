@@ -14,6 +14,7 @@ from target_app.alert_rules import (
     LT,
     PENDING,
     SERIES_RULES,
+    a_dashboard,
     a_definition,
     a_rules_answer,
     last_evaluation_at,
@@ -271,3 +272,37 @@ def test_the_rescheduled_replica_pages_on_the_held_share_rule() -> None:
 
     assert the_rule_linked_from(alert) == FRAUD_HOLDS_HIGH.uid
     assert alert["labels"]["alertname"] == "FraudHoldsHigh"
+
+
+def test_every_rule_names_a_panel_on_the_shops_dashboard() -> None:
+    # Grafana's rule has no unit; the panel it names does. Linked by the two
+    # annotations Grafana links a rule to a panel with, both strings.
+    panels = {panel["id"] for panel in a_dashboard(list(SERIES_RULES.values()))["dashboard"][
+        "panels"]}
+
+    for rule in SERIES_RULES.values():
+        annotations = a_definition(rule)["annotations"]
+
+        assert annotations["__dashboardUid__"] == "io-shop-slos"
+        assert int(annotations["__panelId__"]) in panels
+
+
+def test_each_panel_shows_its_rules_series_in_the_unit_it_is_in() -> None:
+    # Latency in milliseconds, every other series a share of one - which is
+    # what a reader needs to set 0.899 beside an alert saying 80%.
+    units = {
+        panel["id"]: panel["fieldConfig"]["defaults"]["unit"]
+        for panel in a_dashboard(list(SERIES_RULES.values()))["dashboard"]["panels"]
+    }
+
+    assert units[HIGH_LATENCY_P95.panel] == "ms"
+    assert units[HIGH_ERROR_RATE.panel] == "percentunit"
+    assert units[CATEGORISATION_CONFIDENCE_LOW.panel] == "percentunit"
+    assert units[HIGH_MEMORY_USAGE.panel] == "percentunit"
+    assert units[FRAUD_HOLDS_HIGH.panel] == "percentunit"
+
+
+def test_no_two_rules_share_a_panel() -> None:
+    panels = [rule.panel for rule in SERIES_RULES.values()]
+
+    assert len(panels) == len(set(panels))

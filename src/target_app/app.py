@@ -1720,6 +1720,18 @@ def grafana_rule_group(folder_uid: str, group: str) -> JSONResponse:
     )
 
 
+@app.get("/grafana/api/dashboards/uid/{uid}")
+def grafana_dashboard(uid: str) -> JSONResponse:
+    """Stands in for Grafana's dashboard route: the one dashboard the rules'
+    panels are on, which is where each rule's unit is said."""
+    if uid != alert_rules.DASHBOARD_UID:
+        return JSONResponse(status_code=404, content={"message": "Dashboard not found"})
+
+    return JSONResponse(
+        content=alert_rules.a_dashboard(list(alert_rules.SERIES_RULES.values()))
+    )
+
+
 @app.get("/grafana/api/prometheus/grafana/api/v1/rules")
 def grafana_rules(rule_uid: str = Query(...)) -> JSONResponse:
     """Stands in for Grafana's `GET /api/prometheus/grafana/api/v1/rules`,
