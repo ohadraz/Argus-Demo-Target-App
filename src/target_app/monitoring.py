@@ -441,7 +441,7 @@ def _what_the_silence_said(unheard_from_since: datetime, at: datetime) -> str:
     return (
         f"No metrics received from io-shop since "
         f"{unheard_from_since.strftime(TIMESTAMP_FORMAT)} - {minutes}m with no "
-        f"sample, against a scrape interval of one minute. The series stopped "
+        f"sample, against a scrape interval of 15 seconds. The series stopped "
         f"rather than crossing a threshold, so nothing here says whether the "
         f"shop is well: these minutes have no readings to judge, not readings "
         f"that look bad."
