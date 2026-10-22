@@ -10,8 +10,7 @@
 #
 # The name here has to be the one `metrics.portName` in values-production.yaml
 # gives the port. Nothing checks that the two agree: a name that matches no port
-# is not an error to the operator, it is a target list with nothing in it, and
-# the shop goes on serving metrics nobody collects.
+# is not an error to the operator, it is a target list with nothing in it.
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:

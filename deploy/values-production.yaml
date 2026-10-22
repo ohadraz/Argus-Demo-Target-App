@@ -37,10 +37,7 @@ autoscaling:
 # what lets the number move without anything having to be re-pointed at it.
 #
 # The name is therefore load-bearing in a way the number is not. Nothing in the
-# shop reads it: the process serves the same endpoint whatever this says, and a
-# name nothing matches leaves a shop that is publishing perfectly well and a
-# scraper that has stopped collecting it. No request fails, no page slows, and
-# the only sign is that the series stops.
+# shop reads it.
 metrics:
   port: 9090
   portName: http-metrics
