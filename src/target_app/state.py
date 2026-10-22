@@ -205,9 +205,10 @@ def _the_decoys_quiet_state(scenario: Scenario) -> bool:
     return quiet_state_for(scenario.decoy_flag_role)
 
 
-# Clearing the flag provider's recorded history, injected so that a test can
-# watch a reset ask for it without a provider database to ask.
-HistoryEraser = Callable[[Sequence[str]], None]
+# Clearing the flag provider's recorded history - all of it, or what was recorded
+# from an instant on - injected so that a test can watch a reset or a staging ask
+# for it without a provider database to ask.
+HistoryEraser = Callable[[Sequence[str], datetime | None], None]
 
 # And moving a recorded change back to when it happened, injected for the same
 # reason. Its own seam rather than a flag on the eraser's: a reset erases and a
@@ -537,9 +538,14 @@ class ScenarioState:
         where something moved, so a seed onto an already-calm shop adds nothing
         to the history that the next investigation reads - and it makes the
         healthy-state-first step below a no-op, leaving the change that stages
-        the incident as the only one recorded.
+        the incident as the only one recorded. Where something did move, what
+        the put-back recorded is erased: it is the shop being made calm, which
+        comes before the incident rather than inside it, and a change left in
+        the log is a suspect nobody staged.
         """
+        calm_from = utc_now()
         self._put_the_flags_back_where_they_rest()
+        self._forget_what_the_flags_did(since=calm_from)
         # After the clearing, not before: it can take a moment for the provider
         # to agree a flag has moved, and an onset anchored ahead of that would
         # backdate the incident to before the world it starts from.
@@ -900,28 +906,25 @@ class ScenarioState:
         # The alternative is an audience watching a flat graph for five minutes
         # before anything is worth alerting on.
         onset = now - _how_long_ago_this_one_began(scenario)
-        # And the provider's log backdated with it, wherever a reader would
-        # otherwise see the change arrive after the incident it caused.
+        # And the provider's log backdated with it, or every reader sees the
+        # change arrive minutes after the incident it caused. An investigation
+        # looks for changes up to the onset, so a change dated after it is not
+        # found at all - and one that is found anyway, in a wider read, is a
+        # change that cannot have caused what began before it.
         #
-        # The onset above is moved back and the provider's own entry is not, so
-        # the two disagree by exactly that much in every scenario staged by a
-        # flag. Most can afford it: their incident is dated by a departure the
-        # metrics show, a change a few minutes either side of it still reads as
-        # the one that caused it, and no conclusion turns on the order.
+        # To the start of the onset's minute, not the onset itself. The onset
+        # falls partway through a minute, and the metrics date a departure to
+        # the minute it began, so a change dated to the second would still sit
+        # after the onset a reader measures. A real change comes just before its
+        # effect, and the minute's start is that instant.
         #
-        # The drifting total cannot. It is dated a week back by the shop's own
-        # check, so an unbackdated entry would sit a week from the onset and a
-        # consumer looking around the onset would find an empty window.
-        #
-        # The incident dated by an absence has the sharpest version of this
-        # problem - an entry recorded after the rows stop says the change cannot
-        # be what stopped them - and it is not answered here, because that
-        # scenario stages no flag at all. Its change is a deployment, and the
-        # history a deployment lands in is the platform's.
-        if scenario.drifts_the_monthly_total:
-            self._backdate_the_flag_history(
-                [self._flags_for(scenario).name], onset, now
-            )
+        # The decoy with it, to the same instant, for the reason it is staged
+        # in the same breath above.
+        self._backdate_the_flag_history(
+            self._the_flags_staged_by(scenario),
+            onset.replace(second=0, microsecond=0),
+            now,
+        )
         self._active = ActiveScenario(
             scenario=scenario,
             seeded_at=now,
@@ -1747,15 +1750,25 @@ class ScenarioState:
 
         self._forget_what_the_flags_did()
 
-    def _forget_what_the_flags_did(self) -> None:
-        """Clears both flags' recorded history, whichever one was staged.
+    def _forget_what_the_flags_did(self, since: datetime | None = None) -> None:
+        """Clears both flags' recorded history, whichever one was staged - all
+        of it, or only what was recorded from `since` on.
 
         Both, for the reason the flags themselves are both put back: a run
         abandoned by a restart left changes behind under a flag this service no
         longer remembers staging, and a history cleared by halves is a history
         the next investigation still finds something in.
         """
-        self._forget_the_flag_history([self._flags.name, self._fallback_flags.name])
+        self._forget_the_flag_history(
+            [self._flags.name, self._fallback_flags.name], since
+        )
+
+    def _the_flags_staged_by(self, scenario: Scenario) -> list[str]:
+        """The names of the flags staging `scenario` moved: its own, and its
+        decoy where it has one."""
+        decoy = self._decoy_flags_for(scenario)
+
+        return [self._flags_for(scenario).name] + ([decoy.name] if decoy else [])
 
     def _set_flag_for(self, scenario: Scenario, enabled: bool) -> None:
         _set(self._flags_for(scenario), enabled)

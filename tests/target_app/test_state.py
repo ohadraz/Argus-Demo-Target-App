@@ -101,7 +101,7 @@ def a_scenario_state(
     the real one reaches the provider's own database, so a reset here would go
     looking for a database no unit test has. Backdating it is stubbed for exactly
     that second reason - it reaches the same database - and defaulted because only
-    the scenario whose onset is days old ever asks for it.
+    the cases about the history ever look at what it was asked.
     """
     return ScenarioState(
         flags,
@@ -398,7 +398,7 @@ def test_resetting_clears_what_the_provider_recorded_about_both_flags() -> None:
     a_scenario_state(flags, fallback_flags, forget_the_flag_history).reset()
 
     forget_the_flag_history.assert_called_once_with(
-        ["monthly-spend-feature", "legacy-checkout-fallback"]
+        ["monthly-spend-feature", "legacy-checkout-fallback"], None
     )
 
 
@@ -1678,19 +1678,87 @@ def test_staging_it_records_the_flag_change_when_the_change_happened() -> None:
 
     flags, at, since = backdate.call_args.args
     assert flags == [state._flags.name]
-    assert at == present(present(state.active).timeline).turned_on_at
+    assert at == the_start_of_the_minute_of(
+        present(present(state.active).timeline).turned_on_at
+    )
     assert since > at
 
 
-def test_staging_any_other_scenario_backdates_no_history() -> None:
-    # Every other onset is minutes old, so the provider's log is already close
-    # enough and a rewrite would be a fixture editing an audit trail for nothing.
+def the_start_of_the_minute_of(instant: datetime) -> datetime:
+    return instant.replace(second=0, microsecond=0)
+
+
+def test_staging_a_flag_scenario_records_the_change_at_the_start_of_its_onset_minute() -> None:
+    # The onset is minutes old and the provider wrote the change just now, so
+    # left alone it sits after the onset, outside the window an investigation
+    # reads changes in. The minute's start rather than the onset to the second,
+    # because the metrics date the onset to its minute.
     backdate = Mock()
-    state = a_scenario_state(
-        a_flag_client_reporting(True), backdate_the_flag_history=backdate
-    )
+    flags = a_flag_client_reporting(True)
+    flags.name = "monthly-spend-feature"
+    state = a_scenario_state(flags, backdate_the_flag_history=backdate)
 
     state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
+
+    named, at, since = backdate.call_args.args
+    assert named == ["monthly-spend-feature"]
+    assert at == the_start_of_the_minute_of(
+        present(present(state.active).timeline).turned_on_at
+    )
+    assert since > at
+
+
+def test_staging_a_decoy_records_it_changing_at_the_same_instant_as_the_staged_flag() -> None:
+    # Staged in the same breath so that nothing tells the two apart by time;
+    # backdated by halves, the decoy would be minutes newer than the change.
+    backdate = Mock()
+    flags = a_flag_client_reporting(False)
+    flags.name = "monthly-spend-feature"
+    fallback_flags = a_flag_client_reporting(False)
+    fallback_flags.name = "legacy-checkout-fallback"
+    state = a_scenario_state(flags, fallback_flags, backdate_the_flag_history=backdate)
+
+    state.seed(SCENARIOS[COMPETING_FLAG_CHANGES])
+
+    backdate.assert_called_once()
+    named, _, _ = backdate.call_args.args
+    assert named == ["legacy-checkout-fallback", "monthly-spend-feature"]
+
+
+def test_staging_forgets_what_putting_the_flags_back_recorded_and_nothing_before() -> None:
+    # The put-back is the shop being made calm before the incident. Left in
+    # the log it is a change inside the window an investigation reads, which
+    # nobody staged - and what was recorded before the staging began happened
+    # when it happened.
+    forget = Mock()
+    backdate = Mock()
+    flags = a_flag_client_reporting(True)
+    flags.name = "monthly-spend-feature"
+    fallback_flags = a_flag_client_reporting(True)
+    fallback_flags.name = "legacy-checkout-fallback"
+    before = utc_now()
+
+    a_scenario_state(flags, fallback_flags, forget, backdate).seed(
+        SCENARIOS[FEATURE_FLAG_TOGGLE]
+    )
+
+    forget.assert_called_once()
+    named, since = forget.call_args.args
+    _, _, staged_from = backdate.call_args.args
+    assert named == ["monthly-spend-feature", "legacy-checkout-fallback"]
+    assert since is not None
+    assert before <= since <= staged_from
+
+
+def test_staging_a_scenario_no_flag_stages_backdates_no_history() -> None:
+    # Its change is a deployment or another company's outage, and the flags'
+    # history holds nothing it staged.
+    backdate = Mock()
+    state = a_scenario_state(
+        a_flag_client_reporting(False), backdate_the_flag_history=backdate
+    )
+
+    state.seed(SCENARIOS[UPSTREAM_DEPENDENCY_FAILURE])
 
     backdate.assert_not_called()
 
