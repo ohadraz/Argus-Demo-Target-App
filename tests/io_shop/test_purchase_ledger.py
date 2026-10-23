@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from io_shop.accounts import Account, Purchase
-from io_shop.purchase_ledger import record_purchase
+from io_shop.purchase_ledger import record_a_purchase, record_purchase
+from io_shop.spend_reconciliation import reconcile_monthly_totals
 
 """Writing a purchase down, and moving the totals that describe it.
 
@@ -105,3 +108,41 @@ def test_a_shopper_with_no_history_can_be_written_to() -> None:
     recorded = record_purchase(a_new_shopper, a_purchase_of(500))
 
     assert (recorded.total_cents, recorded.total_this_month_cents) == (500, 500)
+
+
+def test_the_derive_the_month_path_still_moves_the_stored_month_total() -> None:
+    # Every reader - the account page, the statement, the reconciliation - reads
+    # the stored month total. A write path that leaves it behind is the incident
+    # of 2026-10-15: totals that silently disagree with the purchases.
+    account = an_account_with(1000, spent_this_month=4000)
+
+    recorded = record_a_purchase(account, a_purchase_of(500), derive_the_month=True)
+
+    assert (recorded.total_cents, recorded.total_this_month_cents) == (1500, 4500)
+
+
+def test_the_derive_the_month_path_leaves_an_earlier_months_purchase_out() -> None:
+    account = an_account_with(1000, spent_this_month=4000)
+
+    recorded = record_a_purchase(
+        account, a_purchase_of(500, this_month=False), derive_the_month=True
+    )
+
+    assert recorded.total_this_month_cents == 4000
+
+
+@pytest.mark.parametrize("derive_the_month", [False, True])
+def test_either_write_path_leaves_totals_that_reconcile(derive_the_month: bool) -> None:
+    account = Account(
+        shopper_id="shopper-in-either-cohort",
+        purchases=(),
+        total_cents=0,
+        total_this_month_cents=0,
+    )
+
+    for price, this_month in [(500, True), (700, False), (1200, True)]:
+        account = record_a_purchase(
+            account, a_purchase_of(price, this_month=this_month), derive_the_month
+        )
+
+    assert not reconcile_monthly_totals([account]).anything_disagrees
