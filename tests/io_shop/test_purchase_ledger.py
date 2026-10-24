@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from io_shop.accounts import Account, Purchase
-from io_shop.purchase_ledger import record_purchase
+from io_shop.purchase_ledger import record_a_purchase, record_purchase
+from io_shop.spend_reconciliation import reconcile_monthly_totals
 
 """Writing a purchase down, and moving the totals that describe it.
 
@@ -105,3 +108,47 @@ def test_a_shopper_with_no_history_can_be_written_to() -> None:
     recorded = record_purchase(a_new_shopper, a_purchase_of(500))
 
     assert (recorded.total_cents, recorded.total_this_month_cents) == (500, 500)
+
+
+# Whichever path the rollout selects, the account it writes must still agree with
+# itself: the page and the reconciliation both read the stored monthly total.
+
+
+@pytest.mark.parametrize("derive_the_month", [False, True])
+def test_every_write_path_leaves_the_month_agreeing_with_the_purchases(
+        derive_the_month: bool) -> None:
+    account = an_account_with(1000, 2000)
+
+    for purchase in (a_purchase_of(500), a_purchase_of(700, this_month=False),
+                     a_purchase_of(300)):
+        account = record_a_purchase(account, purchase, derive_the_month)
+
+    assert account.total_this_month_cents == 800
+    assert account.total_cents == 4500
+    assert not reconcile_monthly_totals([account]).anything_disagrees
+
+
+@pytest.mark.parametrize("derive_the_month", [False, True])
+def test_an_earlier_months_purchase_moves_no_months_figure_on_either_path(
+        derive_the_month: bool) -> None:
+    account = record_a_purchase(an_account_with(1000), a_purchase_of(400), derive_the_month)
+
+    recorded = record_a_purchase(
+        account, a_purchase_of(500, this_month=False), derive_the_month
+    )
+
+    assert recorded.total_this_month_cents == 400
+
+
+def test_deriving_the_month_corrects_a_total_that_had_already_drifted() -> None:
+    drifted = Account(
+        shopper_id="shopper-whose-total-fell-behind",
+        purchases=(Purchase(price_cents=900, in_current_month=True),),
+        total_cents=900,
+        total_this_month_cents=0,
+    )
+
+    recorded = record_a_purchase(drifted, a_purchase_of(100), derive_the_month=True)
+
+    assert recorded.total_this_month_cents == 1000
+    assert not reconcile_monthly_totals([recorded]).anything_disagrees
