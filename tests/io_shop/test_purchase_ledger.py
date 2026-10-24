@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from io_shop.accounts import Account, Purchase
-from io_shop.purchase_ledger import record_purchase
+from io_shop.purchase_ledger import record_a_purchase, record_purchase
+from io_shop.spend_reconciliation import reconcile_monthly_totals
 
 """Writing a purchase down, and moving the totals that describe it.
 
@@ -105,3 +106,32 @@ def test_a_shopper_with_no_history_can_be_written_to() -> None:
     recorded = record_purchase(a_new_shopper, a_purchase_of(500))
 
     assert (recorded.total_cents, recorded.total_this_month_cents) == (500, 500)
+
+
+def test_the_derive_the_month_path_still_moves_the_stored_month_total() -> None:
+    # The account still carries the month's total, so the rollout's write path
+    # must not stop moving it.
+    account = an_account_with(1000, spent_this_month=4000)
+
+    recorded = record_a_purchase(account, a_purchase_of(500), derive_the_month=True)
+
+    assert (recorded.total_cents, recorded.total_this_month_cents) == (1500, 4500)
+
+
+def test_the_derive_the_month_path_leaves_the_month_alone_for_an_older_purchase() -> None:
+    account = an_account_with(1000, spent_this_month=4000)
+
+    recorded = record_a_purchase(
+        account, a_purchase_of(500, this_month=False), derive_the_month=True
+    )
+
+    assert (recorded.total_cents, recorded.total_this_month_cents) == (1500, 4000)
+
+
+def test_writes_through_either_path_leave_nothing_for_reconciliation_to_find() -> None:
+    account = an_account_with(1000)
+
+    for price, derive in ((500, True), (700, False), (129731, True)):
+        account = record_a_purchase(account, a_purchase_of(price), derive_the_month=derive)
+
+    assert not reconcile_monthly_totals([account]).anything_disagrees
