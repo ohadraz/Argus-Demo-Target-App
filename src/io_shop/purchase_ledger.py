@@ -53,21 +53,16 @@ def record_purchase(account: Account, purchase: Purchase) -> Account:
 
 def record_purchase_deriving_the_month(account: Account,
                                        purchase: Purchase) -> Account:
-    """The same account, without the month's total being moved.
+    """The account with this purchase written into it, and both totals moved.
 
-    One total to carry instead of two, which is the saving: a month is not
-    something the shop has to keep a figure for. Every purchase says which month
-    it falls in, so what a shopper has spent this month adds up from the history
-    whenever anybody wants it - exactly as the lifetime average is derived from the
-    purchases rather than read off the account (see
-    `io_shop.spend_summary.average_spend_per_item`). Keeping a second copy of a
-    figure the purchases already hold is the work this path exists to drop.
+    This path once left the month's total where it was, on the theory that the
+    month could be added up from the history instead. But the account still
+    carries `total_this_month_cents`, and a write that moves the history without
+    moving it leaves the stored total short by the price of every purchase this
+    month. So this path records exactly as `record_purchase` does, and the two
+    sides of the rollout write the same totals.
     """
-    return replace(
-        account,
-        purchases=(*account.purchases, purchase),
-        total_cents=account.total_cents + purchase.price_cents
-    )
+    return record_purchase(account, purchase)
 
 
 def record_a_purchase(account: Account,
