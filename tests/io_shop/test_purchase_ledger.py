@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from io_shop.accounts import Account, Purchase
-from io_shop.purchase_ledger import record_purchase
+from io_shop.purchase_ledger import record_a_purchase, record_purchase
+from io_shop.spend_reconciliation import reconcile_monthly_totals
 
 """Writing a purchase down, and moving the totals that describe it.
 
@@ -105,3 +106,46 @@ def test_a_shopper_with_no_history_can_be_written_to() -> None:
     recorded = record_purchase(a_new_shopper, a_purchase_of(500))
 
     assert (recorded.total_cents, recorded.total_this_month_cents) == (500, 500)
+
+
+def test_the_rollout_path_moves_the_months_stored_total() -> None:
+    # The monthly-spend-feature incident: with the flag on, purchases were
+    # written without moving the month's stored total.
+    account = an_account_with(1000, spent_this_month=4000)
+
+    recorded = record_a_purchase(account, a_purchase_of(500), derive_the_month=True)
+
+    assert (recorded.total_cents, recorded.total_this_month_cents) == (1500, 4500)
+
+
+def test_the_rollout_path_leaves_the_month_alone_for_an_earlier_months_purchase() -> None:
+    account = an_account_with(1000, spent_this_month=4000)
+
+    recorded = record_a_purchase(
+        account, a_purchase_of(500, this_month=False), derive_the_month=True
+    )
+
+    assert (recorded.total_cents, recorded.total_this_month_cents) == (1500, 4000)
+
+
+def test_the_rollout_path_leaves_nothing_for_the_reconciliation_to_find() -> None:
+    account = Account(
+        shopper_id="shopper-in-the-rollout",
+        purchases=(),
+        total_cents=0,
+        total_this_month_cents=0,
+    )
+
+    for price in (500, 1250, 129731):
+        account = record_a_purchase(account, a_purchase_of(price), derive_the_month=True)
+
+    assert not reconcile_monthly_totals([account]).anything_disagrees
+
+
+def test_both_rollout_paths_write_the_same_account() -> None:
+    account = an_account_with(1000, 2000, spent_this_month=0)
+    purchase = a_purchase_of(750)
+
+    assert record_a_purchase(account, purchase, derive_the_month=True) == (
+        record_a_purchase(account, purchase, derive_the_month=False)
+    )
