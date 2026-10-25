@@ -115,5 +115,11 @@ MODELS: Final[Mapping[str, CategoriserModel]] = {
 
 
 def categorise(title: str, model: CategoriserModel) -> Categorisation:
-    """Where `model` files a purchase with this title."""
-    return model.predict(title.split())
+    """Where `model` files a purchase with this title.
+
+    Words are lowercased here, before any model sees them, the way the training
+    pipeline lowercased every title the vocabularies were built from. A model that
+    no longer folds case itself (v2) would otherwise miss every capitalised word
+    and file the purchase under `UNCATEGORISED` without a single error to show it.
+    """
+    return model.predict([word.lower() for word in title.split()])
