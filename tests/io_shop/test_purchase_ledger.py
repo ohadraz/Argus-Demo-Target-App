@@ -3,7 +3,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from io_shop.accounts import Account, Purchase
-from io_shop.purchase_ledger import record_purchase
+from io_shop.purchase_ledger import (
+    record_a_purchase,
+    record_purchase,
+    record_purchase_deriving_the_month,
+)
+from io_shop.spend_reconciliation import reconcile_monthly_totals
 
 """Writing a purchase down, and moving the totals that describe it.
 
@@ -105,3 +110,54 @@ def test_a_shopper_with_no_history_can_be_written_to() -> None:
     recorded = record_purchase(a_new_shopper, a_purchase_of(500))
 
     assert (recorded.total_cents, recorded.total_this_month_cents) == (500, 500)
+
+
+def a_shopper_who_bought_this_month(*prices: int) -> Account:
+    """A shopper whose stored month total agrees with this month's purchases."""
+    return Account(
+        shopper_id="shopper-buying-this-month",
+        purchases=tuple(
+            Purchase(price_cents=price, in_current_month=True) for price in prices
+        ),
+        total_cents=sum(prices),
+        total_this_month_cents=sum(prices),
+    )
+
+
+def test_deriving_the_month_still_moves_the_stored_month_total() -> None:
+    # The path that derives the month must leave the stored field saying what
+    # the purchases say.
+    account = a_shopper_who_bought_this_month(1000, 2000)
+
+    recorded = record_purchase_deriving_the_month(account, a_purchase_of(500))
+
+    assert (recorded.total_cents, recorded.total_this_month_cents) == (3500, 3500)
+
+
+def test_the_rollout_path_moves_the_month_total_too() -> None:
+    account = a_shopper_who_bought_this_month(1000)
+
+    recorded = record_a_purchase(account, a_purchase_of(500), derive_the_month=True)
+
+    assert recorded.total_this_month_cents == 1500
+
+
+def test_deriving_the_month_ignores_an_earlier_months_purchase() -> None:
+    account = a_shopper_who_bought_this_month(1000)
+
+    recorded = record_a_purchase(
+        account, a_purchase_of(500, this_month=False), derive_the_month=True
+    )
+
+    assert (recorded.total_cents, recorded.total_this_month_cents) == (1500, 1000)
+
+
+def test_either_path_leaves_nothing_for_the_reconciliation_to_find() -> None:
+    account = a_shopper_who_bought_this_month(1000, 2000)
+
+    written = [
+        record_a_purchase(account, a_purchase_of(500), derive_the_month=derive)
+        for derive in (False, True)
+    ]
+
+    assert not reconcile_monthly_totals(written).anything_disagrees
