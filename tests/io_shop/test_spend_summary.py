@@ -67,6 +67,22 @@ def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
     assert average_spend_per_item_this_month(an_active_shopper) == 3000
 
 
+def test_the_monthly_average_is_zero_for_a_shopper_who_bought_nothing_this_month() -> None:
+    # The case the monthly-spend-feature rollout met in production: a shopper
+    # with a history but no purchases this month. Nothing spent this month is
+    # nothing per item, not a division by zero.
+    account = an_account_with_no_purchases_this_month(1000, 3000)
+
+    assert average_spend_per_item_this_month(account) == 0
+
+
+def test_the_page_renders_the_monthly_summary_for_a_shopper_idle_this_month() -> None:
+    # The same shopper through the page's own entry point with the rollout on.
+    account = an_account_with_no_purchases_this_month(1000, 3000)
+
+    assert render_spend_summary(account, use_monthly_summary=True) == 0
+
+
 def test_the_page_takes_the_stable_summary_when_the_rollout_is_off() -> None:
     account = an_account_with_no_purchases_this_month(1000, 3000)
 
