@@ -56,6 +56,7 @@ from target_app.scenarios import (
     FEATURE_FLAG_TOGGLE,
     SCENARIOS,
     TIMESTAMP_FORMAT,
+    TYPICAL_PURCHASE_FLAG,
     Scenario,
     bucket_id,
     description_for,
@@ -139,7 +140,28 @@ fallback_flags = FlagClient(
         update={"flag": get_unleash_settings().fallback_flag}
     )
 )
-state = ScenarioState(flags, fallback_flags)
+# The third flag is the typical-purchase figure's, a feature with a flag of its
+# own, and a client of its own for the reason the fallback has one.
+typical_purchase_flags = FlagClient(
+    settings=get_unleash_settings().model_copy(
+        update={"flag": get_unleash_settings().typical_purchase_flag}
+    )
+)
+state = ScenarioState(flags, fallback_flags, typical_purchase_flags)
+
+
+def _the_shops_flags_by_role() -> tuple[tuple[FlagClient, str], ...]:
+    """Every flag the shop has, each with its role, in the shop's own order."""
+    return (
+        (flags, FEATURE_FLAG),
+        (fallback_flags, FALLBACK_FLAG),
+        (typical_purchase_flags, TYPICAL_PURCHASE_FLAG),
+    )
+
+
+def _the_flag_in(flag_role: str) -> str:
+    """The name of the shop's flag in `flag_role`."""
+    return next(client.name for client, role in _the_shops_flags_by_role() if role == flag_role)
 
 
 @asynccontextmanager
@@ -152,16 +174,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     started by hand has no such promise, and crash-looping against a provider
     that is thirty seconds from ready helps nobody.
 
-    Both flags, because the shop has two and the console shows both. Leaving
-    the second to be created by the one scenario that stages it meant a
-    provider that had never heard of it, and a page reporting an absent flag as
-    an off one - the two are indistinguishable through an evaluation endpoint,
-    which lists only what is on.
+    Every flag, because the console shows every one. Leaving one to be created
+    by the scenario that stages it meant a provider that had never heard of it,
+    and a page reporting an absent flag as an off one - the two are
+    indistinguishable through an evaluation endpoint, which lists only what is
+    on.
     """
     flags.wait_until_reachable()
     flags.ensure_only_one_environment()
 
-    for client, role in ((flags, FEATURE_FLAG), (fallback_flags, FALLBACK_FLAG)):
+    for client, role in _the_shops_flags_by_role():
         _bring_into_being(client, role)
 
     yield
@@ -756,15 +778,15 @@ def _the_families_offered(offered: list[Scenario]) -> list[ScenarioFamilySummary
 
 
 def _the_shops_flags() -> list[FlagState]:
-    """Both of the shop's flags and what each reads, whatever is staged.
+    """Every one of the shop's flags and what each reads, whatever is staged.
 
-    Always both, and always in the same order, so a badge does not move about
+    Always every one, and always in the same order, so a badge does not move about
     the page as scenarios come and go. An unreachable provider reports `False`
     rather than failing: this feeds a status line, and a page that will not
     render because a checkbox could not be filled in is worse than one that
     renders with the checkbox clear.
     """
-    return [_the_state_of(client) for client in (flags, fallback_flags)]
+    return [_the_state_of(client) for client, _ in _the_shops_flags_by_role()]
 
 
 def _the_flags_in_play_for(scenario: Scenario) -> list[ScenarioFlag]:
@@ -801,8 +823,8 @@ def _the_flags_in_play_for(scenario: Scenario) -> list[ScenarioFlag]:
         breaking_position[scenario.decoy_flag_role] = None
 
     return [
-        ScenarioFlag(name=name, breaks_when_on=breaking_position[role])
-        for role, name in ((FEATURE_FLAG, flags.name), (FALLBACK_FLAG, fallback_flags.name))
+        ScenarioFlag(name=client.name, breaks_when_on=breaking_position[role])
+        for client, role in _the_shops_flags_by_role()
         if role in breaking_position
     ]
 
@@ -2244,7 +2266,6 @@ def _the_window_now() -> list[GeneratedMinute]:
     timeline, up_to = window
     active = state.active
     scenario = active.scenario if active else SCENARIOS[FEATURE_FLAG_TOGGLE]
-    settings = get_unleash_settings()
 
     if scenario.flaps_after_revert and timeline is not None:
         timeline = with_relapses(timeline, up_to)
@@ -2253,11 +2274,7 @@ def _the_window_now() -> list[GeneratedMinute]:
         timeline,
         up_to,
         GENERATED_SPAN_MINUTES,
-        flag=(
-            settings.fallback_flag
-            if scenario.flag_role == FALLBACK_FLAG
-            else settings.flag
-        ),
+        flag=_the_flag_in(scenario.flag_role),
         breaks_when_flag_is_on=scenario.breaks_when_flag_is_on,
         decoy_flag=_the_decoy_flag(scenario),
         decoy_timeline=state.decoy_timeline_now(),
@@ -2331,13 +2348,7 @@ def _the_decoy_flag(scenario: Scenario) -> str | None:
     if scenario.decoy_flag_role is None:
         return None
 
-    settings = get_unleash_settings()
-
-    return (
-        settings.fallback_flag
-        if scenario.decoy_flag_role == FALLBACK_FLAG
-        else settings.flag
-    )
+    return _the_flag_in(scenario.decoy_flag_role)
 
 
 def _authored_log_lines(scenario: Scenario, seeded_at: datetime | None) -> list[str]:

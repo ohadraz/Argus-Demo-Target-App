@@ -61,9 +61,12 @@ class ScenarioMinute:
 
 # Which flag stages a generated scenario. `FEATURE` is the new feature that
 # breaks when it is switched on; `FALLBACK` is the safe path that breaks when
-# it is switched off.
+# it is switched off; `TYPICAL_PURCHASE` is the typical-purchase figure, a
+# feature of its own with a flag of its own, as every feature a real shop rolls
+# out has.
 FEATURE_FLAG = "feature"
 FALLBACK_FLAG = "fallback"
+TYPICAL_PURCHASE_FLAG = "typical-purchase"
 
 
 def quiet_state_for(flag_role: str | None) -> bool:
@@ -86,15 +89,19 @@ def quiet_state_for(flag_role: str | None) -> bool:
 def description_for(flag_role: str | None) -> str:
     """What the flag is for, in the words the provider's own console shows.
 
-    Two flags with two stories, and both are read by a human standing in front
-    of Unleash during a demo. Kept here beside the role rather than in the flag
-    client, which is scoped to one flag and has no way to know which it holds.
+    Three flags with three stories, and each is read by a human standing in
+    front of Unleash during a demo. Kept here beside the role rather than in the
+    flag client, which is scoped to one flag and has no way to know which it
+    holds.
     """
     if flag_role == FALLBACK_FLAG:
         return (
             "Keeps account pages on the old, safe renderer - on for months, "
             "and the shop's fault is exposed when it is withdrawn"
         )
+
+    if flag_role == TYPICAL_PURCHASE_FLAG:
+        return "The shopper's typical purchase on the account page, rolling out"
 
     return "Average spend per item this month - the demo's seeded fault"
 
@@ -1027,7 +1034,7 @@ SCENARIOS: dict[str, Scenario] = {
             "Io's account page is getting a third figure: the shopper's "
             "typical purchase - the middle of their history rather than the "
             "average, so one expensive buy stops distorting it. It ships "
-            "behind 'monthly-spend-feature' at three percent of traffic. The "
+            "behind 'typical-purchase-feature' at three percent of traffic. The "
             "figure is right every time. What is wrong is how it is worked "
             "out: the code takes the cheapest purchase that is left, over and "
             "over, until the middle remains, so it walks the history once per "
@@ -1045,6 +1052,7 @@ SCENARIOS: dict[str, Scenario] = {
             "bring back."
         ),
         family=THE_TAIL,
+        flag_role=TYPICAL_PURCHASE_FLAG,
         rollout_is_slow=True,
     ),
     MONTHLY_STATEMENT_PANEL: Scenario(

@@ -114,6 +114,9 @@ class UnleashSettings(BaseSettings):
     # backwards, because one flag cannot honestly be both a new feature and the
     # fallback that protects against it.
     fallback_flag: str = Field(default="legacy-checkout-fallback")
+    # The typical-purchase figure's own flag. A feature rolled out behind its
+    # own flag is what a real shop ships, and the code it switches on names it.
+    typical_purchase_flag: str = Field(default="typical-purchase-feature")
     admin_token: str = Field(default="*:*.argus-demo-admin-token")
     frontend_token: str = Field(default="default:production.argus-demo-frontend-token")
     # The provider's own database, which a reset clears the flag history in -

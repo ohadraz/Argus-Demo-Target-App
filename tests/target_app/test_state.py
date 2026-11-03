@@ -90,12 +90,15 @@ def a_scenario_state(
     fallback_flags: Mock | None = None,
     forget_the_flag_history: Mock | None = None,
     backdate_the_flag_history: Mock | None = None,
+    typical_purchase_flags: Mock | None = None,
 ) -> ScenarioState:
-    """A state object whose second flag nobody is looking at.
+    """A state object whose other flags nobody is looking at.
 
-    Most cases here stage the feature flag, and the fallback flag only has to
-    exist for them - so it is defaulted rather than restated, and named
-    explicitly by the cases that are actually about it.
+    Most cases here stage the feature flag, and the fallback and typical-purchase
+    flags only have to exist for them - so they are defaulted rather than
+    restated, and named explicitly by the cases that are actually about them.
+    The typical-purchase flag rests off and is named, so a case reading every
+    flag's name finds it among them.
 
     Clearing the flag history is stubbed for the same reason, and for one more:
     the real one reaches the provider's own database, so a reset here would go
@@ -106,9 +109,17 @@ def a_scenario_state(
     return ScenarioState(
         flags,
         fallback_flags or a_flag_client_reporting(True),
+        typical_purchase_flags or a_typical_purchase_flag_reporting(False),
         forget_the_flag_history or Mock(),
         backdate_the_flag_history or Mock(),
     )
+
+
+def a_typical_purchase_flag_reporting(enabled: bool) -> Mock:
+    """The typical-purchase figure's flag, by the name the shop gives it."""
+    flags = a_flag_client_reporting(enabled)
+    flags.name = "typical-purchase-feature"
+    return flags
 
 
 def the_first_whole_minute_after(moment: datetime) -> datetime:
@@ -383,7 +394,7 @@ def test_resetting_clears_the_scenario_and_the_flag() -> None:
     assert flags.disable.call_count == disables_before_the_reset + 1
 
 
-def test_resetting_clears_what_the_provider_recorded_about_both_flags() -> None:
+def test_resetting_clears_what_the_provider_recorded_about_every_flag() -> None:
     # The half of a reset that putting the flags back does not do. The
     # provider's log is what an investigation reads when it asks what recently
     # changed, so toggles left in it from the run just finished - and the
@@ -398,7 +409,8 @@ def test_resetting_clears_what_the_provider_recorded_about_both_flags() -> None:
     a_scenario_state(flags, fallback_flags, forget_the_flag_history).reset()
 
     forget_the_flag_history.assert_called_once_with(
-        ["monthly-spend-feature", "legacy-checkout-fallback"], None
+        ["monthly-spend-feature", "legacy-checkout-fallback", "typical-purchase-feature"],
+        None,
     )
 
 
@@ -1164,9 +1176,13 @@ def a_staged_slow_rollout(flags: Mock | None = None) -> ScenarioState:
 
     A flag scenario like the first four, so the flag is reported on from the
     start and the staging turns it on exactly as those do. What is different is
-    only what the requests it reaches cost.
+    the flag - the typical-purchase figure's own, which `flags` stands in for -
+    and what the requests it reaches cost.
     """
-    state = a_scenario_state(flags or a_flag_client_reporting(True))
+    state = a_scenario_state(
+        a_flag_client_reporting(False),
+        typical_purchase_flags=flags or a_typical_purchase_flag_reporting(True),
+    )
     state.seed(SCENARIOS[SLOW_CANARY_ROLLOUT])
 
     return state
@@ -1708,6 +1724,25 @@ def test_staging_a_flag_scenario_records_the_change_at_the_start_of_its_onset_mi
     assert since > at
 
 
+def test_the_slow_rollout_is_staged_on_the_typical_purchase_figure_s_own_flag() -> None:
+    # The typical-purchase figure is a feature of its own, so it goes out behind
+    # a flag of its own - and the monthly-spend flag, which ships other features,
+    # is left where it rests.
+    backdate = Mock()
+    flags = a_flag_client_reporting(False)
+    flags.name = "monthly-spend-feature"
+    typical_purchase_flags = a_typical_purchase_flag_reporting(False)
+    state = a_scenario_state(flags, backdate_the_flag_history=backdate,
+                             typical_purchase_flags=typical_purchase_flags)
+
+    state.seed(SCENARIOS[SLOW_CANARY_ROLLOUT])
+
+    named, _, _ = backdate.call_args.args
+    assert named == ["typical-purchase-feature"]
+    assert typical_purchase_flags.enable.called
+    assert not flags.enable.called
+
+
 def test_staging_a_decoy_records_it_changing_at_the_same_instant_as_the_staged_flag() -> None:
     # Staged in the same breath so that nothing tells the two apart by time;
     # backdated by halves, the decoy would be minutes newer than the change.
@@ -1745,7 +1780,9 @@ def test_staging_forgets_what_putting_the_flags_back_recorded_and_nothing_before
     forget.assert_called_once()
     named, since = forget.call_args.args
     _, _, staged_from = backdate.call_args.args
-    assert named == ["monthly-spend-feature", "legacy-checkout-fallback"]
+    assert named == [
+        "monthly-spend-feature", "legacy-checkout-fallback", "typical-purchase-feature"
+    ]
     assert since is not None
     assert before <= since <= staged_from
 

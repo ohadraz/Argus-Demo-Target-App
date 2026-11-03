@@ -61,6 +61,7 @@ from target_app.integrity import (
 from target_app.scenarios import (
     FALLBACK_FLAG,
     FEATURE_FLAG,
+    TYPICAL_PURCHASE_FLAG,
     Scenario,
     description_for,
     quiet_state_for,
@@ -453,6 +454,7 @@ class ScenarioState:
         self,
         flags: FlagClient,
         fallback_flags: FlagClient,
+        typical_purchase_flags: FlagClient,
         forget_the_flag_history: HistoryEraser = forget_the_changes_to,
         backdate_the_flag_history: HistoryBackdater = (
             record_the_change_as_having_happened_at
@@ -460,6 +462,7 @@ class ScenarioState:
     ) -> None:
         self._flags = flags
         self._fallback_flags = fallback_flags
+        self._typical_purchase_flags = typical_purchase_flags
         self._forget_the_flag_history = forget_the_flag_history
         self._backdate_the_flag_history = backdate_the_flag_history
         self._active: ActiveScenario | None = None
@@ -487,28 +490,30 @@ class ScenarioState:
         # reports from then on came up then.
         self._pods_replaced_at: datetime | None = None
 
-    def _flags_for(self, scenario: Scenario) -> FlagClient:
+    def _the_shops_flags(self) -> tuple[tuple[FlagClient, str], ...]:
+        """Every flag the shop has, each with its role, in the shop's order."""
         return (
-            self._fallback_flags
-            if scenario.flag_role == FALLBACK_FLAG
-            else self._flags
+            (self._flags, FEATURE_FLAG),
+            (self._fallback_flags, FALLBACK_FLAG),
+            (self._typical_purchase_flags, TYPICAL_PURCHASE_FLAG),
         )
+
+    def _client_in(self, flag_role: str) -> FlagClient:
+        return next(client for client, role in self._the_shops_flags() if role == flag_role)
+
+    def _flags_for(self, scenario: Scenario) -> FlagClient:
+        return self._client_in(scenario.flag_role)
 
     def _decoy_flags_for(self, scenario: Scenario) -> FlagClient | None:
         """The client for the scenario's decoy flag, if it stages one.
 
-        The decoy is always the flag the staged one is not - there are two in
-        this shop, and a decoy that was the same flag would be the change it is
-        supposed to be mistaken for.
+        The decoy is always a flag the staged one is not - a decoy that was the
+        same flag would be the change it is supposed to be mistaken for.
         """
         if scenario.decoy_flag_role is None:
             return None
 
-        return (
-            self._fallback_flags
-            if scenario.decoy_flag_role == FALLBACK_FLAG
-            else self._flags
-        )
+        return self._client_in(scenario.decoy_flag_role)
 
     @property
     def active(self) -> ActiveScenario | None:
@@ -1443,7 +1448,7 @@ class ScenarioState:
         _set(client, not _the_decoys_quiet_state(scenario))
 
     def _put_the_flags_back_where_they_rest(self) -> None:
-        """Both flags to their resting positions - the feature off, the fallback
+        """Every flag to its resting position - the features off, the fallback
         on - whatever this service believes it staged.
 
         Whatever it believes, because the belief is the part that goes missing.
@@ -1463,10 +1468,7 @@ class ScenarioState:
         scenario moves its own flag straight after this, and that call is not
         forgiving. What is skipped here is only the housekeeping.
         """
-        for client, role in (
-            (self._flags, FEATURE_FLAG),
-            (self._fallback_flags, FALLBACK_FLAG),
-        ):
+        for client, role in self._the_shops_flags():
             try:
                 _set(client, quiet_state_for(role))
             except FlagProviderUnavailable:
@@ -1482,7 +1484,7 @@ class ScenarioState:
         self._moments = []
         self._last_seen = {}
 
-        for client in (self._flags, self._fallback_flags):
+        for client, _ in self._the_shops_flags():
             try:
                 self._last_seen[client.name] = client.is_enabled()
             except Exception:
@@ -1605,13 +1607,13 @@ class ScenarioState:
         return active.scrape_outage.began_at.replace(second=0, microsecond=0)
 
     def observe_the_flags(self) -> list[FlagMoment]:
-        """Reads both flags and records any that have moved since the last look.
+        """Reads every flag and records any that have moved since the last look.
 
         On the read path, like every other reconciliation here, and for the same
         reason: nobody announces a flag change to this service, so the only
         moment it can find out is the moment somebody asks it something.
 
-        Both flags every time, not only the staged one. An agent working an
+        Every flag every time, not only the staged one. An agent working an
         ambiguous incident will change a flag that turns out to be innocent and
         then change it back, and those two moments are the most interesting
         things on the page - they are the whole of what "it tried something,
@@ -1624,7 +1626,7 @@ class ScenarioState:
         if self._active is None:
             return []
 
-        for client in (self._flags, self._fallback_flags):
+        for client, _ in self._the_shops_flags():
             try:
                 enabled = client.is_enabled()
             except Exception:
@@ -1751,16 +1753,16 @@ class ScenarioState:
         self._forget_what_the_flags_did()
 
     def _forget_what_the_flags_did(self, since: datetime | None = None) -> None:
-        """Clears both flags' recorded history, whichever one was staged - all
+        """Clears every flag's recorded history, whichever one was staged - all
         of it, or only what was recorded from `since` on.
 
-        Both, for the reason the flags themselves are both put back: a run
+        Every one, for the reason the flags themselves are all put back: a run
         abandoned by a restart left changes behind under a flag this service no
-        longer remembers staging, and a history cleared by halves is a history
-        the next investigation still finds something in.
+        longer remembers staging, and a history cleared in part is a history the
+        next investigation still finds something in.
         """
         self._forget_the_flag_history(
-            [self._flags.name, self._fallback_flags.name], since
+            [client.name for client, _ in self._the_shops_flags()], since
         )
 
     def _the_flags_staged_by(self, scenario: Scenario) -> list[str]:

@@ -5,6 +5,9 @@ average is dragged around by a single expensive buy - one laptop among twenty
 coffees averages to a figure describing neither - so the page offers the middle
 of the history instead: the price as many purchases sit below as above.
 
+`typical-purchase-feature` decides whether a request gets this figure, and a
+request that does not get it renders the figure it rendered before.
+
 The figure it produces is right for every history the shop has. What it is not
 is cheap, and the cost follows the shape of the code rather than anything it is
 waiting on.

@@ -91,23 +91,35 @@ RESTART_ACTION_PATH = "/argocd/io-shop/resource/actions/v2"
 
 
 def _the_catalogs_own_clients_replaced_by(
-    flags: FlagClient, fallback_flags: FlagClient
-) -> tuple[FlagClient, FlagClient]:
-    """Points the two clients the catalogue reads at these, and answers the two
-    it was reading.
+    flags: FlagClient, fallback_flags: FlagClient, typical_purchase_flags: FlagClient
+) -> tuple[FlagClient, FlagClient, FlagClient]:
+    """Points the clients the catalogue reads at these, and answers the ones it
+    was reading.
 
     The state object is not the only way into the provider: the catalogue reads
-    both flags through the module's own clients, to report their live state
+    every flag through the module's own clients, to report their live state
     whatever is staged. Replacing the state alone left those aimed at a provider
-    no test here runs, so every catalogue request spent two four-second failed
-    connects to answer `None` - which is the same answer an unreachable provider
-    is supposed to give, so the suite was correct and two and a half times
-    slower, and stayed that way until somebody timed it.
+    no test here runs, so every catalogue request spent a four-second failed
+    connect per flag to answer `None` - which is the same answer an unreachable
+    provider is supposed to give, so the suite was correct and two and a half
+    times slower, and stayed that way until somebody timed it.
     """
-    was = app_module.flags, app_module.fallback_flags
-    app_module.flags, app_module.fallback_flags = flags, fallback_flags
+    was = app_module.flags, app_module.fallback_flags, app_module.typical_purchase_flags
+    app_module.flags, app_module.fallback_flags, app_module.typical_purchase_flags = (
+        flags, fallback_flags, typical_purchase_flags
+    )
 
     return was
+
+
+def a_flag_client_named(name: str, enabled: bool) -> Mock:
+    """A provider holding one flag, reading `enabled` and never moved."""
+    client = Mock(spec=FlagClient)
+    client.is_enabled.return_value = enabled
+    client.last_moved_at.return_value = None
+    client.name = name
+
+    return client
 
 
 @pytest.fixture
@@ -118,22 +130,21 @@ def client() -> Iterator[TestClient]:
     configured: what these cases are about is what the endpoints do, and a
     scenario staged over a real provider would be about the provider.
     """
-    flags = Mock(spec=FlagClient)
-    flags.is_enabled.return_value = False
-    flags.last_moved_at.return_value = None
-    flags.name = "monthly-spend-feature"
-    fallback_flags = Mock(spec=FlagClient)
-    fallback_flags.is_enabled.return_value = True
-    fallback_flags.last_moved_at.return_value = None
-    fallback_flags.name = "legacy-checkout-fallback"
+    flags = a_flag_client_named("monthly-spend-feature", enabled=False)
+    fallback_flags = a_flag_client_named("legacy-checkout-fallback", enabled=True)
+    typical_purchase_flags = a_flag_client_named("typical-purchase-feature", enabled=False)
 
     was = app_module.state
     # Both of the provider's history seams stubbed, for one reason: each reaches
     # the provider's own database, which no test here has. One clears the log on a
     # reset; the other backdates a staging toggle to when the change it stages
     # actually happened.
-    app_module.state = ScenarioState(flags, fallback_flags, Mock(), Mock())
-    was_read_directly = _the_catalogs_own_clients_replaced_by(flags, fallback_flags)
+    app_module.state = ScenarioState(
+        flags, fallback_flags, typical_purchase_flags, Mock(), Mock()
+    )
+    was_read_directly = _the_catalogs_own_clients_replaced_by(
+        flags, fallback_flags, typical_purchase_flags
+    )
     forget_every_visit()
 
     yield TestClient(app)
@@ -828,29 +839,28 @@ A_CALM_ERROR_RATE = 0.05
 
 @pytest.fixture
 def a_shop_whose_flag_is_on() -> Iterator[TestClient]:
-    """The service with its feature flag reading on, for one test.
+    """The service with the typical-purchase flag reading on, for one test.
 
     The `client` fixture's provider answers off, which is the *healthy* state
-    for a scenario staged through the feature flag - so a rollout seeded against
-    it reconciles to recovered on the first read and the window holds no slow
+    for a scenario staged through that flag - so a rollout seeded against it
+    reconciles to recovered on the first read and the window holds no slow
     minutes to compare. This one answers where seeding left it.
     """
-    flags = Mock(spec=FlagClient)
-    flags.is_enabled.return_value = True
-    flags.last_moved_at.return_value = None
-    flags.name = "monthly-spend-feature"
-    fallback_flags = Mock(spec=FlagClient)
-    fallback_flags.is_enabled.return_value = True
-    fallback_flags.last_moved_at.return_value = None
-    fallback_flags.name = "legacy-checkout-fallback"
+    flags = a_flag_client_named("monthly-spend-feature", enabled=False)
+    fallback_flags = a_flag_client_named("legacy-checkout-fallback", enabled=True)
+    typical_purchase_flags = a_flag_client_named("typical-purchase-feature", enabled=True)
 
     was = app_module.state
     # Both of the provider's history seams stubbed, for one reason: each reaches
     # the provider's own database, which no test here has. One clears the log on a
     # reset; the other backdates a staging toggle to when the change it stages
     # actually happened.
-    app_module.state = ScenarioState(flags, fallback_flags, Mock(), Mock())
-    was_read_directly = _the_catalogs_own_clients_replaced_by(flags, fallback_flags)
+    app_module.state = ScenarioState(
+        flags, fallback_flags, typical_purchase_flags, Mock(), Mock()
+    )
+    was_read_directly = _the_catalogs_own_clients_replaced_by(
+        flags, fallback_flags, typical_purchase_flags
+    )
     forget_every_visit()
 
     yield TestClient(app)
