@@ -215,10 +215,10 @@ class FlagClient:
         where it belongs; one that was already there is somebody else's
         business, and may be sitting mid-incident.
 
-        The description is the caller's because this shop has two flags with
-        two different stories, and a client scoped to one flag has no way to
-        tell which. Both are read by a human in the provider's own console
-        during a demo, so the wrong one is a wrong answer on screen.
+        The description is the caller's because each of this shop's flags has
+        a story of its own, and a client scoped to one flag has no way to tell
+        which. Each is read by a human in the provider's own console during a
+        demo, so the wrong one is a wrong answer on screen.
         """
         existing = self._find_flag()
         created = existing is None

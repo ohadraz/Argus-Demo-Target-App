@@ -1397,10 +1397,11 @@ def generate(timeline: FlagTimeline | None,
     it moves it in both directions.
 
     `ships_the_statement` says which feature the flag is shipping this time.
-    The shop has one feature flag and several scenarios behind it: most ship
-    the monthly summary, one ships the typical purchase, and this one ships the
-    monthly statement panel. Left unsaid, the flag ships the summary, which is
-    what it shipped before there was anything else to choose.
+    The monthly-spend flag has several scenarios behind it: most ship the
+    monthly summary, and this one ships the monthly statement panel - the
+    typical purchase ships behind a flag of its own. Left unsaid, the flag ships
+    the summary, which is what it shipped before there was anything else to
+    choose.
 
     It changes no figure this generator reports. The statement breaks for the
     same shoppers the summary breaks for - a month with nothing bought in it
@@ -1409,7 +1410,7 @@ def generate(timeline: FlagTimeline | None,
     shop's log names as having raised the failure, and that file is the whole
     of what the scenario is for.
 
-    `ships_the_incremental_write` is the fourth thing the one flag can ship, and
+    `ships_the_incremental_write` is the third thing that flag can ship, and
     the only one that is not on the read path at all: a cheaper way of writing a
     purchase down, which stopped keeping a shopper's monthly total in step with
     their purchases. So it changes nothing here, deliberately and completely. No
@@ -2638,12 +2639,12 @@ def _serve_one_account_page(
 
     `the_flag_ships_the_slow_feature`, `the_flag_ships_the_statement` and
     `the_flag_ships_the_incremental_write` say which feature the flag is
-    shipping, because the shop has one flag and several scenarios behind it. Most
-    ship the monthly summary, whose divisor is empty for a shopper who has bought
-    nothing this month; one ships the typical purchase, which is correct for
-    everybody and merely slow; one ships the monthly statement panel, which
-    breaks for exactly the shoppers the summary breaks for and does it in a far
-    larger file.
+    shipping. The monthly-spend flag has several scenarios behind it: most ship
+    the monthly summary, whose divisor is empty for a shopper who has bought
+    nothing this month; one ships the monthly statement panel, which breaks for
+    exactly the shoppers the summary breaks for and does it in a far larger
+    file. The typical purchase, which is correct for everybody and merely slow,
+    ships behind a flag of its own.
 
     The last of them is not on this path at all, and is named here only to be
     kept off it. What that flag ships is a cheaper way of *writing a purchase
@@ -2691,10 +2692,11 @@ def _serve_one_account_page(
         or the_flag_ships_the_statement
         or the_flag_ships_the_incremental_write
     )
-    # The third thing the one flag can ship. Same cohort as the monthly summary
-    # and the same shoppers break it - a month with nothing bought in it has no
-    # largest purchase any more than it has an average - but the fault is in a
-    # different file, and which file is the whole reason this scenario exists.
+    # The second thing the monthly-spend flag can ship. Same cohort as the
+    # monthly summary and the same shoppers break it - a month with nothing
+    # bought in it has no largest purchase any more than it has an average - but
+    # the fault is in a different file, and which file is the whole reason this
+    # scenario exists.
     # See `io_shop.monthly_statement`.
     use_monthly_statement = in_the_canary and the_flag_ships_the_statement
     provider_refused = (
