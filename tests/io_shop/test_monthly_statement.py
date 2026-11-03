@@ -31,6 +31,14 @@ stop raising would leave that scenario staging nothing at all.
 MARCH = period_for(3, 2026)
 
 
+class _CountedHistory(tuple):
+    """A purchase history that counts how many times it is walked."""
+
+    def __iter__(self):
+        self.walks = getattr(self, "walks", 0) + 1
+        return super().__iter__()
+
+
 def a_shopper_who_bought_this_month() -> Account:
     return Account(
         shopper_id="shopper-with-a-month",
@@ -77,6 +85,47 @@ def test_a_month_with_nothing_in_it_fails_rather_than_reporting_zero() -> None:
     # months it can describe.
     with pytest.raises(ValueError):
         render_monthly_statement(a_shopper_who_bought_nothing_this_month(), MARCH)
+
+
+def test_a_statement_walks_the_history_once() -> None:
+    # The statement runs on every page the rollout reaches, and a shopper's
+    # history grows without bound. Walking it once per figure made the panel's
+    # cost a multiple of the whole history - the tail of the page's latency.
+    history = _CountedHistory(
+        [Purchase(price_cents=700 + index, in_current_month=index % 50 == 0)
+         for index in range(5_000)]
+    )
+    in_month = [purchase for purchase in tuple.__iter__(history)
+                if purchase.in_current_month]
+    account = Account(
+        shopper_id="shopper-with-a-long-history",
+        purchases=history,
+        total_cents=sum(purchase.price_cents for purchase in tuple.__iter__(history)),
+        total_this_month_cents=sum(purchase.price_cents for purchase in in_month),
+    )
+
+    statement = render_monthly_statement(account, MARCH)
+
+    assert statement.purchase_count == len(in_month)
+    assert history.walks == 1
+
+
+def test_the_bands_and_categories_hold_what_the_month_bought() -> None:
+    statement = render_monthly_statement(a_shopper_who_bought_this_month(), MARCH)
+
+    bands = {summary.band.label: (summary.purchase_count, summary.total_cents)
+             for summary in statement.bands}
+    categories = {summary.name: (summary.purchase_count, summary.total_cents)
+                  for summary in statement.categories}
+
+    assert bands["£5 to £20"] == (1, 1200)
+    assert bands["£20 to £50"] == (1, 3300)
+    assert bands["£50 to £100"] == (1, 6400)
+    assert bands["Under £5"] == (0, 0)
+    assert categories["Books"] == (1, 1200)
+    assert categories["Home"] == (1, 6400)
+    assert categories["Garden"] == (1, 3300)
+    assert categories["Groceries"] == (0, 0)
 
 
 def test_the_breakdowns_add_up_to_the_headline() -> None:
