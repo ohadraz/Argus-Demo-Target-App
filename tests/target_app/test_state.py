@@ -1694,21 +1694,16 @@ def test_staging_it_records_the_flag_change_when_the_change_happened() -> None:
 
     flags, at, since = backdate.call_args.args
     assert flags == [state._flags.name]
-    assert at == the_start_of_the_minute_of(
-        present(present(state.active).timeline).turned_on_at
-    )
+    assert at == present(present(state.active).timeline).turned_on_at
     assert since > at
 
 
-def the_start_of_the_minute_of(instant: datetime) -> datetime:
-    return instant.replace(second=0, microsecond=0)
-
-
-def test_staging_a_flag_scenario_records_the_change_at_the_start_of_its_onset_minute() -> None:
+def test_staging_a_flag_scenario_records_the_change_at_the_instant_the_flag_turned_on() -> None:
     # The onset is minutes old and the provider wrote the change just now, so
     # left alone it sits after the onset, outside the window an investigation
-    # reads changes in. The minute's start rather than the onset to the second,
-    # because the metrics date the onset to its minute.
+    # reads changes in. To the second the timeline turns the flag on, as a real
+    # provider logs it: dated to its minute's start, a change late in a minute
+    # read a whole minute before the break it caused.
     backdate = Mock()
     flags = a_flag_client_reporting(True)
     flags.name = "monthly-spend-feature"
@@ -1718,9 +1713,7 @@ def test_staging_a_flag_scenario_records_the_change_at_the_start_of_its_onset_mi
 
     named, at, since = backdate.call_args.args
     assert named == ["monthly-spend-feature"]
-    assert at == the_start_of_the_minute_of(
-        present(present(state.active).timeline).turned_on_at
-    )
+    assert at == present(present(state.active).timeline).turned_on_at
     assert since > at
 
 

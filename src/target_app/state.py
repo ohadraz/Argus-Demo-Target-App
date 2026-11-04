@@ -917,17 +917,17 @@ class ScenarioState:
         # found at all - and one that is found anyway, in a wider read, is a
         # change that cannot have caused what began before it.
         #
-        # To the start of the onset's minute, not the onset itself. The onset
-        # falls partway through a minute, and the metrics date a departure to
-        # the minute it began, so a change dated to the second would still sit
-        # after the onset a reader measures. A real change comes just before its
-        # effect, and the minute's start is that instant.
+        # To the instant the timeline turns the flag on, to the second, as a
+        # real provider logs it. Dated to the start of its minute instead, a
+        # change late in a minute the shop barely broke read a whole minute
+        # before the onset the metrics measure, and a write-up explained a gap
+        # that never was.
         #
         # The decoy with it, to the same instant, for the reason it is staged
         # in the same breath above.
         self._backdate_the_flag_history(
             self._the_flags_staged_by(scenario),
-            onset.replace(second=0, microsecond=0),
+            onset,
             now,
         )
         self._active = ActiveScenario(

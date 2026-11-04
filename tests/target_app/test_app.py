@@ -73,7 +73,7 @@ from target_app.scenarios import (
     TIMESTAMP_FORMAT,
     UPSTREAM_DEPENDENCY_FAILURE,
 )
-from target_app.settings import the_deployed_replica_count
+from target_app.settings import get_scenario_settings, the_deployed_replica_count
 from target_app.state import ScenarioState
 
 """The service's own endpoints, asked the way anybody actually asks them.
@@ -663,6 +663,22 @@ def test_a_generated_scenario_can_carry_a_deploy(client: TestClient) -> None:
     history = client.get("/argocd/io-shop").json()["status"]["history"]
 
     assert len(history) == 2
+
+
+def test_a_generated_scenario_s_deploy_is_dated_to_the_second_it_landed(
+    client: TestClient
+) -> None:
+    # As a deployment platform logs one. Dated to the start of its minute, a
+    # deploy late in a minute it barely broke read a whole minute before the
+    # onset the metrics measure, and a write-up explained a gap that never was.
+    a_staged_cache_misconfiguration(client)
+
+    seeded_at = datetime.fromisoformat(client.get("/scenario/status").json()["seeded_at"])
+    landed = client.get("/argocd/io-shop").json()["status"]["history"][-1]["deployedAt"]
+
+    assert landed == (
+        seeded_at - timedelta(minutes=get_scenario_settings().onset_backdate_minutes)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def test_a_generated_scenario_staging_no_deploy_still_reports_none(

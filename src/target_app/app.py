@@ -104,6 +104,11 @@ def to_bucket_id(moment: datetime) -> str:
     """One instant as the minute id every other channel spells it with."""
     return moment.replace(second=0, microsecond=0).strftime(TIMESTAMP_FORMAT)
 
+
+def to_the_second(moment: datetime) -> str:
+    """One instant as a platform logs an event: to the second."""
+    return moment.strftime(TIMESTAMP_FORMAT)
+
 # What the platform calls the pricing service. The one application name this
 # file reads rather than echoing back, because restarting the wrong process is
 # the mistake this scenario is built to catch - see
@@ -2167,12 +2172,15 @@ def _the_revision_history() -> list[ArgoCdRevisionHistory]:
             )
         )
 
+        # To the second, as a deployment platform logs one. Dated to the start
+        # of its minute, a deploy late in a minute it barely broke read a whole
+        # minute before the onset the metrics measure.
         return [
             ArgoCdRevisionHistory(
                 id=1,
                 revision=active.scenario.deploy.previous_revision,
-                deployedAt=to_bucket_id(landed - _A_PREVIOUS_DEPLOY_AGO),
-                deployStartedAt=to_bucket_id(
+                deployedAt=to_the_second(landed - _A_PREVIOUS_DEPLOY_AGO),
+                deployStartedAt=to_the_second(
                     landed - _A_PREVIOUS_DEPLOY_AGO - timedelta(minutes=1)
                 ),
                 source=ArgoCdSource(
@@ -2185,8 +2193,8 @@ def _the_revision_history() -> list[ArgoCdRevisionHistory]:
             ArgoCdRevisionHistory(
                 id=2,
                 revision=active.scenario.deploy.revision,
-                deployedAt=to_bucket_id(landed),
-                deployStartedAt=to_bucket_id(landed - timedelta(minutes=1)),
+                deployedAt=to_the_second(landed),
+                deployStartedAt=to_the_second(landed - timedelta(minutes=1)),
                 source=ArgoCdSource(
                     repoURL=active.scenario.deploy.repo_url,
                     path=active.scenario.deploy.path,
