@@ -144,10 +144,19 @@ def a_page_of_charges(buckets: list[Any],
                     and order >= resume_after[1]):
                 continue
 
+            charge = _a_charge(minute, order, taken)
+
+            # Inside the window to the second, as the provider bounds `created`.
+            # Walked by whole minutes, a window's first and last minutes listed
+            # charges from before its start and after its end, and a consumer
+            # summing it counted seconds it never asked for.
+            if not started_at.timestamp() <= charge["created"] <= ended_at.timestamp():
+                continue
+
             if len(page) == limit:
                 return page, True
 
-            page.append(_a_charge(minute, order, taken))
+            page.append(charge)
 
         minute -= timedelta(minutes=1)
 

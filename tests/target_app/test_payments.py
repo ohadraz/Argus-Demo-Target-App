@@ -33,8 +33,9 @@ Nothing here needs the app, a provider or a clock.
 SOME_MINUTE = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
 
 # Exactly the reported minute, so a count below is that minute's orders and not
-# also the ordinary trade of the minutes either side of it.
-JUST_THAT_MINUTE = (SOME_MINUTE, SOME_MINUTE)
+# also the ordinary trade of the minutes either side of it. To its last second,
+# since the window is bounded to the second, as the provider bounds it.
+JUST_THAT_MINUTE = (SOME_MINUTE, SOME_MINUTE + timedelta(seconds=59))
 
 SOME_VOLUME = 1_000
 NOTHING_FAILED = 0.0
@@ -165,6 +166,33 @@ def test_minutes_outside_the_window_are_not_charged_for() -> None:
         < int((SOME_MINUTE + timedelta(minutes=1)).timestamp())
         for charge in charges
     )
+
+
+def test_a_window_ending_inside_a_minute_lists_no_charge_after_its_end() -> None:
+    # Stripe's `created[lte]` is a second, inclusive. Walked by whole minutes,
+    # the window's last minute was listed in full, and a loss summed from it
+    # counted the takings of seconds nobody asked for.
+    a_window = (SOME_MINUTE - timedelta(minutes=1), SOME_MINUTE + timedelta(seconds=30))
+
+    charges = every_charge_in(
+        [_a_minute(error_rate=NOTHING_FAILED, request_volume=SOME_VOLUME)], a_window
+    )
+
+    assert charges
+    assert all(int(a_window[0].timestamp()) <= charge["created"]
+               <= int(a_window[1].timestamp()) for charge in charges)
+
+
+def test_a_window_starting_inside_a_minute_lists_no_charge_before_its_start() -> None:
+    a_window = (SOME_MINUTE + timedelta(seconds=30), SOME_MINUTE + timedelta(minutes=1))
+
+    charges = every_charge_in(
+        [_a_minute(error_rate=NOTHING_FAILED, request_volume=SOME_VOLUME)], a_window
+    )
+
+    assert charges
+    assert all(int(a_window[0].timestamp()) <= charge["created"]
+               <= int(a_window[1].timestamp()) for charge in charges)
 
 
 def test_a_charge_carries_the_fields_a_payment_provider_reports() -> None:
