@@ -11,6 +11,7 @@ from io_shop.visits import (
     how_many_shoppers_are_remembered,
     record_visit,
 )
+from target_app.alert_rules import HIGH_MEMORY_USAGE
 from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.generator import TIMESTAMP_FORMAT, generate, utc_now
 from target_app.scenarios import (
@@ -877,7 +878,8 @@ def test_staging_a_leak_records_when_it_began() -> None:
     # Backdated, for the same reason a flag scenario's onset is: an audience
     # watching a flat graph for half an hour is not a demo. The difference is
     # how far back - a ramp needs a quiet opening and a climb, and both have to
-    # be in the window before anybody looks.
+    # be in the window before anybody looks. Exactly how far is the memory
+    # rule's to say, and pinned beside the generator.
     state = a_leaking_scenario_state()
 
     state.seed(SCENARIOS[RESOURCE_LEAK])
@@ -886,9 +888,7 @@ def test_staging_a_leak_records_when_it_began() -> None:
 
     assert active is not None
     assert active.leak_started_at is not None
-    assert utc_now() - active.leak_started_at >= timedelta(
-        minutes=get_scenario_settings().leak_backdate_minutes
-    )
+    assert utc_now() - active.leak_started_at >= HIGH_MEMORY_USAGE.pending
 
 
 def test_staging_a_leak_moves_no_flag() -> None:

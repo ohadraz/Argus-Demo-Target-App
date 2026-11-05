@@ -7,6 +7,13 @@ from io_shop.fraud_scoring import held_for_review
 from io_shop.payment_provider import PROVIDER_HOST
 from io_shop.pricing_service import PRICING_HOST
 from io_shop.summary_cache import CacheEndpoint
+from target_app.alert_rules import (
+    FIRING,
+    HIGH_MEMORY_USAGE,
+    PENDING,
+    last_evaluation_at,
+    state_of,
+)
 from target_app.generator import (
     BASELINE_MEMORY_BYTES,
     CORES_PER_REPLICA,
@@ -30,6 +37,7 @@ from target_app.generator import (
     SlowRollout,
     generate,
     the_cores_of,
+    when_a_leak_began_for_a_page_at,
 )
 from target_app.settings import DeclaredAutoscaler
 
@@ -517,6 +525,41 @@ def test_the_heap_never_exceeds_the_limit_it_is_given() -> None:
     minutes = a_leaking_window(began_minutes_ago=300)
 
     assert minute_at(0, minutes).memory_used_bytes <= MEMORY_LIMIT_BYTES
+
+
+def test_a_leak_begun_for_a_page_fires_its_rule_first_at_that_evaluation() -> None:
+    # The page goes out as the shop is seeded: not before, which would be an
+    # alert overdue by a delay nothing in the shop caused, and not after, which
+    # would keep everybody waiting for it. Wherever in its minute the seed lands,
+    # and whatever the wobble draws.
+    for seconds_in in (0, 1, 29, 59):
+        now = SOME_NOW.replace(second=seconds_in)
+        evaluated_at = last_evaluation_at(HIGH_MEMORY_USAGE, now)
+        began = when_a_leak_began_for_a_page_at(
+            evaluated_at, HIGH_MEMORY_USAGE.threshold, HIGH_MEMORY_USAGE.pending
+        )
+        rows = [
+            {
+                "bucket_id": minute.minute_id,
+                "memory_used_bytes": minute.memory_used_bytes,
+                "memory_limit_bytes": minute.memory_limit_bytes,
+            }
+            for minute in generate(
+                None,
+                now,
+                A_LEAKING_SPAN_MINUTES,
+                flag="dont-care-flag",
+                leak_started_at=began
+            )
+        ]
+
+        at_the_seed = state_of(HIGH_MEMORY_USAGE, rows, now, now)
+        a_minute_before = state_of(
+            HIGH_MEMORY_USAGE, rows, now - timedelta(minutes=1), now
+        )
+
+        assert at_the_seed.state == FIRING, seconds_in
+        assert a_minute_before.state == PENDING, seconds_in
 
 
 def test_a_scenario_that_is_not_about_memory_leaves_the_heap_alone() -> None:

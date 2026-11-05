@@ -2228,6 +2228,28 @@ def _the_heap_at(minute: datetime,
     )
 
 
+def when_a_leak_began_for_a_page_at(evaluated_at: datetime,
+                                    line: float,
+                                    pending: timedelta) -> datetime:
+    """When a leak has to have begun for a rule reading the heap's last minute
+    against `line` - a share of the limit - to fire first at `evaluated_at`.
+
+    Such a rule fires at the evaluation that has seen its condition hold for
+    `pending`, so the first one to see it is `pending` earlier and reads the
+    minute before itself. The heap crosses the line halfway into the minute
+    before that one: each of the two minutes then reads half a minute's climb
+    from the line, which is more than the wobble can move a reading, so the
+    first minute over is the same minute whatever the wobble draws.
+    """
+    first_minute_over = evaluated_at - pending - timedelta(minutes=1)
+    minutes_to_the_line = (
+        (line * MEMORY_LIMIT_BYTES - BASELINE_MEMORY_BYTES)
+        / LEAK_CLIMB_BYTES_PER_MINUTE
+    )
+
+    return first_minute_over - timedelta(minutes=minutes_to_the_line + 0.5)
+
+
 def _wobble_around(entropy: random.Random,
                    baseline_ms: int,
                    as_fraction_of_baseline: float) -> int:

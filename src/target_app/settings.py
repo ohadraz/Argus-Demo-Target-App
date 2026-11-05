@@ -146,19 +146,8 @@ class ScenarioSettings(BaseSettings):
 
     onset_backdate_minutes: int = Field(default=5, gt=0)
 
-    # How long a leaking shop has been leaking by the time it is seeded, which
-    # is the same trick `onset_backdate_minutes` plays and needs a bigger number
-    # for a different reason. A flag fault steps: one minute of it is already a
-    # departure. A leak ramps, so the departure has to be *accumulated* - and
-    # what locates its onset is the contrast between a quiet opening and a climb,
-    # which means both have to be in the window. Thirty minutes puts the heap at
-    # about two thirds of its limit when anybody first looks: memory well clear
-    # of its baseline, latency just beginning to follow, and the error rate not
-    # moved at all.
-    leak_backdate_minutes: int = Field(default=30, gt=0)
-
     # How long the traffic has been climbing by the time a surge is seeded, which
-    # is the leak's trick again and needs its own number for its own reason. A
+    # is the onset's trick again and needs its own number for its own reason. A
     # surge ramps over ten minutes and the shop is merely busy for the first six
     # of them, so a five-minute backdate would stage an incident whose latency has
     # not moved yet - diagnosable as nothing, and only because the fixture had not
@@ -171,7 +160,7 @@ class ScenarioSettings(BaseSettings):
     # fault is what has already been written. Days rather than minutes, and it is
     # the only backdate here measured in them.
     #
-    # The other three are sized so that a departure is visible in a window
+    # The other two are sized so that a departure is visible in a window
     # somebody is about to read. This one has the opposite job: nothing about this
     # incident is in any window, and the check that finds it runs weekly, so the
     # onset has to be *older than the metrics reach* - otherwise a consumer could

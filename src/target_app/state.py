@@ -32,6 +32,7 @@ from target_app.cache_entries import (
     write_entries
 )
 from target_app.flags import FlagClient, FlagProviderUnavailable
+from target_app.alert_rules import HIGH_MEMORY_USAGE, last_evaluation_at
 from target_app.generator import (
     SETTLED_UPTIME,
     CacheOutage,
@@ -48,6 +49,7 @@ from target_app.generator import (
     Scaling,
     ScrapeOutage,
     SlowDeployment,
+    when_a_leak_began_for_a_page_at,
 )
 from target_app.history import (
     forget_the_changes_to,
@@ -873,13 +875,21 @@ class ScenarioState:
             # this stages is the process's own accumulation, which has been
             # going on for a while already - long enough that the window opens
             # quiet and the climb is visible in it the instant anybody looks.
+            #
+            # How long is the memory rule's to say: as long as it takes the
+            # rule to fire at the evaluation this seed lands in. A leak any
+            # younger is one nobody is paged about yet, and any older one whose
+            # page went out before the shop existed - an alert overdue by a
+            # delay nothing in the shop caused.
             self._remember_where_the_flags_are_now()
             self._active = ActiveScenario(
                 scenario=scenario,
                 seeded_at=now,
                 process_started_at=now - SETTLED_UPTIME,
-                leak_started_at=now - timedelta(
-                    minutes=get_scenario_settings().leak_backdate_minutes
+                leak_started_at=when_a_leak_began_for_a_page_at(
+                    last_evaluation_at(HIGH_MEMORY_USAGE, now),
+                    HIGH_MEMORY_USAGE.threshold,
+                    HIGH_MEMORY_USAGE.pending
                 ),
             )
             return
