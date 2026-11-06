@@ -2250,6 +2250,39 @@ def when_a_leak_began_for_a_page_at(evaluated_at: datetime,
     return first_minute_over - timedelta(minutes=minutes_to_the_line + 0.5)
 
 
+def when_a_surge_began_for_a_page_at(evaluated_at: datetime,
+                                     line: float,
+                                     pending: timedelta,
+                                     replicas: int) -> datetime:
+    """When a surge has to have begun for a rule reading the p95 against
+    `line` - in milliseconds - to fire first at `evaluated_at`, on a deployment
+    of `replicas` that nobody resizes while it climbs.
+
+    The leak's arithmetic, run on the ramp instead of the heap: the first
+    evaluation to see the condition is `pending` earlier and reads the minute
+    before itself, and the p95 crosses the line halfway into the minute before
+    that one. Half a minute of the ramp moves the p95 by about five times as
+    much as the wobble can, so the first minute over is the same minute
+    whatever the wobble draws.
+
+    Worked back through the latency's own curve: how much slower the line is
+    than the baseline, the utilisation that slows a request that much, and the
+    multiple of the baseline traffic that asks it of `replicas`.
+    """
+    first_minute_over = evaluated_at - pending - timedelta(minutes=1)
+    slower = line / _BASELINE_P95_MS
+    utilisation = _CPU_PRESSURE_BEGINS_AT + (
+        (slower - 1.0) / (_SLOWEST_AT_CAPACITY - 1.0) * (1.0 - _CPU_PRESSURE_BEGINS_AT)
+    )
+    multiple = (
+        utilisation * the_cores_of(replicas) * _REQUESTS_PER_CORE_MINUTE
+        / REPORTED_VOLUME_PER_MINUTE
+    )
+    into_the_ramp = (multiple - 1.0) / (_SURGE_PEAK_MULTIPLE - 1.0) * _SURGE_RAMPS_OVER
+
+    return first_minute_over - timedelta(minutes=0.5) - into_the_ramp
+
+
 def _wobble_around(entropy: random.Random,
                    baseline_ms: int,
                    as_fraction_of_baseline: float) -> int:

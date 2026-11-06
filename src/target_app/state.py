@@ -32,7 +32,7 @@ from target_app.cache_entries import (
     write_entries
 )
 from target_app.flags import FlagClient, FlagProviderUnavailable
-from target_app.alert_rules import HIGH_MEMORY_USAGE, last_evaluation_at
+from target_app.alert_rules import HIGH_LATENCY_P95, HIGH_MEMORY_USAGE, last_evaluation_at
 from target_app.generator import (
     SETTLED_UPTIME,
     CacheOutage,
@@ -50,6 +50,7 @@ from target_app.generator import (
     ScrapeOutage,
     SlowDeployment,
     when_a_leak_began_for_a_page_at,
+    when_a_surge_began_for_a_page_at,
 )
 from target_app.history import (
     forget_the_changes_to,
@@ -819,21 +820,31 @@ class ScenarioState:
             # this process either. What is staged is the traffic: shoppers arrive
             # in numbers the deployment was not sized for, and the shop queues.
             # Backdated further than the others because a surge ramps rather than
-            # steps - see `surge_backdate_minutes` - so that the plateau, the climb
-            # and the quiet minutes before it are all in the window at once.
+            # steps, so that the climb and the quiet minutes before it are both in
+            # the window at once.
+            #
+            # How far is the latency rule's to say, as the memory rule's is for a
+            # leak: as long as it takes the rule to fire at the evaluation this
+            # seed lands in. A surge any older is one whose page went out before
+            # the shop existed - an alert overdue by a delay nothing in the shop
+            # caused.
             #
             # The capacity it meets is not recorded here. It is the deployment's
             # size, which is process state and belongs to nobody's scenario, and a
             # seed that captured it would stage an incident against a count that
-            # stopped being true the moment anybody scaled.
+            # stopped being true the moment anybody scaled. It is read, though,
+            # because how soon the latency passes its line is the size's to say.
             self._remember_where_the_flags_are_now()
             self._active = ActiveScenario(
                 scenario=scenario,
                 seeded_at=now,
                 process_started_at=now - SETTLED_UPTIME,
                 demand_surge=DemandSurge(
-                    began_at=now - timedelta(
-                        minutes=get_scenario_settings().surge_backdate_minutes
+                    began_at=when_a_surge_began_for_a_page_at(
+                        last_evaluation_at(HIGH_LATENCY_P95, now),
+                        HIGH_LATENCY_P95.threshold,
+                        HIGH_LATENCY_P95.pending,
+                        self.capacity.replicas_during(now)
                     )
                 ),
             )

@@ -11,7 +11,7 @@ from io_shop.visits import (
     how_many_shoppers_are_remembered,
     record_visit,
 )
-from target_app.alert_rules import HIGH_MEMORY_USAGE
+from target_app.alert_rules import HIGH_LATENCY_P95, HIGH_MEMORY_USAGE
 from target_app.flags import FlagClient, FlagProviderUnavailable
 from target_app.generator import TIMESTAMP_FORMAT, generate, utc_now
 from target_app.scenarios import (
@@ -1356,6 +1356,21 @@ def test_no_autoscaler_is_live_until_one_is_staged() -> None:
     state.seed(SCENARIOS[CPU_SATURATION])
 
     assert state.autoscaler is None
+
+
+def test_staging_a_surge_dates_it_to_its_latency_rule() -> None:
+    # Old enough for the latency rule to have held through its wait by the
+    # seed - and no older, which is pinned beside the generator: a surge dated
+    # by a fixed backdate paged minutes before the shop existed.
+    state = a_flapping_scenario_state()
+
+    state.seed(SCENARIOS[CPU_SATURATION])
+
+    active = state.active
+
+    assert active is not None
+    assert active.demand_surge is not None
+    assert utc_now() - active.demand_surge.began_at >= HIGH_LATENCY_P95.pending
 
 
 def test_staging_a_flapping_controller_makes_one_live() -> None:

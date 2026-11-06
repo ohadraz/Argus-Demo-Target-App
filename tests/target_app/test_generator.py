@@ -9,6 +9,7 @@ from io_shop.pricing_service import PRICING_HOST
 from io_shop.summary_cache import CacheEndpoint
 from target_app.alert_rules import (
     FIRING,
+    HIGH_LATENCY_P95,
     HIGH_MEMORY_USAGE,
     PENDING,
     last_evaluation_at,
@@ -38,6 +39,7 @@ from target_app.generator import (
     generate,
     the_cores_of,
     when_a_leak_began_for_a_page_at,
+    when_a_surge_began_for_a_page_at,
 )
 from target_app.settings import DeclaredAutoscaler
 
@@ -1679,6 +1681,38 @@ def a_window_with_the_traffic_surging(
         demand_surge=DemandSurge(began_at=SOME_NOW - timedelta(minutes=began_minutes_ago)),
         capacity=Capacity(sized_for=sized_for, scalings=scalings),
     )
+
+
+def test_a_surge_begun_for_a_page_fires_its_rule_first_at_that_evaluation() -> None:
+    # The leak's case, for the latency a surge drives up: the page goes out as
+    # the shop is seeded, not minutes before it - an alert overdue by a delay
+    # nothing in the shop caused. Wherever in its minute the seed lands, and
+    # whatever the wobble draws.
+    for seconds_in in (0, 1, 29, 59):
+        now = SOME_NOW.replace(second=seconds_in)
+        began = when_a_surge_began_for_a_page_at(
+            last_evaluation_at(HIGH_LATENCY_P95, now),
+            HIGH_LATENCY_P95.threshold,
+            HIGH_LATENCY_P95.pending,
+            replicas=3,
+        )
+        rows = [
+            {"bucket_id": minute.minute_id, "p95_ms": minute.p95_ms}
+            for minute in generate(
+                None,
+                now,
+                A_LEAKING_SPAN_MINUTES,
+                flag="dont-care-flag",
+                demand_surge=DemandSurge(began_at=began),
+                capacity=Capacity(sized_for=3),
+            )
+        ]
+
+        at_the_seed = state_of(HIGH_LATENCY_P95, rows, now, now)
+        a_minute_before = state_of(HIGH_LATENCY_P95, rows, now - timedelta(minutes=1), now)
+
+        assert at_the_seed.state == FIRING, seconds_in
+        assert a_minute_before.state == PENDING, seconds_in
 
 
 def test_a_quiet_shop_reports_a_quarter_of_its_capacity() -> None:
