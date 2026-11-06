@@ -146,18 +146,6 @@ class ScenarioSettings(BaseSettings):
 
     onset_backdate_minutes: int = Field(default=5, gt=0)
 
-    # How long the traffic has been climbing by the time a flapping autoscaler is
-    # seeded - a plain surge's start is worked out from its latency rule instead
-    # (`when_a_surge_began_for_a_page_at`) - which is the onset's trick again and
-    # needs its own number for its own reason. A
-    # surge ramps over ten minutes and the shop is merely busy for the first six
-    # of them, so a five-minute backdate would stage an incident whose latency has
-    # not moved yet - diagnosable as nothing, and only because the fixture had not
-    # finished arriving. Twenty minutes puts the plateau ten minutes behind the
-    # seed: the whole ascent is in the window, with the quiet minutes it departed
-    # from ahead of it, and the shop is already saturated when anybody first looks.
-    surge_backdate_minutes: int = Field(default=20, gt=0)
-
     # How long ago the cheaper write path went live, for the one scenario whose
     # fault is what has already been written. Days rather than minutes, and it is
     # the only backdate here measured in them.

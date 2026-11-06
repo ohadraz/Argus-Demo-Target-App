@@ -49,6 +49,7 @@ from target_app.generator import (
     Scaling,
     ScrapeOutage,
     SlowDeployment,
+    when_a_flap_began_for_a_page_at,
     when_a_leak_began_for_a_page_at,
     when_a_surge_began_for_a_page_at,
 )
@@ -857,10 +858,11 @@ class ScenarioState:
             # the right size for this load half the time and the wrong size the
             # rest of it.
             #
-            # The same `DemandSurge` and the same backdating the surge uses, so
-            # the ramp, the plateau and the quiet minutes before it are all in the
-            # window at once - and so the two scenarios differ in one thing rather
-            # than in a figure each.
+            # The same `DemandSurge` the surge uses, dated the same way - from the
+            # latency rule, so its page goes out at the evaluation this seed lands
+            # in - at the controller's floor, which is what the slow minutes are
+            # served at. The two scenarios differ in one thing rather than in a
+            # figure each.
             #
             # The autoscaler is not recorded here. It is derived from the scenario
             # and the deployment's own declaration (`autoscaler`), for the reason
@@ -874,8 +876,11 @@ class ScenarioState:
                 seeded_at=now,
                 process_started_at=now - SETTLED_UPTIME,
                 demand_surge=DemandSurge(
-                    began_at=now - timedelta(
-                        minutes=get_scenario_settings().surge_backdate_minutes
+                    began_at=when_a_flap_began_for_a_page_at(
+                        last_evaluation_at(HIGH_LATENCY_P95, now),
+                        HIGH_LATENCY_P95.threshold,
+                        HIGH_LATENCY_P95.pending,
+                        the_declared_autoscaler().min_replicas
                     )
                 ),
             )

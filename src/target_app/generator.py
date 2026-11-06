@@ -2283,6 +2283,34 @@ def when_a_surge_began_for_a_page_at(evaluated_at: datetime,
     return first_minute_over - timedelta(minutes=0.5) - into_the_ramp
 
 
+def when_a_flap_began_for_a_page_at(evaluated_at: datetime,
+                                    line: float,
+                                    pending: timedelta,
+                                    floor: int) -> datetime:
+    """When a surge under a flapping controller has to have begun for a rule
+    reading the p95's maximum over its range against `line` to fire first at
+    `evaluated_at`.
+
+    The plain surge's start at the controller's floor, which is what the slow
+    minutes are served at - unless the first minute over would fall at the
+    ceiling, where the shop is quick. The cycle runs from the surge's start, so
+    one minute earlier moves the ceiling onto the minute before and the floor
+    onto this one, with the ramp still under the line two minutes back. After
+    that the maximum over two minutes always holds a slow minute, so the rule
+    holds through its pending period as it would on a plain surge.
+    """
+    began_at = when_a_surge_began_for_a_page_at(evaluated_at, line, pending, floor)
+    first_minute_over = evaluated_at - pending - timedelta(minutes=1)
+    minutes_in = int(
+        (first_minute_over - began_at.replace(second=0, microsecond=0)).total_seconds()
+    ) // _SECONDS_PER_MINUTE
+
+    if minutes_in % _FLAP_CYCLE_MINUTES == _FLAP_CYCLE_MINUTES - 1:
+        return began_at - timedelta(minutes=1)
+
+    return began_at
+
+
 def _wobble_around(entropy: random.Random,
                    baseline_ms: int,
                    as_fraction_of_baseline: float) -> int:
