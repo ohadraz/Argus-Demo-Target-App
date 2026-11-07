@@ -22,6 +22,6 @@ spec:
     matchLabels:
       app: io-shop
   endpoints:
-    - port: metrics
+    - port: http-metrics
       path: /metrics
       interval: 15s
