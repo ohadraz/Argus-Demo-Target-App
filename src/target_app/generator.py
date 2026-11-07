@@ -1141,18 +1141,18 @@ class LiveAutoscaler:
         return self.floor >= self.ceiling
 
     def floor_during(self, minute: datetime) -> int:
-        """The floor in force for this minute.
+        """The floor in force at this instant.
 
         The latest pin at or before it, and the declaration's floor where none has
-        landed yet. Minute-truncated as `Capacity.replicas_during` is, and for the
-        same reason: a bucket carries one floor, and the one worth reporting is the
-        one still in force when anybody reads it.
+        landed yet. Not minute-truncated, unlike `Capacity.replicas_during`: a
+        minute is asked about at its start, so a pin landing partway through it
+        leaves it served at the old floor. That is what a real controller's minute
+        is - slow until the pin, and a minute's p95 is its slowest twentieth, so
+        the part before the pin is what it reports. Served whole at the new floor,
+        the minute read as fast before anything had made it so, and the pause
+        before it as a recovery that came before the pin.
         """
-        in_force = [
-            pin.floor
-            for pin in self.pins
-            if pin.at.replace(second=0, microsecond=0) <= minute
-        ]
+        in_force = [pin.floor for pin in self.pins if pin.at <= minute]
 
         return in_force[-1] if in_force else self.declared.min_replicas
 

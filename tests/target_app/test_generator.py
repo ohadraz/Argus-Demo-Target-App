@@ -2053,11 +2053,28 @@ def test_pinning_the_floor_stops_the_cycle() -> None:
     )
 
     while_it_flapped = minute_at(8, minutes)
-    held = [minute_at(ago, minutes) for ago in range(6, 0, -1)]
+    held = [minute_at(ago, minutes) for ago in range(5, 0, -1)]
 
     assert while_it_flapped.cpu_limit_cores == the_cores_of(3)
     assert {minute.cpu_limit_cores for minute in held} == {the_cores_of(6)}
     assert all(minute.p95_ms < while_it_flapped.p95_ms / 5 for minute in held)
+
+
+def test_a_pin_landing_partway_through_a_minute_holds_from_the_next() -> None:
+    # The minute it lands in was served at the old floor until it landed, and
+    # its slowest twentieth is that part. Served whole at the new floor, a minute
+    # the cycle had at its floor read as fast before anything made it so, and the
+    # pause before it read as a recovery that came before the pin.
+    # Four minutes ago is at the ceiling by the cycle - the pause - and the pin
+    # lands in the floor minute after it.
+    landed_in = (SOME_NOW - timedelta(minutes=3)).replace(second=32, microsecond=0)
+    minutes = a_window_with_the_autoscaler_flapping(pins=(Pin(at=landed_in, floor=6),))
+
+    the_minute_it_landed_in = minute_at(3, minutes)
+    the_next_at_the_floor_by_its_cycle = minute_at(2, minutes)
+
+    assert the_minute_it_landed_in.cpu_limit_cores == the_cores_of(3)
+    assert the_next_at_the_floor_by_its_cycle.cpu_limit_cores == the_cores_of(6)
 
 
 def test_putting_the_floor_back_resumes_the_cycle() -> None:
