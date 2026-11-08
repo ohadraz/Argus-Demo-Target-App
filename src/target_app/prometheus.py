@@ -20,6 +20,7 @@ numbers it read before, so nothing recorded against the old shape moves.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
@@ -196,26 +197,42 @@ def the_reading_for(query: str) -> Reading | None:
     return lambda row: row.get(field)
 
 
-def an_exposition(rows: Sequence[Mapping[str, Any]]) -> str:
+def an_exposition(rows: Sequence[Mapping[str, Any]],
+                  staged_at: datetime,
+                  now: datetime) -> str:
     """What a scrape of this shop reads: the series the queries name, now.
 
-    Gauges carry the newest minute's reading; counters carry the totals over
-    every minute the shop holds, which is as far back as it remembers. Latency
-    is a summary - the shop measures quantiles, not buckets, and a histogram
-    would be inventing a distribution it never saw.
+    Gauges carry the newest minute's reading. Counters are what a serving
+    process's counters are: they only rise, from nothing at the later of when
+    the shop was staged and when its process last started - so a restart sets
+    them back, as it sets a real one back - and they grow through the minute in
+    progress by the share of it served so far. Summed over the window, they
+    would fall whenever its oldest minute dropped off and stand still while a
+    minute was served, and every rate a real Prometheus worked out of them
+    would be the window sliding rather than anything the shop did. Counted from
+    the staging, they hold for as long as the window reaches back that far: six
+    hours.
+
+    Latency is a summary - the shop measures quantiles, not buckets, and a
+    histogram would be inventing a distribution it never saw.
     """
     if not rows:
         return ""
 
     newest = rows[-1]
-    served = sum(int(row["request_volume"]) for row in rows)
-    failed = sum(round(row["error_rate"] * row["request_volume"]) for row in rows)
-    cpu_seconds = sum(row["cpu_used_cores"] * 60 for row in rows)
+    since = _counting_since(staged_at, newest)
+    shares = [(row, _the_share_served(row, since, now)) for row in rows]
+    failed = _counted(shares, lambda row: row["error_rate"] * row["request_volume"])
+    succeeded = _counted(shares, lambda row: (1 - row["error_rate"]) * row["request_volume"])
+    served = succeeded + failed
+    cpu_seconds = sum(
+        row["cpu_used_cores"] * _A_MINUTE.total_seconds() * share for row, share in shares
+    )
 
     lines = [
         "# HELP http_requests_total Requests served, by status class.",
         "# TYPE http_requests_total counter",
-        f'http_requests_total{{code="200"}} {served - failed}',
+        f'http_requests_total{{code="200"}} {succeeded}',
         f'http_requests_total{{code="500"}} {failed}',
         "# HELP http_request_duration_seconds How long a request took.",
         "# TYPE http_request_duration_seconds summary",
@@ -281,6 +298,34 @@ def an_exposition(rows: Sequence[Mapping[str, Any]]) -> str:
         ]
 
     return "\n".join(lines) + "\n"
+
+
+def _counting_since(staged_at: datetime, newest: Mapping[str, Any]) -> datetime:
+    """When the counters were last at nothing: the staging, or the process's
+    last start where that came later."""
+    started = newest.get("process_start_time_seconds")
+
+    if started is None:
+        return staged_at
+
+    return max(staged_at, datetime.fromtimestamp(float(started), UTC))
+
+
+def _the_share_served(row: Mapping[str, Any], since: datetime, now: datetime) -> float:
+    """How much of a row's minute was served between `since` and `now`, from
+    none of it to the whole."""
+    began = _the_minute_of(row)
+    served = min(now, began + _A_MINUTE) - max(since, began)
+
+    return min(max(served / _A_MINUTE, 0.0), 1.0)
+
+
+def _counted(shares: Sequence[tuple[Mapping[str, Any], float]],
+             per_minute: Callable[[Mapping[str, Any]], float]) -> int:
+    """A counter's value: each minute's figure by the share of it served,
+    summed and kept whole - rounded down, so it never stands above what was
+    served."""
+    return math.floor(sum(per_minute(row) * share for row, share in shares))
 
 
 def _the_minute_of(row: Mapping[str, Any]) -> datetime:

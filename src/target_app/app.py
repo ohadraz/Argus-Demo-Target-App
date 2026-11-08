@@ -1878,9 +1878,19 @@ def scenario_metrics() -> list[MetricBucket]:
 
 def _the_exposition() -> str:
     """What Prometheus would scrape off this shop: text exposition, current
-    values of the series the stand-in's queries name.
+    values of the series the stand-in's queries name, its counters counted from
+    when the active scenario was staged.
     """
-    return prometheus.an_exposition([bucket.model_dump() for bucket in _the_buckets()])
+    active = state.active
+
+    if active is None or active.seeded_at is None:
+        return ""
+
+    return prometheus.an_exposition(
+        [bucket.model_dump() for bucket in _the_buckets()],
+        staged_at=active.seeded_at,
+        now=datetime.now(UTC)
+    )
 
 
 # The shop's own routes, answering from the figures this rig generates for it.

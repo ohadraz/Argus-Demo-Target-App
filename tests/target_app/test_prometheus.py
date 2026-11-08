@@ -86,6 +86,32 @@ def long_after() -> datetime:
     return THE_FIRST_MINUTE + timedelta(hours=1)
 
 
+def exposed(rows: list[dict[str, Any]],
+            *,
+            staged_at: datetime = THE_FIRST_MINUTE,
+            now: datetime | None = None) -> str:
+    """The scrape, staged at the first minute and read long after it unless
+    told otherwise."""
+    return an_exposition(rows, staged_at=staged_at, now=now or long_after())
+
+
+def the_counter(exposition: str, series: str) -> float:
+    """One series' value, as the scrape spells it."""
+    [line] = [line for line in exposition.splitlines() if line.startswith(f"{series} ")]
+
+    return float(line.split(" ")[-1])
+
+
+def minutes_failing_a_quarter(count: int) -> list[dict[str, Any]]:
+    """Whole minutes from the first, each 1200 requests a quarter of which
+    failed - figures binary floats hold exactly, so a counter's arithmetic is
+    the test's and not the float's."""
+    return [
+        a_row(THE_FIRST_MINUTE + index * A_MINUTE, error_rate=0.25)
+        for index in range(count)
+    ]
+
+
 def test_an_answer_is_a_matrix() -> None:
     data = a_matrix_over(three_minutes(), "error_rate", now=long_after())
 
@@ -209,7 +235,7 @@ def test_a_step_is_read_as_seconds_or_a_duration() -> None:
 
 
 def test_the_exposition_declares_every_series_the_queries_name() -> None:
-    exposition = an_exposition(three_minutes())
+    exposition = exposed(three_minutes())
 
     for series in ("http_requests_total", "http_request_duration_seconds",
                    "process_resident_memory_bytes", "process_start_time_seconds",
@@ -223,11 +249,11 @@ def test_the_exposition_carries_the_newest_minute() -> None:
     rows = three_minutes()
     rows[-1]["memory_used_bytes"] = 444
 
-    assert "process_resident_memory_bytes 444\n" in an_exposition(rows)
+    assert "process_resident_memory_bytes 444\n" in exposed(rows)
 
 
 def test_an_empty_shop_exposes_nothing() -> None:
-    assert an_exposition([]) == ""
+    assert exposed([]) == ""
 
 
 def test_the_exposition_is_served_as_prometheus_text() -> None:
@@ -261,7 +287,7 @@ def test_the_exposition_carries_the_categorisers_share_where_it_is_reported() ->
     rows = three_minutes()
     rows[-1]["categoriser_confident_ratio"] = 0.41
 
-    exposition = an_exposition(rows)
+    exposition = exposed(rows)
 
     assert "# TYPE categoriser_confident_ratio gauge" in exposition
     assert "categoriser_confident_ratio 0.41\n" in exposition
@@ -281,7 +307,57 @@ def test_the_exposition_carries_the_held_share_where_it_is_reported() -> None:
     rows = three_minutes()
     rows[-1]["fraud_held_for_review_ratio"] = 0.18
 
-    exposition = an_exposition(rows)
+    exposition = exposed(rows)
 
     assert "# TYPE fraud_held_for_review_ratio gauge" in exposition
     assert "fraud_held_for_review_ratio 0.18\n" in exposition
+
+
+def test_the_counters_count_what_was_served_since_the_staging() -> None:
+    # The first minute was served before anything was staged, so it counts
+    # for nothing: two whole minutes of 1200, a quarter of them failing.
+    exposition = exposed(minutes_failing_a_quarter(3), staged_at=THE_FIRST_MINUTE + A_MINUTE)
+
+    assert the_counter(exposition, 'http_requests_total{code="500"}') == 600
+    assert the_counter(exposition, 'http_requests_total{code="200"}') == 1800
+    assert the_counter(exposition, "http_request_duration_seconds_count") == 2400
+    assert the_counter(exposition, "container_cpu_usage_seconds_total") == 0.75 * 60 * 2
+
+
+def test_a_counter_grows_through_the_minute_in_progress() -> None:
+    # Thirty seconds into the third minute: two whole minutes and half of the
+    # third. A counter that stood still until the minute ended would give a
+    # rate over any one minute of nothing at all.
+    half_way_through_the_third = THE_FIRST_MINUTE + 2 * A_MINUTE + timedelta(seconds=30)
+
+    exposition = exposed(minutes_failing_a_quarter(3), now=half_way_through_the_third)
+
+    assert the_counter(exposition, "http_request_duration_seconds_count") == 3000
+
+
+def test_a_counter_never_falls_as_the_window_slides() -> None:
+    # Half a minute on, the window has let go of its oldest minute - one served
+    # before the staging, as every minute it lets go of is - and taken on a new
+    # one. Summed over the window, the total would have stood still or fallen,
+    # which Prometheus reads as the process restarting.
+    rows = minutes_failing_a_quarter(4)
+    staged_at = THE_FIRST_MINUTE + A_MINUTE
+    at_the_end_of_the_third = THE_FIRST_MINUTE + 3 * A_MINUTE
+
+    before = exposed(rows[:3], staged_at=staged_at, now=at_the_end_of_the_third)
+    after = exposed(rows[1:], staged_at=staged_at,
+                    now=at_the_end_of_the_third + timedelta(seconds=30))
+
+    assert the_counter(after, "http_request_duration_seconds_count") \
+        > the_counter(before, "http_request_duration_seconds_count")
+
+
+def test_a_restart_sets_the_counters_back() -> None:
+    # As a real process's counters start again from nothing: the newest
+    # minute says the process came up at the start of the third.
+    rows = minutes_failing_a_quarter(3)
+    rows[-1]["process_start_time_seconds"] = (THE_FIRST_MINUTE + 2 * A_MINUTE).timestamp()
+
+    exposition = exposed(rows)
+
+    assert the_counter(exposition, "http_request_duration_seconds_count") == 1200
