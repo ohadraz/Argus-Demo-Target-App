@@ -53,20 +53,27 @@ def record_purchase(account: Account, purchase: Purchase) -> Account:
 
 def record_purchase_deriving_the_month(account: Account,
                                        purchase: Purchase) -> Account:
-    """The same account, without the month's total being moved.
+    """The same account, with the month's total derived from the history.
 
-    One total to carry instead of two, which is the saving: a month is not
-    something the shop has to keep a figure for. Every purchase says which month
-    it falls in, so what a shopper has spent this month adds up from the history
-    whenever anybody wants it - exactly as the lifetime average is derived from the
-    purchases rather than read off the account (see
-    `io_shop.spend_summary.average_spend_per_item`). Keeping a second copy of a
-    figure the purchases already hold is the work this path exists to drop.
+    Every purchase says which month it falls in, so what a shopper has spent this
+    month adds up from the history - and this path adds it up at the moment of
+    writing rather than adding the price to whatever the account arrived carrying.
+
+    It is still stored on the account: a write that left the stored month where
+    it was would leave the account holding a month total its own purchases do not
+    add up to. Deriving it here also means an account whose stored month had
+    already drifted is put right by its next write rather than carrying the drift
+    forward.
     """
+    purchases = (*account.purchases, purchase)
+
     return replace(
         account,
-        purchases=(*account.purchases, purchase),
-        total_cents=account.total_cents + purchase.price_cents
+        purchases=purchases,
+        total_cents=account.total_cents + purchase.price_cents,
+        total_this_month_cents=sum(
+            each.price_cents for each in purchases if each.in_current_month
+        )
     )
 
 
