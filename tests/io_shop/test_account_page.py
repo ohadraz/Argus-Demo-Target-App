@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 from io_shop import payment_provider, spend_summary
 from io_shop.account_page import PRICING_UNAVAILABLE, serve_account_page
 from io_shop.accounts import Account, Purchase
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
-from io_shop.pricing_service import AskThePricingService, PricingAnswer
+from io_shop.pricing_service import (
+    PRICING_BUDGET_MS,
+    AskThePricingService,
+    PricingAnswer,
+)
 from io_shop.summary_cache import (
     CacheAnswer,
     CacheEndpoint,
@@ -51,6 +57,16 @@ def a_slow_pricing_service(took_ms: int = 1500) -> AskThePricingService:
 
 def a_pricing_service_with_no_price() -> AskThePricingService:
     return lambda dont_care_shopper: PricingAnswer(total_cents=None, took_ms=8)
+
+
+def a_pricing_service_that_stalls_until(
+    released: threading.Event
+) -> AskThePricingService:
+    def ask(dont_care_shopper: str) -> PricingAnswer:
+        released.wait(timeout=10)
+        return PricingAnswer(total_cents=8400, took_ms=10_000)
+
+    return ask
 
 
 def an_account_idle_this_month(*prices: int) -> Account:
@@ -283,6 +299,34 @@ def test_a_slow_pricing_service_delays_the_page_without_failing_it() -> None:
     assert page.basket_total_cents == 8400
     assert page.pricing_delay is not None
     assert payment_provider.PROVIDER_HOST not in page.pricing_delay
+
+
+def test_a_stalled_pricing_service_does_not_hold_the_page_past_its_budget() -> None:
+    # The incident: io-pricing took 1500ms and every account page took 1500ms
+    # longer, for a figure the page is worth showing without. The page waits
+    # for its budget and then renders without the basket total.
+    released = threading.Event()
+    started = time.monotonic()
+
+    try:
+        page = serve_account_page(
+            an_account_idle_this_month(1000, 3000),
+            use_monthly_summary=False,
+            ask_the_provider=a_provider_holding_a_card(),
+            ask_the_pricing_service=a_pricing_service_that_stalls_until(released)
+        )
+        waited = time.monotonic() - started
+    finally:
+        released.set()
+
+    assert waited < PRICING_BUDGET_MS / 1000 + 1.0
+    assert page.failure is None
+    assert page.figure_cents == 2000
+    assert page.card_last_four == "4242"
+    assert page.basket_total_cents is None
+    assert page.pricing_unavailable == PRICING_UNAVAILABLE
+    assert page.pricing_failure is not None
+    assert "pricing.io-internal.svc" in page.pricing_failure
 
 
 def test_a_pricing_service_with_no_price_renders_the_page_without_the_basket() -> None:
