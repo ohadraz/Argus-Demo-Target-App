@@ -6,7 +6,12 @@ from io_shop import payment_provider, spend_summary
 from io_shop.account_page import PRICING_UNAVAILABLE, serve_account_page
 from io_shop.accounts import Account, Purchase
 from io_shop.payment_provider import AskTheProvider, ProviderAnswer, StoredCard
-from io_shop.pricing_service import AskThePricingService, PricingAnswer
+from io_shop.pricing_service import (
+    PRICING_BUDGET_MS,
+    SLOW_CALL_MS,
+    AskThePricingService,
+    PricingAnswer,
+)
 from io_shop.summary_cache import (
     CacheAnswer,
     CacheEndpoint,
@@ -35,7 +40,7 @@ def a_provider_that_is_down() -> AskTheProvider:
 
 def a_prompt_pricing_service() -> AskThePricingService:
     """A pricing service behaving itself, which is what every test here wants
-    from it except the two that are about it.
+    from it except the few that are about it.
 
     Well under the threshold the shop remarks on, so a page served through this
     reports no delay at all.
@@ -43,7 +48,7 @@ def a_prompt_pricing_service() -> AskThePricingService:
     return lambda dont_care_shopper: PricingAnswer(total_cents=8400, took_ms=12)
 
 
-def a_slow_pricing_service(took_ms: int = 1500) -> AskThePricingService:
+def a_slow_pricing_service(took_ms: int = SLOW_CALL_MS + 50) -> AskThePricingService:
     return lambda dont_care_shopper: PricingAnswer(
         total_cents=8400, took_ms=took_ms
     )
@@ -270,9 +275,8 @@ def test_a_page_carries_what_the_basket_comes_to() -> None:
 
 
 def test_a_slow_pricing_service_delays_the_page_without_failing_it() -> None:
-    # The whole scenario rests on this, exactly as the cache's rests on the
-    # fallback: the page is correct, the shopper is charged the right amount,
-    # and the only trace is a line nobody is paged for.
+    # Slow but within budget: the page is correct, the shopper is charged the
+    # right amount, and the trace is a line saying where the time went.
     page = serve_account_page(an_account_idle_this_month(1000, 3000),
                               use_monthly_summary=False,
                               ask_the_provider=a_provider_holding_a_card(),
@@ -283,6 +287,27 @@ def test_a_slow_pricing_service_delays_the_page_without_failing_it() -> None:
     assert page.basket_total_cents == 8400
     assert page.pricing_delay is not None
     assert payment_provider.PROVIDER_HOST not in page.pricing_delay
+
+
+def test_a_pricing_service_past_its_budget_does_not_hold_the_page() -> None:
+    # The incident: io-pricing took 1500ms and the account page waited for all
+    # of it. The basket total is a convenience, so past the budget the page
+    # renders without it rather than taking on the pricing service's latency.
+    page = serve_account_page(
+        an_account_idle_this_month(1000, 3000),
+        use_monthly_summary=False,
+        ask_the_provider=a_provider_holding_a_card(),
+        ask_the_pricing_service=a_slow_pricing_service(took_ms=1500)
+    )
+
+    assert 1500 > PRICING_BUDGET_MS
+    assert page.failure is None
+    assert page.figure_cents == 2000
+    assert page.card_last_four == "4242"
+    assert page.basket_total_cents is None
+    assert page.pricing_unavailable == PRICING_UNAVAILABLE
+    assert page.pricing_failure is not None
+    assert "pricing.io-internal.svc" in page.pricing_failure
 
 
 def test_a_pricing_service_with_no_price_renders_the_page_without_the_basket() -> None:
