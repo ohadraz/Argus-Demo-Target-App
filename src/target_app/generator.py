@@ -32,9 +32,11 @@ from __future__ import annotations
 
 import random
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
+from typing import Any
 
 from io_shop.account_page import serve_account_page
 from io_shop.accounts import Account, Purchase
@@ -1582,8 +1584,9 @@ def _a_whole_minute(
     all parameters and none of them is read from anywhere. A flag toggled now
     does not change a minute that has already finished, but it does change the
     timeline - so the next request misses, regenerates the window once, and
-    hits from then on. That is the whole cost of a mitigation: one window, not
-    one per request.
+    hits from then on. Regenerating it is cheap for every minute the change did
+    not reach, whose pages `_the_pages_served` still holds; only the minutes
+    from the change on put their pages through the shop again.
 
     What this is worth: a six-hour window is 360 minutes, and the account pages
     behind it are rendered for real. Regenerating all of them on every
@@ -1647,22 +1650,6 @@ def _generate_minute(
     rescheduling: Rescheduling | None = None,
 ) -> GeneratedMinute:
     minute_id = minute.strftime(TIMESTAMP_FORMAT)
-    entropy = random.Random(minute_id)
-    # A sequence of its own, so that consulting a cache on every request cannot
-    # move a single figure drawn from the one above. Seeded from the same
-    # minute, so this minute reads the same however often it is fetched.
-    cache_entropy = (
-        random.Random(f"{minute_id}-cache") if cache_endpoint is not None else None
-    )
-    # A third sequence, seeded from the same minute and kept apart from both, for
-    # the reason the cache has one of its own: which side of a split fleet served
-    # a request is a draw per request, and taking it from either sequence above
-    # would move a figure in every scenario that has no rollout in it. Made only
-    # where one is staged, so a shop whose fleet is on one revision takes no draw
-    # at all.
-    rollout_entropy = (
-        random.Random(f"{minute_id}-rollout") if paused_rollout is not None else None
-    )
 
     seconds_on = (
         timeline.seconds_on_within(minute, elapsed_seconds)
@@ -1754,30 +1741,24 @@ def _generate_minute(
         )
     )
 
-    outcomes = [
-        _serve_one_account_page(
-            entropy,
-            share_of_minute_flagged,
-            share_of_minute_refused,
-            cache_entropy,
-            share_of_minute_without_the_cache,
-            cache_endpoint,
-            the_rollout_reached_it=index < reached_by_the_rollout,
-            the_flag_ships_the_slow_feature=slow_rollout is not None,
-            the_flag_ships_the_statement=ships_the_statement,
-            the_flag_ships_the_incremental_write=ships_the_incremental_write,
-            # The month this minute falls in, which is what a request arriving
-            # in it would have been asking about. Taken from the minute rather
-            # than from the clock, so that a window fetched twice reads the
-            # same both times - the same reason every other figure here is
-            # seeded from the minute's own id.
-            statement_period=period_for(minute.month, minute.year),
-            the_pricing_call_was_slow=index < calls_that_waited,
-            rollout_entropy=rollout_entropy,
-            share_of_minute_half_rolled_out=share_of_minute_half_rolled_out,
-        )
-        for index in range(_SAMPLE_SIZE)
-    ]
+    outcomes, drawn_so_far = _the_pages_served(
+        minute,
+        share_of_minute_flagged,
+        share_of_minute_refused,
+        cache_endpoint,
+        share_of_minute_without_the_cache,
+        reached_by_the_rollout,
+        the_flag_ships_the_slow_feature=slow_rollout is not None,
+        the_flag_ships_the_statement=ships_the_statement,
+        the_flag_ships_the_incremental_write=ships_the_incremental_write,
+        calls_that_waited=calls_that_waited,
+        the_fleet_can_split=paused_rollout is not None,
+        share_of_minute_half_rolled_out=share_of_minute_half_rolled_out,
+    )
+    # Picked up where the pages left it, so every figure drawn below is the one
+    # it was when the pages and the figures were drawn in one go.
+    entropy = random.Random()
+    entropy.setstate(drawn_so_far)
     failures = [served.failure for served in outcomes if served.failure is not None]
     served_the_broken_path = sum(1 for served in outcomes if served.flag_is_on)
     evaluated_on = (
@@ -1949,6 +1930,87 @@ def _generate_minute(
     )
 
 
+# How many minutes' pages to keep. Each is two hundred served pages, so this is
+# sized in windows rather than in minutes: the window being read, the one it
+# was a mitigation ago, and room for the minutes a run moves on by.
+_PAGE_SAMPLES_WORTH_REMEMBERING = 1024
+
+
+@lru_cache(maxsize=_PAGE_SAMPLES_WORTH_REMEMBERING)
+def _the_pages_served(
+    minute: datetime,
+    share_of_minute_flagged: float,
+    share_of_minute_refused: float,
+    cache_endpoint: CacheEndpoint | None,
+    share_of_minute_without_the_cache: float,
+    reached_by_the_rollout: int,
+    the_flag_ships_the_slow_feature: bool,
+    the_flag_ships_the_statement: bool,
+    the_flag_ships_the_incremental_write: bool,
+    calls_that_waited: int,
+    the_fleet_can_split: bool,
+    share_of_minute_half_rolled_out: float,
+) -> tuple[tuple[_ServedPage, ...], tuple[Any, ...]]:
+    """The minute's sample of account pages, put through the shop once and then
+    remembered - and where the minute's own sequence stood once they were drawn.
+
+    Most of what building a window costs, and the reason this is remembered
+    apart from `_a_whole_minute`. That one is keyed on every condition whole, so
+    a scale-out or a revert misses on all 360 minutes, including the hours before
+    it. This is keyed only on what the conditions came to *in this minute*, which
+    is everything a page here is decided by - so a minute a change did not reach
+    reads the same key it read before, and only the minutes from the change on
+    are served again. What a page cannot see cannot make a remembered one stale.
+
+    The sequence's state is handed back because the minute goes on drawing from
+    it after the pages - the wobbles, the heap, the CPU - and a remembered sample
+    has to leave those figures exactly where drawing it would have.
+    """
+    minute_id = minute.strftime(TIMESTAMP_FORMAT)
+    entropy = random.Random(minute_id)
+    # A sequence of its own, so that consulting a cache on every request cannot
+    # move a single figure drawn from the one above. Seeded from the same
+    # minute, so this minute reads the same however often it is fetched.
+    cache_entropy = (
+        random.Random(f"{minute_id}-cache") if cache_endpoint is not None else None
+    )
+    # A third sequence, seeded from the same minute and kept apart from both, for
+    # the reason the cache has one of its own: which side of a split fleet served
+    # a request is a draw per request, and taking it from either sequence above
+    # would move a figure in every scenario that has no rollout in it. Made only
+    # where one is staged, so a shop whose fleet is on one revision takes no draw
+    # at all.
+    rollout_entropy = (
+        random.Random(f"{minute_id}-rollout") if the_fleet_can_split else None
+    )
+    pages = tuple(
+        _serve_one_account_page(
+            entropy,
+            share_of_minute_flagged,
+            share_of_minute_refused,
+            cache_entropy,
+            share_of_minute_without_the_cache,
+            cache_endpoint,
+            the_rollout_reached_it=index < reached_by_the_rollout,
+            the_flag_ships_the_slow_feature=the_flag_ships_the_slow_feature,
+            the_flag_ships_the_statement=the_flag_ships_the_statement,
+            the_flag_ships_the_incremental_write=the_flag_ships_the_incremental_write,
+            # The month this minute falls in, which is what a request arriving
+            # in it would have been asking about. Taken from the minute rather
+            # than from the clock, so that a window fetched twice reads the
+            # same both times - the same reason every other figure here is
+            # seeded from the minute's own id.
+            statement_period=period_for(minute.month, minute.year),
+            the_pricing_call_was_slow=index < calls_that_waited,
+            rollout_entropy=rollout_entropy,
+            share_of_minute_half_rolled_out=share_of_minute_half_rolled_out,
+        )
+        for index in range(_SAMPLE_SIZE)
+    )
+
+    return pages, entropy.getstate()
+
+
 def _how_much_was_filed_confidently(prices: list[int],
                                     filed_by_the_upgrade: float,
                                     upgraded_to: str | None) -> float | None:
@@ -2078,7 +2140,7 @@ def _the_quantile_at(sorted_latencies: list[int], quantile: float) -> int:
     return sorted_latencies[position]
 
 
-def _how_much_the_cache_carried(outcomes: list[_ServedPage]) -> float | None:
+def _how_much_the_cache_carried(outcomes: Sequence[_ServedPage]) -> float | None:
     """The share of this minute's requests the cache answered, or `None` where
     the deployment has no cache.
 
@@ -2095,7 +2157,7 @@ def _how_much_the_cache_carried(outcomes: list[_ServedPage]) -> float | None:
 
 
 def _cache_lines_for(minute_id: str,
-                     outcomes: list[_ServedPage],
+                     outcomes: Sequence[_ServedPage],
                      minute: datetime | None = None,
                      promoted_at: datetime | None = None) -> tuple[str, ...]:
     """What the shop said about its cache this minute.
@@ -2167,7 +2229,7 @@ def _cache_lines_for(minute_id: str,
     return tuple(said)
 
 
-def _pricing_lines_for(minute_id: str, outcomes: list[_ServedPage]) -> tuple[str, ...]:
+def _pricing_lines_for(minute_id: str, outcomes: Sequence[_ServedPage]) -> tuple[str, ...]:
     """What the shop said about the pricing service this minute.
 
     Quiet while it answers in the time it always does, for the reason the cache
@@ -2605,7 +2667,7 @@ def _decoy_evaluation_line(
 
 
 def _renderer_lines_for(
-    minute_id: str, outcomes: list[_ServedPage], decoy_flag: str | None
+    minute_id: str, outcomes: Sequence[_ServedPage], decoy_flag: str | None
 ) -> tuple[str, ...]:
     """Which renderer served this minute's account pages, where two flags moved.
 

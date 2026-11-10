@@ -865,6 +865,11 @@ def seed_scenario(body: SeedRequest) -> ScenarioStatus:
 
     try:
         state.seed(SCENARIOS[body.scenario_id])
+        # The new window built here rather than by its first reader. Every
+        # minute of it is new, so the build is a whole one, and the first reader
+        # is whoever the seed paged - a responder's opening look, with a timeout
+        # of its own, made while the seed's caller has time to spare.
+        _the_buckets()
     except FlagProviderUnavailable as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
 

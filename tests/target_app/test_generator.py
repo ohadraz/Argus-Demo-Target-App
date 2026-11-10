@@ -166,6 +166,22 @@ def test_a_completed_minute_reads_the_same_every_time() -> None:
     assert first == second
 
 
+def test_a_minute_before_a_revert_reads_as_it_did_before_the_revert() -> None:
+    # A minute's pages are remembered by what the conditions came to in that
+    # minute, so a revert reuses every minute it did not reach. Reused or not,
+    # the minute has to say what it said before - and every figure drawn after
+    # its pages has to be where it was.
+    timeline = a_flag_on_since(10)
+    reverted = FlagTimeline(
+        turned_on_at=timeline.turned_on_at, turned_off_at=SOME_NOW - timedelta(minutes=3)
+    )
+
+    before = minute_at(5, generate(timeline, SOME_NOW, SOME_SPAN_MINUTES))
+    after = minute_at(5, generate(reverted, SOME_NOW, SOME_SPAN_MINUTES))
+
+    assert before == after
+
+
 def test_the_minute_in_progress_is_the_newest_one() -> None:
     minutes = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES)
 
