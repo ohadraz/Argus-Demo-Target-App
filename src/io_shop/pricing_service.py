@@ -14,13 +14,17 @@ chose that spelling - which is why the fact is published in the service
 catalogue rather than left to be inferred here.
 
 The shop does not retry and does not price the basket itself when the service
-is slow, and it says how long each call took.
+is slow, and it says how long each call took. It also does not wait for ever:
+the basket total is a convenience the page renders without, so a call that runs
+past its budget is abandoned and reported as no price, rather than becoming the
+account page's own latency.
 
 How the service is reached is the caller's to supply.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final
@@ -39,6 +43,17 @@ BASKET_PATH: Final = "/v1/shoppers/{shopper_id}/basket-total"
 # in its own logs, and a service that has never been near this number is one
 # nobody writes a line about.
 SLOW_CALL_MS: Final = 200
+
+# How long the account page will wait for a basket total at all. Past this the
+# call is abandoned and the page renders without the total - which it is built
+# to do - instead of taking on the pricing service's latency in full.
+PRICING_BUDGET_MS: Final = 300
+
+# Where calls run, so that waiting on one can be bounded. A handful of workers:
+# a hung call holds one, and the page still stops waiting at the budget.
+_CALLS: Final = concurrent.futures.ThreadPoolExecutor(
+    max_workers=8, thread_name_prefix="pricing-call"
+)
 
 
 @dataclass(frozen=True)
@@ -89,22 +104,39 @@ type AskThePricingService = Callable[[str], PricingAnswer]
 def basket_total(shopper_id: str, ask: AskThePricingService) -> PricedBasket:
     """What this shopper's basket comes to, and what the call cost to make.
 
-    Raises `PricingServiceFailed` for anything that is not a price. A slow price
-    is a price: it comes back with the words for how slow, so the shop can put
-    them in its own logs and a reader can see where a request's time went
-    without having any telemetry of the pricing service's own.
+    Raises `PricingServiceFailed` for anything that is not a price, and for a
+    call that ran past `PRICING_BUDGET_MS` - the page renders without a basket
+    total, and a basket total is not worth the whole page's latency. A slow
+    price inside the budget is a price: it comes back with the words for how
+    slow, so the shop can put them in its own logs and a reader can see where a
+    request's time went without having any telemetry of the pricing service's
+    own.
 
     Those words are the whole point of this function. A log line saying only
     "account page took 1900ms" describes every slow incident equally, and leaves
     a reader to guess which of the shop's own lines was the slow one - when in
     fact none of them was.
     """
-    answer = ask(shopper_id)
+    path = BASKET_PATH.format(shopper_id=shopper_id)
+    call = _CALLS.submit(ask, shopper_id)
+
+    try:
+        answer = call.result(timeout=PRICING_BUDGET_MS / 1000)
+    except concurrent.futures.TimeoutError:
+        call.cancel()
+        raise PricingServiceFailed(
+            f"{PRICING_HOST} did not answer within {PRICING_BUDGET_MS}ms for {path}"
+        ) from None
+
+    if answer.took_ms > PRICING_BUDGET_MS:
+        raise PricingServiceFailed(
+            f"{PRICING_HOST} took {answer.took_ms}ms for {path}, past the "
+            f"{PRICING_BUDGET_MS}ms budget"
+        )
 
     if answer.total_cents is None:
         raise PricingServiceFailed(
-            f"{PRICING_HOST} returned no price for "
-            f"{BASKET_PATH.format(shopper_id=shopper_id)}"
+            f"{PRICING_HOST} returned no price for {path}"
         )
 
     return PricedBasket(
