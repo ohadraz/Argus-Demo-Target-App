@@ -21,7 +21,12 @@ from io_shop.monthly_statement import (
     StatementPeriod,
     render_monthly_statement,
 )
-from io_shop.payment_provider import AskTheProvider, card_on_file
+from io_shop.payment_provider import (
+    AskTheProvider,
+    PaymentProviderFailed,
+    StoredCard,
+    card_on_file,
+)
 from io_shop.pricing_service import (
     AskThePricingService,
     PricedBasket,
@@ -76,6 +81,12 @@ class RenderedPage:
     place when the pricing service gave no price, and `pricing_failure` is the
     error's own words, for the log - a page that rendered without its basket
     total, like one that rendered without its cache.
+
+    `card_unavailable` and `card_failure` are the same pair for the card: what
+    the shopper is told where the card would be when the payment provider gave
+    none, and the provider's failure in its own words - host, path and status -
+    for the log. The shopper is told rather than shown nothing, so the page does
+    not invite a purchase with a card nobody could confirm.
     """
 
     figure_cents: int | None
@@ -88,10 +99,18 @@ class RenderedPage:
     pricing_delay: str | None = None
     pricing_unavailable: str | None = None
     pricing_failure: str | None = None
+    card_unavailable: str | None = None
+    card_failure: str | None = None
 
 
 # What the page says in the basket total's place when pricing gave no price.
 PRICING_UNAVAILABLE: Final = "Pricing is not available right now. Please check again later."
+
+# What the page says in the card's place when the payment provider gave none.
+CARD_UNAVAILABLE: Final = (
+    "Your saved card cannot be shown right now, and payments may not go through. "
+    "Please check again later."
+)
 
 
 def serve_account_page(account: Account,
@@ -106,14 +125,16 @@ def serve_account_page(account: Account,
                        ) -> RenderedPage:
     """Renders the account page, reporting a failure rather than raising one.
 
-    Three things are shown, and two of them are needed: what the shopper
-    averages per item, which Io works out for itself, and the card it would
-    charge, which only the payment provider knows. The third, what their basket
-    comes to, which the pricing service works out, is a convenience - the page
-    is still worth showing without it. The basket and the card are calls to
-    other services from inside a page render, which is ordinary and is why a
-    slowdown or an outage over there arrives here as Io's own latency and Io's
-    own error rate.
+    Three things are shown, and one of them is needed: what the shopper
+    averages per item, which Io works out for itself. The card it would charge,
+    which only the payment provider knows, and what their basket comes to,
+    which the pricing service works out, are both shown when their services
+    answer and replaced by a notice when they do not - the page is still worth
+    showing without them, and a page that failed whole whenever another
+    company's service did would turn every outage over there into an outage
+    here. The basket and the card are calls to other services from inside a
+    page render, which is ordinary and is why a slowdown over there arrives
+    here as Io's own latency.
 
     The two are not the same kind of neighbour, and nothing in this function
     tells them apart: one is another team's service and one is another company's,
@@ -150,7 +171,7 @@ def serve_account_page(account: Account,
         basket, pricing_failure = _the_basket_for(
             account.shopper_id, ask_the_pricing_service
         )
-        card = card_on_file(account.shopper_id, ask_the_provider)
+        card, card_failure = _the_card_for(account.shopper_id, ask_the_provider)
     except Exception as error:  # noqa: BLE001 - the boundary records anything
         failure = f"{type(error).__name__}: {error} at {_where_it_was_raised(error)}"
         record_visit(account.shopper_id, failure)
@@ -160,7 +181,7 @@ def serve_account_page(account: Account,
     record_visit(account.shopper_id, str(figure_cents))
 
     return RenderedPage(figure_cents=figure_cents,
-                        card_last_four=card.last_four,
+                        card_last_four=card.last_four if card else None,
                         failure=None,
                         served_from_cache=from_cache,
                         cache_failure=cache_failure,
@@ -168,7 +189,26 @@ def serve_account_page(account: Account,
                         basket_total_cents=basket.total_cents if basket else None,
                         pricing_delay=basket.slow_call if basket else None,
                         pricing_unavailable=None if basket else PRICING_UNAVAILABLE,
-                        pricing_failure=pricing_failure)
+                        pricing_failure=pricing_failure,
+                        card_unavailable=None if card else CARD_UNAVAILABLE,
+                        card_failure=card_failure)
+
+
+def _the_card_for(shopper_id: str,
+                  ask_the_provider: AskTheProvider
+                  ) -> tuple[StoredCard | None, str | None]:
+    """The card on file, or nothing and the provider's own words where the
+    provider gave no card.
+
+    Caught here rather than at the boundary, for the same reason as the basket:
+    the page is worth showing without the card, and the provider is another
+    company's service whose outage should not take the whole page with it. Only
+    the provider's failure is caught; anything else still reaches the boundary.
+    """
+    try:
+        return card_on_file(shopper_id, ask_the_provider), None
+    except PaymentProviderFailed as error:
+        return None, f"{type(error).__name__}: {error}"
 
 
 def _the_basket_for(shopper_id: str,
@@ -177,7 +217,7 @@ def _the_basket_for(shopper_id: str,
     """The basket total, or nothing and the reason where pricing gave no price.
 
     Caught here rather than at the boundary, because the page is worth showing
-    without its basket total, where it is not without the card.
+    without its basket total.
     """
     try:
         return basket_total(shopper_id, ask_the_pricing_service), None
