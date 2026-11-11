@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 from io_shop.pricing_service import (
@@ -17,7 +20,8 @@ Two things worth pinning, and the second is the one the incident rests on. A
 service that answers no price fails the page, in words that name the service
 rather than the shop. And a service that answers slowly does not fail anything -
 it produces a line saying where the time went, which is the only evidence a
-caller has about a dependency nobody is watching.
+caller has about a dependency nobody is watching. A service that does not answer
+within the budget, though, is not waited on: the shop gives up on the total.
 """
 
 
@@ -29,6 +33,17 @@ def a_service_answering_in(took_ms: int) -> AskThePricingService:
 
 def a_service_with_no_price() -> AskThePricingService:
     return lambda dont_care_shopper: PricingAnswer(total_cents=None, took_ms=6)
+
+
+def a_service_that_stalls_until(released: threading.Event) -> AskThePricingService:
+    """A service that really does not answer - not one that merely reports a
+    large duration - until the test lets it go."""
+
+    def ask(dont_care_shopper: str) -> PricingAnswer:
+        released.wait(timeout=10)
+        return PricingAnswer(total_cents=8400, took_ms=10_000)
+
+    return ask
 
 
 def test_a_prompt_answer_is_a_price_and_nothing_to_report() -> None:
@@ -69,3 +84,28 @@ def test_no_price_fails_in_words_that_name_the_service() -> None:
         basket_total("shopper-42", a_service_with_no_price())
 
     assert PRICING_HOST in str(raised.value)
+
+
+def test_a_service_that_does_not_answer_in_budget_is_not_waited_on() -> None:
+    # The incident: the service took 1500ms and the page took 1500ms more.
+    # The shop must stop waiting at its budget, not at the service's leisure.
+    released = threading.Event()
+    started = time.monotonic()
+
+    try:
+        with pytest.raises(PricingServiceFailed) as raised:
+            basket_total("shopper-42", a_service_that_stalls_until(released),
+                         budget_ms=100)
+        waited = time.monotonic() - started
+    finally:
+        released.set()
+
+    assert waited < 1.0
+    assert PRICING_HOST in str(raised.value)
+    assert "shopper-42" in str(raised.value)
+
+
+def test_an_answer_within_budget_is_still_a_price() -> None:
+    priced = basket_total("shopper-42", a_service_answering_in(12), budget_ms=1000)
+
+    assert priced.total_cents == 8400
