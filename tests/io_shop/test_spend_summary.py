@@ -50,6 +50,40 @@ def test_the_lifetime_average_follows_the_purchases_not_the_carried_total() -> N
     assert average_spend_per_item(an_account_whose_total_drifted) == 2000
 
 
+class _CountedPurchase:
+    """A purchase that counts how often its price is read."""
+
+    reads = 0
+
+    def __init__(self, price_cents: int) -> None:
+        self._price_cents = price_cents
+        self.in_current_month = False
+
+    @property
+    def price_cents(self) -> int:
+        _CountedPurchase.reads += 1
+        return self._price_cents
+
+
+def test_the_lifetime_average_reads_each_purchase_once() -> None:
+    # The default figure on the busiest page: its cost must grow with the
+    # history, not with its square. Re-summing every prefix reads n(n+1)/2
+    # prices - 20,100 for this history - instead of 200.
+    purchases = tuple(_CountedPurchase(100 * (i + 1)) for i in range(200))
+    a_long_history = Account(
+        shopper_id="shopper-with-a-long-history",
+        purchases=purchases,  # type: ignore[arg-type]
+        total_cents=0,
+        total_this_month_cents=0,
+    )
+    _CountedPurchase.reads = 0
+
+    figure = average_spend_per_item(a_long_history)
+
+    assert figure == sum(100 * (i + 1) for i in range(200)) // 200
+    assert _CountedPurchase.reads <= len(purchases)
+
+
 def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
     # The ordinary case for the monthly figure: a shopper who has bought
     # something this month, averaged over what they bought this month.
