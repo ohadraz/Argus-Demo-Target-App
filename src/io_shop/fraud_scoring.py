@@ -29,10 +29,11 @@ import math
 from typing import Final
 
 # Whether the scorer lets the accelerator run its arithmetic in TF32 where the
-# accelerator can. The frameworks' own switch, under the frameworks' own name,
-# and on for the reason it is on in most deployments: it is several times faster
-# on the hardware that supports it.
-ALLOW_TF32 = True
+# accelerator can. The frameworks' own switch, under the frameworks' own name.
+# Off for this model: its decision lives in the small difference between two
+# large products that TF32's rounding swamps, so allowing it makes the scorer's
+# decisions depend on which card a replica lands on. Full precision everywhere.
+ALLOW_TF32 = False
 
 # The accelerators that run matrix arithmetic in TF32 when allowed to, by the
 # product name a node advertises its GPU under. Ampere introduced the format;
