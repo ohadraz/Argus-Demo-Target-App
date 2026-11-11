@@ -221,6 +221,13 @@ def _the_figure_for(
     fallback the whole scenario rests on: the page is correct either way, and
     the only thing the cache decides is how long getting here took.
 
+    An entry is only used where it was worked out over the purchases this
+    account has now. Each entry carries the number of purchases it counted, and
+    the page already holds the purchases, so an entry counting a different
+    number is a copy that stopped keeping up - and serving it would put a stale
+    figure in front of the shopper for as long as the cache answers. Such an
+    entry is treated as a miss and the figure is worked out.
+
     A cache failure is returned rather than raised onward, because it is not
     this request's failure. The request succeeded.
     """
@@ -238,7 +245,7 @@ def _the_figure_for(
     except CacheUnreachable as unreachable:
         found, cache_failure = None, str(unreachable)
 
-    if found is not None:
+    if found is not None and found.items_counted == len(account.purchases):
         return found.amount_cents, True, cache_failure
 
     return render_spend_summary(
