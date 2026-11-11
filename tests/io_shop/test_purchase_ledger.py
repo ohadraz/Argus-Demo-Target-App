@@ -3,7 +3,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from io_shop.accounts import Account, Purchase
-from io_shop.purchase_ledger import record_purchase
+from io_shop.purchase_ledger import (
+    record_a_purchase,
+    record_purchase,
+    record_purchase_deriving_the_month,
+)
+from io_shop.spend_reconciliation import reconcile_monthly_totals
 
 """Writing a purchase down, and moving the totals that describe it.
 
@@ -105,3 +110,41 @@ def test_a_shopper_with_no_history_can_be_written_to() -> None:
     recorded = record_purchase(a_new_shopper, a_purchase_of(500))
 
     assert (recorded.total_cents, recorded.total_this_month_cents) == (500, 500)
+
+
+def test_deriving_the_month_still_leaves_the_months_total_right() -> None:
+    # The path that derives the month has to write what it derived onto the
+    # account, not leave the field where it was.
+    account = an_account_with(1000)
+    account = record_purchase_deriving_the_month(account, a_purchase_of(500))
+    account = record_purchase_deriving_the_month(account, a_purchase_of(700))
+    account = record_purchase_deriving_the_month(
+        account, a_purchase_of(300, this_month=False)
+    )
+
+    assert (account.total_cents, account.total_this_month_cents) == (2500, 1200)
+
+
+def test_either_write_path_leaves_nothing_for_the_reconciliation_to_find() -> None:
+    for derive_the_month in (False, True):
+        account = an_account_with(1000)
+        account = record_a_purchase(account, a_purchase_of(500), derive_the_month)
+        account = record_a_purchase(account, a_purchase_of(900), derive_the_month)
+
+        assert account.total_this_month_cents == 1400
+        assert not reconcile_monthly_totals([account]).anything_disagrees
+
+
+def test_deriving_the_month_puts_a_drifted_total_right() -> None:
+    # A total that fell behind before this write is corrected by it rather than
+    # carried forward.
+    drifted = Account(
+        shopper_id="shopper-with-a-stale-total",
+        purchases=(a_purchase_of(800),),
+        total_cents=800,
+        total_this_month_cents=0,
+    )
+
+    recorded = record_purchase_deriving_the_month(drifted, a_purchase_of(200))
+
+    assert recorded.total_this_month_cents == 1000
