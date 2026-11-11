@@ -2,8 +2,15 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from io_shop.accounts import Account, Purchase
-from io_shop.purchase_ledger import record_purchase
+from io_shop.purchase_ledger import (
+    record_a_purchase,
+    record_purchase,
+    record_purchase_deriving_the_month,
+)
+from io_shop.spend_reconciliation import reconcile_monthly_totals
 
 """Writing a purchase down, and moving the totals that describe it.
 
@@ -105,3 +112,56 @@ def test_a_shopper_with_no_history_can_be_written_to() -> None:
     recorded = record_purchase(a_new_shopper, a_purchase_of(500))
 
     assert (recorded.total_cents, recorded.total_this_month_cents) == (500, 500)
+
+
+def test_deriving_the_month_still_stores_what_the_month_comes_to() -> None:
+    # A path that left the stored month where it was would leave the account
+    # holding a month total its own purchases do not add up to.
+    account = an_account_with(1000, 2000)
+
+    recorded = record_purchase_deriving_the_month(account, a_purchase_of(500))
+
+    assert (recorded.total_cents, recorded.total_this_month_cents) == (3500, 500)
+
+
+def test_deriving_the_month_leaves_it_alone_for_an_earlier_months_purchase() -> None:
+    account = an_account_with(1000)
+
+    recorded = record_purchase_deriving_the_month(
+        account, a_purchase_of(500, this_month=False)
+    )
+
+    assert (recorded.total_cents, recorded.total_this_month_cents) == (1500, 0)
+
+
+def test_deriving_the_month_corrects_a_month_that_had_drifted() -> None:
+    # Two purchases this month, and a stored month that missed both of them.
+    drifted = Account(
+        shopper_id="shopper-whose-month-fell-behind",
+        purchases=(
+            Purchase(price_cents=1200, in_current_month=True),
+            Purchase(price_cents=800, in_current_month=True),
+        ),
+        total_cents=2000,
+        total_this_month_cents=0,
+    )
+
+    recorded = record_purchase_deriving_the_month(drifted, a_purchase_of(500))
+
+    assert recorded.total_this_month_cents == 2500
+
+
+@pytest.mark.parametrize("derive_the_month", [False, True])
+def test_either_write_path_leaves_the_month_reconciling(
+    derive_the_month: bool,
+) -> None:
+    account = an_account_with(1000, 2000)
+
+    for purchase in (
+        a_purchase_of(500),
+        a_purchase_of(700, this_month=False),
+        a_purchase_of(300),
+    ):
+        account = record_a_purchase(account, purchase, derive_the_month)
+
+    assert not reconcile_monthly_totals([account]).anything_disagrees
