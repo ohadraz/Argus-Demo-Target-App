@@ -8,9 +8,8 @@ of the history instead: the price as many purchases sit below as above.
 `typical-purchase-feature` decides whether a request gets this figure, and a
 request that does not get it renders the figure it rendered before.
 
-The figure it produces is right for every history the shop has. What it is not
-is cheap, and the cost follows the shape of the code rather than anything it is
-waiting on.
+The figure is found with a single sort of the history, so its cost grows as
+n log n in the number of purchases rather than with the square of it.
 """
 
 from __future__ import annotations
@@ -21,16 +20,15 @@ from io_shop.accounts import Account
 def typical_spend_per_item(account: Account) -> int:
     """The middle price in this shopper's history.
 
-    Found by taking the cheapest purchase that is left, over and over, until
-    the middle of the history is what remains. On an even-length history that
-    lands on the lower of the two middles, which is the one a shopper reading
-    "your typical purchase" can point at - a figure interpolated between two
-    prices is one nobody paid.
+    Found by ordering the history once and reading the middle of it. On an
+    even-length history that lands on the lower of the two middles, which is
+    the one a shopper reading "your typical purchase" can point at - a figure
+    interpolated between two prices is one nobody paid.
+
+    Raises ValueError for an empty history, as it always has.
     """
-    remaining = [purchase.price_cents for purchase in account.purchases]
-    below_the_middle = (len(remaining) - 1) // 2
+    prices = sorted(purchase.price_cents for purchase in account.purchases)
+    if not prices:
+        raise ValueError("an account with no purchases has no typical purchase")
 
-    for _ in range(below_the_middle):
-        remaining.remove(min(remaining))
-
-    return min(remaining)
+    return prices[(len(prices) - 1) // 2]
