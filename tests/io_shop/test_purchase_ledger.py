@@ -2,8 +2,15 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from io_shop.accounts import Account, Purchase
-from io_shop.purchase_ledger import record_purchase
+from io_shop.purchase_ledger import (
+    record_a_purchase,
+    record_purchase,
+    record_purchase_deriving_the_month,
+)
+from io_shop.spend_reconciliation import reconcile_monthly_totals
 
 """Writing a purchase down, and moving the totals that describe it.
 
@@ -105,3 +112,61 @@ def test_a_shopper_with_no_history_can_be_written_to() -> None:
     recorded = record_purchase(a_new_shopper, a_purchase_of(500))
 
     assert (recorded.total_cents, recorded.total_this_month_cents) == (500, 500)
+
+
+# The path behind the rollout has to leave the stored month total as right as
+# the other path does.
+
+
+def an_account_with_this_months(*prices: int) -> Account:
+    """A shopper whose stored month total agrees with this month's purchases."""
+    return Account(
+        shopper_id="shopper-buying-this-month",
+        purchases=tuple(
+            Purchase(price_cents=price, in_current_month=True) for price in prices
+        ),
+        total_cents=sum(prices),
+        total_this_month_cents=sum(prices),
+    )
+
+
+def test_deriving_the_month_still_moves_the_months_total() -> None:
+    account = an_account_with_this_months(1000, 2000)
+
+    recorded = record_purchase_deriving_the_month(account, a_purchase_of(500))
+
+    assert (recorded.total_cents, recorded.total_this_month_cents) == (3500, 3500)
+
+
+def test_deriving_the_month_ignores_an_earlier_months_purchase() -> None:
+    account = an_account_with_this_months(1000)
+
+    recorded = record_purchase_deriving_the_month(
+        account, a_purchase_of(500, this_month=False)
+    )
+
+    assert (recorded.total_cents, recorded.total_this_month_cents) == (1500, 1000)
+
+
+def test_deriving_the_month_puts_right_a_total_that_had_fallen_behind() -> None:
+    behind = Account(
+        shopper_id="shopper-whose-total-fell-behind",
+        purchases=(Purchase(price_cents=1000, in_current_month=True),),
+        total_cents=1000,
+        total_this_month_cents=0,
+    )
+
+    recorded = record_purchase_deriving_the_month(behind, a_purchase_of(500))
+
+    assert recorded.total_this_month_cents == 1500
+
+
+@pytest.mark.parametrize("derive_the_month", [False, True])
+def test_either_path_leaves_totals_that_reconcile(derive_the_month: bool) -> None:
+    account = an_account_with_this_months(1000)
+
+    for price in (500, 129_731, 250):
+        account = record_a_purchase(account, a_purchase_of(price), derive_the_month)
+
+    assert account.total_this_month_cents == 1000 + 500 + 129_731 + 250
+    assert not reconcile_monthly_totals([account]).anything_disagrees
