@@ -50,6 +50,37 @@ def test_the_lifetime_average_follows_the_purchases_not_the_carried_total() -> N
     assert average_spend_per_item(an_account_whose_total_drifted) == 2000
 
 
+class _CountedPurchase:
+    """A purchase that counts how many times its price is read."""
+
+    reads = 0
+
+    def __init__(self, price_cents: int) -> None:
+        self._price_cents = price_cents
+        self.in_current_month = False
+
+    @property
+    def price_cents(self) -> int:
+        _CountedPurchase.reads += 1
+        return self._price_cents
+
+
+def test_the_lifetime_average_reads_each_price_once() -> None:
+    # A long history must cost work in proportion to its length; re-summing the
+    # list for every purchase made the account page ten times slower.
+    count = 200
+    _CountedPurchase.reads = 0
+    a_long_history = Account(
+        shopper_id="shopper-with-a-long-history",
+        purchases=tuple(_CountedPurchase(1000) for _ in range(count)),  # type: ignore[misc]
+        total_cents=1000 * count,
+        total_this_month_cents=0,
+    )
+
+    assert average_spend_per_item(a_long_history) == 1000
+    assert _CountedPurchase.reads <= count
+
+
 def test_the_monthly_average_is_correct_for_a_shopper_who_did_buy() -> None:
     # The ordinary case for the monthly figure: a shopper who has bought
     # something this month, averaged over what they bought this month.
