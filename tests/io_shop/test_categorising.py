@@ -42,6 +42,20 @@ def test_the_upgrade_files_everything_the_first_model_did_the_same_way() -> None
     assert categorise("Family cookbook", V2).category == "Books"
 
 
+def test_the_upgrade_reads_a_word_however_it_is_capitalised() -> None:
+    kettle = categorise("Kettle in brushed steel", V2)
+    assert kettle.category == "Kitchen"
+    assert kettle.confident
+
+    keyboard = categorise("KEYBOARD with backlight", V2)
+    assert keyboard.category == "Computing"
+    assert keyboard.confident
+
+    watch = categorise("Fitness Smartwatch", V2)
+    assert watch.category == "Wearables"
+    assert watch.confident
+
+
 def test_every_model_is_loadable_by_the_version_the_deployment_names() -> None:
     assert {version: model.version for version, model in MODELS.items()} == {
         "v1": "v1", "v2": "v2"
