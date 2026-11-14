@@ -2011,6 +2011,19 @@ def _the_pages_served(
     return pages, entropy.getstate()
 
 
+def forget_every_generated_minute() -> None:
+    """Drops every minute and every minute's pages the shop has remembered.
+
+    What a new process starts with anyway - the shop's own reset, for a
+    deployment that wants one without waiting for a restart. A remembered
+    minute is sound only while the draws it was made from stay the draws a
+    minute is made from; whoever changes them between runs has to start the
+    next one from nothing, or it is served minutes drawn for the last.
+    """
+    _a_whole_minute.cache_clear()
+    _the_pages_served.cache_clear()
+
+
 def _how_much_was_filed_confidently(prices: list[int],
                                     filed_by_the_upgrade: float,
                                     upgraded_to: str | None) -> float | None:

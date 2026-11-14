@@ -49,6 +49,7 @@ from target_app.generator import (
     Scaling,
     ScrapeOutage,
     SlowDeployment,
+    forget_every_generated_minute,
     when_a_flap_began_for_a_page_at,
     when_a_leak_began_for_a_page_at,
     when_a_surge_began_for_a_page_at,
@@ -1726,6 +1727,11 @@ class ScenarioState:
         # failure: the shop treats an unreachable cache as an ordinary day, and
         # one that never answered is holding nothing this reset could clear.
         forget_every_cached_summary()
+        # And every minute the generator remembered. A remembered minute is the
+        # one it would draw again only while its draws stay the same, and a run
+        # that seeds the shop's draws afresh - a replay moving them to its
+        # recording's minutes - was otherwise served the previous run's.
+        forget_every_generated_minute()
         # The platform's arrangement with the application goes back too. A
         # rollback suspends automated sync and a withdrawal puts it back, but a
         # run abandoned between the two leaves it off - and the next scenario

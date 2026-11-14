@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import random
 import re
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
+import pytest
 
 from io_shop.fraud_scoring import held_for_review
 from io_shop.payment_provider import PROVIDER_HOST
@@ -36,6 +40,7 @@ from target_app.generator import (
     ScrapeOutage,
     SlowDeployment,
     SlowRollout,
+    forget_every_generated_minute,
     generate,
     the_cores_of,
     when_a_flap_began_for_a_page_at,
@@ -1214,6 +1219,27 @@ def test_a_window_asked_for_twice_reads_the_same() -> None:
 
     assert [(m.minute_id, m.error_rate, m.p50_ms, m.p95_ms, m.p99_ms) for m in once] == \
            [(m.minute_id, m.error_rate, m.p50_ms, m.p95_ms, m.p99_ms) for m in again]
+
+
+def test_a_forgotten_window_is_drawn_again_from_the_draws_in_place_now(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A replay moves the shop's draws to its recording's minutes at every seed.
+    # Remembered minutes drawn before the move were served after it - the next
+    # case read the last one's noise - until a reset forgot them.
+    import target_app.generator as the_generator
+
+    before = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES)
+    monkeypatch.setattr(the_generator, "random", SimpleNamespace(
+        Random=lambda seed=None: random.Random(
+            None if seed is None else f"{seed}-drawn-elsewhere")))
+
+    forget_every_generated_minute()
+    after = generate(a_flag_on_since(10), SOME_NOW, SOME_SPAN_MINUTES)
+    monkeypatch.undo()
+    forget_every_generated_minute()
+
+    assert [m.p50_ms for m in after] != [m.p50_ms for m in before]
 
 
 def test_a_reverted_flag_is_visible_the_next_time_the_window_is_asked_for() -> None:
