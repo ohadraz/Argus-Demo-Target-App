@@ -494,6 +494,9 @@ class ScenarioState:
         # removing one rolls the whole deployment - and every pod the platform
         # reports from then on came up then.
         self._pods_replaced_at: datetime | None = None
+        # The annotations each object the platform holds carries, by kind. Only
+        # what somebody wrote: nothing is declared with any.
+        self._annotations: dict[str, dict[str, str]] = {}
 
     def _the_shops_flags(self) -> tuple[tuple[FlagClient, str], ...]:
         """Every flag the shop has, each with its role, in the shop's order."""
@@ -554,6 +557,9 @@ class ScenarioState:
         the log is a suspect nobody staged.
         """
         calm_from = utc_now()
+        # A mark is about a change, and the changes it was about belong to the
+        # run before. See `annotations_of`.
+        self._annotations = {}
         self._put_the_flags_back_where_they_rest()
         self._forget_what_the_flags_did(since=calm_from)
         # After the clearing, not before: it can take a moment for the provider
@@ -1025,6 +1031,29 @@ class ScenarioState:
         an application quietly not receiving anything anybody deploys to it.
         """
         self._sync_policy = copy.deepcopy(policy)
+
+    def annotations_of(self, kind: str) -> dict[str, str]:
+        """What the object of `kind` is annotated with, as anybody wrote it.
+
+        A copy, as the sync policy is. Forgotten on a reset and on a seeding,
+        unlike the sync policy on a seeding: an annotation here is a writer
+        marking a change as theirs, and the changes a seeding starts from are
+        none of the last run's.
+        """
+        return dict(self._annotations.get(kind, {}))
+
+    def annotate(self, kind: str, annotations: dict[str, str | None]) -> None:
+        """Merges `annotations` into the object of `kind`'s, as a merge patch
+        does: a value sets its key, and a `None` removes it."""
+        merged = dict(self._annotations.get(kind, {}))
+
+        for key, value in annotations.items():
+            if value is None:
+                merged.pop(key, None)
+            else:
+                merged[key] = value
+
+        self._annotations[kind] = merged
 
     @property
     def syncs_itself(self) -> bool:
@@ -1757,6 +1786,10 @@ class ScenarioState:
         # the scheduler may not move a pod in - an incident that never starts.
         self._accelerator_pin = None
         self._pods_replaced_at = None
+        # And whatever anybody wrote on the objects, which is about the changes
+        # just cleared: kept, the next run would read a mark on a deployment
+        # nobody has changed.
+        self._annotations = {}
 
         if active is None:
             self._put_the_flags_back_where_they_rest()

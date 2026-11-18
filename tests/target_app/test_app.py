@@ -886,6 +886,45 @@ def test_a_patch_reaching_past_the_sync_policy_is_refused(
     assert refused.status_code == 400
 
 
+def test_a_sync_patch_carrying_annotations_marks_the_application(
+    client: TestClient
+) -> None:
+    a_staged_cache_misconfiguration(client)
+
+    suspended = client.patch("/argocd/io-shop", json={
+        "name": "io-shop",
+        "patch": json.dumps({
+            "metadata": {"annotations": {"argus/action": "a"}},
+            "spec": {"syncPolicy": {"automated": {"enabled": False}}}
+        }),
+        "patchType": "merge"
+    })
+
+    assert suspended.status_code == 200
+    assert client.get("/argocd/io-shop").json()["metadata"]["annotations"] == {
+        "argus/action": "a"
+    }
+    assert the_automated_sync(client)["enabled"] is False
+
+
+def test_a_sync_patch_reaching_past_the_annotations_is_refused_whole(
+    client: TestClient
+) -> None:
+    a_staged_cache_misconfiguration(client)
+
+    refused = client.patch("/argocd/io-shop", json={
+        "name": "io-shop",
+        "patch": json.dumps({
+            "metadata": {"labels": {"x": "y"}},
+            "spec": {"syncPolicy": {"automated": {"enabled": False}}}
+        }),
+        "patchType": "merge"
+    })
+
+    assert refused.status_code == 400
+    assert the_automated_sync(client).get("enabled") is not False
+
+
 def test_a_patch_setting_a_field_the_policy_does_not_have_is_refused(
     client: TestClient
 ) -> None:
@@ -1536,13 +1575,26 @@ def test_a_patch_type_the_stand_in_does_not_apply_is_refused(
     assert refused.status_code == 400
 
 
-def test_a_patch_that_does_not_reach_the_floor_is_refused(
+def test_a_patch_reaching_past_the_floor_or_not_a_document_is_refused(
     client: TestClient
 ) -> None:
     a_staged_flapping_autoscaler(client)
 
-    assert patched(client, "io-shop", json.dumps({SPEC_FIELD: {}})).status_code == 400
+    assert patched(
+        client, "io-shop", json.dumps({SPEC_FIELD: {"maxReplicas": 9}})
+    ).status_code == 400
     assert patched(client, "io-shop", "not a document").status_code == 400
+    assert the_autoscaler_of(client, "io-shop")[MIN_REPLICAS_FIELD] == 3
+
+
+def test_an_autoscaler_patch_reaching_no_field_of_its_spec_changes_no_floor(
+    client: TestClient
+) -> None:
+    # As the platform answers it: applied, and nothing in the spec moves.
+    a_staged_flapping_autoscaler(client)
+
+    assert patched(client, "io-shop", json.dumps({SPEC_FIELD: {}})).status_code == 200
+    assert the_autoscaler_of(client, "io-shop")[MIN_REPLICAS_FIELD] == 3
 
 
 def test_a_floor_below_one_is_refused(client: TestClient) -> None:
@@ -2467,27 +2519,134 @@ def test_a_deployment_nobody_pinned_carries_no_selector(client: TestClient) -> N
     assert the_node_selector_of(client, "io-shop") == {}
 
 
-def test_a_deployment_patch_reaching_past_the_gpu_label_is_refused(
+def test_a_deployment_patch_reaching_past_its_size_and_gpu_label_is_refused(
     client: TestClient
 ) -> None:
     a_staged_rescheduled_replica(client)
+    replicas_before = the_deployment_of(client, "io-shop")["spec"]["replicas"]
 
     for patch in (
-        json.dumps({"spec": {"replicas": 9}}),
+        json.dumps({"spec": {"paused": True}}),
+        json.dumps({"spec": {"replicas": 0}}),
+        json.dumps({"spec": {"replicas": True}}),
         json.dumps({"spec": {"template": {"spec": {"nodeSelector": {
             "kubernetes.io/hostname": "gpu-v100-1"
         }}}}}),
         json.dumps({"spec": {"template": {"spec": {"nodeSelector": {
             GPU_PRODUCT: 7
         }}}}}),
+        # A good size beside a bad selector: refused whole, so the size is not
+        # set either.
         json.dumps({"spec": {"replicas": 9, "template": {"spec": {"nodeSelector": {
-            GPU_PRODUCT: "Tesla-V100-SXM2-16GB"
+            "kubernetes.io/hostname": "gpu-v100-1"
         }}}}}),
+        json.dumps({"metadata": {"name": "elsewhere"}, "spec": {"replicas": 9}}),
+        json.dumps({"metadata": {"annotations": {"argus/action": 7}},
+                    "spec": {"replicas": 9}}),
+        json.dumps({"status": {}, "spec": {"replicas": 9}}),
         "not a document",
     ):
         assert patched(client, "io-shop", patch, kind="Deployment").status_code == 400, patch
 
     assert the_node_selector_of(client, "io-shop") == {}
+    assert the_deployment_of(client, "io-shop")["spec"]["replicas"] == replicas_before
+    assert "annotations" not in the_deployment_of(client, "io-shop")["metadata"]
+
+
+def test_a_deployment_patch_reaching_no_field_of_its_spec_is_applied(
+    client: TestClient
+) -> None:
+    # As the platform answers it: a patch changing no field is still a patch,
+    # and the annotations it carries land.
+    a_staged_rescheduled_replica(client)
+    replicas_before = the_deployment_of(client, "io-shop")["spec"]["replicas"]
+
+    for patch in (
+        json.dumps({"spec": {}}),
+        json.dumps({"metadata": {"annotations": {"argus/action": "a"}}}),
+    ):
+        assert patched(client, "io-shop", patch, kind="Deployment").status_code == 200, patch
+
+    assert the_deployment_of(client, "io-shop")["spec"]["replicas"] == replicas_before
+    assert the_deployment_of(client, "io-shop")["metadata"]["annotations"] == {
+        "argus/action": "a"
+    }
+
+
+def test_a_patch_of_the_deployments_size_resizes_it(client: TestClient) -> None:
+    a_staged_rescheduled_replica(client)
+    some_replicas = the_deployed_replica_count() + 2
+
+    resized = patched(
+        client, "io-shop", json.dumps({"spec": {"replicas": some_replicas}}),
+        kind="Deployment"
+    )
+
+    assert resized.status_code == 200
+    assert the_deployment_of(client, "io-shop")["spec"]["replicas"] == some_replicas
+
+
+def test_a_patch_carrying_annotations_marks_the_deployment_and_a_null_removes_one(
+    client: TestClient
+) -> None:
+    a_staged_rescheduled_replica(client)
+    some_replicas = the_deployed_replica_count() + 2
+    patched(client, "io-shop", json.dumps({
+        "metadata": {"annotations": {"argus/action": "a", "argus/written-at": "t"}},
+        "spec": {"replicas": some_replicas}
+    }), kind="Deployment")
+
+    patched(client, "io-shop", json.dumps({
+        "metadata": {"annotations": {"argus/written-at": None}},
+        "spec": {"replicas": some_replicas}
+    }), kind="Deployment")
+
+    assert the_deployment_of(client, "io-shop")["metadata"]["annotations"] == {
+        "argus/action": "a"
+    }
+
+
+def test_a_floor_patch_carrying_annotations_marks_the_autoscaler(
+    client: TestClient
+) -> None:
+    a_staged_flapping_autoscaler(client)
+
+    pinned = patched(client, "io-shop", json.dumps({
+        "metadata": {"annotations": {"argus/action": "a"}},
+        "spec": {"minReplicas": 5}
+    }))
+
+    assert pinned.status_code == 200
+    manifest = json.loads(client.get(
+        "/argocd/io-shop/resource", params={**AN_AUTOSCALER, "kind": AUTOSCALER_KIND}
+    ).json()["manifest"])
+    assert manifest["metadata"]["annotations"] == {"argus/action": "a"}
+    assert manifest["spec"]["minReplicas"] == 5
+
+
+def test_a_reset_and_a_seeding_each_forget_every_annotation(client: TestClient) -> None:
+    for forget in (
+        lambda: client.post("/scenario/reset"),
+        lambda: a_staged_rescheduled_replica(client),
+    ):
+        a_staged_rescheduled_replica(client)
+        assert patched(client, "io-shop", json.dumps({
+            "metadata": {"annotations": {"argus/action": "a"}},
+            "spec": {"replicas": the_deployed_replica_count() + 2}
+        }), kind="Deployment").status_code == 200
+        assert client.patch("/argocd/io-shop", json={
+            "name": "io-shop",
+            "patch": json.dumps({"metadata": {"annotations": {"argus/action": "a"}}}),
+            "patchType": "merge"
+        }).status_code == 200
+        assert client.get("/argocd/io-shop").json()["metadata"]["annotations"] == {
+            "argus/action": "a"
+        }
+
+        forget()
+
+        assert "annotations" not in the_deployment_of(client, "io-shop")["metadata"]
+        assert "annotations" not in client.get("/argocd/io-shop").json()["metadata"]
 
 
 def test_the_pricing_service_has_no_deployment_to_pin(client: TestClient) -> None:

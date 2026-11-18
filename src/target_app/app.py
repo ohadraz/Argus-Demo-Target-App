@@ -11,7 +11,14 @@ from fastapi import Body, FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from io_shop.endpoints import the_shops_routes
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    ValidationError,
+    model_serializer,
+)
 
 from target_app import alert_rules, console, prometheus, scenarios
 from target_app.accelerators import (
@@ -307,6 +314,15 @@ MIN_REPLICAS_FIELD = "minReplicas"
 DEPLOYMENT_KIND = "Deployment"
 TEMPLATE_FIELD = "template"
 NODE_SELECTOR_FIELD = "nodeSelector"
+# And its size, which a merge patch sets as Kubernetes' own `spec.replicas` - the
+# one way a writer can resize it and mark the resize in the same write, since the
+# `scale` action takes no metadata.
+REPLICAS_FIELD = "replicas"
+# What every object here may carry beside the field a caller changes: annotations
+# on its own metadata, which is how a writer marks a change as its own.
+METADATA_FIELD = "metadata"
+ANNOTATIONS_FIELD = "annotations"
+APPLICATION_KIND = "Application"
 
 # How a Deployment says how far a rolling update has got, in Kubernetes' own
 # vocabulary. A rollout in progress and a rollout that finished are the same
@@ -551,6 +567,18 @@ class ArgoCdRevisionHistory(BaseModel):
 class ArgoCdApplicationMetadata(BaseModel):
     name: str
     namespace: str
+    annotations: dict[str, str] = {}
+
+    @model_serializer(mode="wrap")
+    def _without_an_empty_map(self, handler: SerializerFunctionWrapHandler) -> Any:
+        """The annotations left out where there are none, as Kubernetes omits an
+        empty map and Argo CD's gateway keeps the omission."""
+        serialized = handler(self)
+
+        if not serialized.get("annotations"):
+            serialized.pop("annotations", None)
+
+        return serialized
 
 
 class ArgoCdApplicationStatus(BaseModel):
@@ -1215,7 +1243,7 @@ def _the_deployment_of(application: str) -> dict[str, Any]:
     return {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
-        "metadata": {"name": application, "namespace": "production"},
+        "metadata": _the_metadata_of(DEPLOYMENT_KIND, application),
         "spec": {
             "replicas": replicas,
             "paused": _is_paused(rollout),
@@ -1241,6 +1269,18 @@ def _the_deployment_of(application: str) -> dict[str, Any]:
             ),
             "conditions": [_the_progress_of(rollout)],
         },
+    }
+
+
+def _the_metadata_of(kind: str, application: str) -> dict[str, Any]:
+    """An object's metadata: its name, its namespace, and its annotations where
+    anybody wrote any - absent otherwise, as Kubernetes omits an empty map."""
+    annotations = state.annotations_of(kind)
+
+    return {
+        "name": application,
+        "namespace": "production",
+        **({ANNOTATIONS_FIELD: annotations} if annotations else {}),
     }
 
 
@@ -1345,12 +1385,16 @@ def argocd_patch_resource(application: str,
     taking a parsed object would be an easier endpoint to write against and not the
     one the adapter will meet.
 
-    Two kinds and one field of each. A patch addressed at anything but the
-    autoscaler or the Deployment, or carrying anything but the autoscaler's floor
-    or the Deployment's GPU node selector, is refused rather than quietly
-    accepted: a platform answering 200 to a patch it did not apply would have a
-    caller believe production had changed when it had not, which is the same
-    reason an unknown resource action is refused above.
+    Two kinds, and of each only what a caller may change: the autoscaler's floor,
+    and the Deployment's size and GPU node selector - each with annotations on
+    the object's own metadata beside it, which is how a writer marks the change as
+    its own. A patch addressed at anything else, or carrying anything else, is
+    refused rather than quietly accepted: a platform answering 200 to a patch it
+    did not apply would have a caller believe production had changed when it had
+    not, which is the same reason an unknown resource action is refused above.
+    The whole patch is read before any of it is applied, so a refused one changes
+    nothing. One reaching no field of the spec - annotations alone, or an empty
+    spec - is applied as the platform applies it, with a 200.
 
     Argo CD answers an empty body on success, and so does this.
     """
@@ -1371,6 +1415,10 @@ def argocd_patch_resource(application: str,
             detail=f"unsupported patch type: {patchType}",
         )
 
+    patch = _the_merge_patch_in(body)
+    annotations = _the_annotations_in(patch)
+    spec = patch.get(SPEC_FIELD)
+
     if kind == DEPLOYMENT_KIND:
         if application == PRICING_APPLICATION:
             raise HTTPException(
@@ -1378,7 +1426,15 @@ def argocd_patch_resource(application: str,
                 detail=f"{PRICING_APPLICATION} has no managed Deployment to patch",
             )
 
-        state.pin_to_accelerator(_the_accelerator_in(body))
+        replicas, pins, accelerator = _the_deployment_changes_in(spec)
+
+        if replicas is not None:
+            state.scale_the_deployment_to(replicas)
+
+        if pins:
+            state.pin_to_accelerator(accelerator)
+
+        state.annotate(DEPLOYMENT_KIND, annotations)
 
         return {}
 
@@ -1388,83 +1444,118 @@ def argocd_patch_resource(application: str,
             detail=f"{application} has no {AUTOSCALER_KIND} deployed",
         )
 
-    state.pin_the_autoscaler_floor_to(_the_floor_in(body))
+    # A patch reaching no field of the spec changes none, and is answered as
+    # the platform answers it: applied, whatever else it carried.
+    if spec:
+        state.pin_the_autoscaler_floor_to(_the_floor_in(spec))
+
+    state.annotate(AUTOSCALER_KIND, annotations)
 
     return {}
 
 
-def _the_floor_in(body: str) -> int:
-    """The floor the patch asks for, or a refusal.
+def _the_merge_patch_in(body: str) -> dict[str, Any]:
+    """The patch as a document reaching only an object's spec and metadata, or a
+    refusal.
 
-    Refused four ways, all of them 400, because all four are the same mistake said
-    differently: a body that is not a document, a document that does not reach the
-    field, a value that is not a number, and a number that is not a count. A real
-    server rejects a malformed merge patch the same way, and a caller has to be
-    able to tell that from a floor it successfully set.
+    A 400 for a body that is not a JSON object, as a real server rejects a
+    malformed merge patch, and for one reaching anything else - status, say,
+    which nobody patches.
     """
     try:
         patch = json.loads(body)
-        floor = patch[SPEC_FIELD][MIN_REPLICAS_FIELD]
-    except Exception:
+    except ValueError:
         raise HTTPException(
-            status_code=400,
-            detail=(
-                f"the patch must be a merge patch setting "
-                f"{SPEC_FIELD}.{MIN_REPLICAS_FIELD}"
-            ),
+            status_code=400, detail="the patch is not JSON"
         ) from None
 
-    try:
-        floor = int(floor)
-    except (TypeError, ValueError):
+    if not isinstance(patch, dict) or set(patch) - {SPEC_FIELD, METADATA_FIELD}:
         raise HTTPException(
             status_code=400,
-            detail=f"invalid number: {floor}",
-        ) from None
-
-    if floor < 1:
-        raise HTTPException(
-            status_code=400,
-            detail=f"{MIN_REPLICAS_FIELD} must be at least one, not {floor}",
+            detail=f"the patch may reach only {SPEC_FIELD} and {METADATA_FIELD}",
         )
 
-    return floor
+    return patch
 
 
-def _the_accelerator_in(body: str) -> str | None:
-    """The card the patch holds the pods to, `None` for a patch that releases
-    them, or a refusal.
+def _the_annotations_in(patch: dict[str, Any]) -> dict[str, str | None]:
+    """The annotations the patch writes, each a string to set or a null to
+    remove, or a refusal - and nothing where it reaches no metadata.
 
-    A merge patch that reaches the GPU label on the pod template's node selector
-    and nothing else, with a string to set or a null to remove - RFC 7386's own
-    way of deleting a key. Everything else is refused with a 400, for the reason
-    a malformed floor is: a caller has to be able to tell a patch the platform
-    could not read from one it applied.
+    Annotations and nothing else of the metadata: the name and the namespace
+    are the object's address, and a patch moving them is no patch this
+    platform takes.
     """
+    metadata = patch.get(METADATA_FIELD)
+
+    if metadata is None:
+        return {}
+
     refusal = HTTPException(
         status_code=400,
         detail=(
-            f"the patch must be a merge patch setting only "
+            f"only {METADATA_FIELD}.{ANNOTATIONS_FIELD}, each a string or null, "
+            f"may be patched in {METADATA_FIELD}"
+        ),
+    )
+
+    if not isinstance(metadata, dict) or list(metadata) != [ANNOTATIONS_FIELD]:
+        raise refusal
+
+    annotations = metadata[ANNOTATIONS_FIELD]
+
+    if not isinstance(annotations, dict) or any(
+        value is not None and not isinstance(value, str)
+        for value in annotations.values()
+    ):
+        raise refusal
+
+    return dict(annotations)
+
+
+def _the_deployment_changes_in(spec: Any) -> tuple[int | None, bool, str | None]:
+    """The size the patch asks for, whether it reaches the card the pods are held
+    to, and that card - or a refusal.
+
+    A count is a number of at least one, and a pin is the GPU label on the pod
+    template's node selector and nothing else, with a string to set or a null to
+    remove - RFC 7386's own way of deleting a key. Everything else is refused with
+    a 400, for the reason a malformed floor is: a caller has to be able to tell a
+    patch the platform could not read from one it applied.
+    """
+    if spec is None:
+        return None, False, None
+
+    refusal = HTTPException(
+        status_code=400,
+        detail=(
+            f"the patch may set only {SPEC_FIELD}.{REPLICAS_FIELD} and "
             f"{SPEC_FIELD}.{TEMPLATE_FIELD}.{SPEC_FIELD}.{NODE_SELECTOR_FIELD}"
             f".{GPU_PRODUCT_LABEL}"
         ),
     )
 
+    if not isinstance(spec, dict) or set(spec) - {REPLICAS_FIELD, TEMPLATE_FIELD}:
+        raise refusal
+
+    replicas = None
+
+    if REPLICAS_FIELD in spec:
+        replicas = _a_count(spec[REPLICAS_FIELD], REPLICAS_FIELD)
+
+    if TEMPLATE_FIELD not in spec:
+        return replicas, False, None
+
+    template = spec[TEMPLATE_FIELD]
+
     try:
-        patch = json.loads(body)
-        selector = patch[SPEC_FIELD][TEMPLATE_FIELD][SPEC_FIELD][NODE_SELECTOR_FIELD]
-    except (ValueError, KeyError, TypeError):
+        selector = template[SPEC_FIELD][NODE_SELECTOR_FIELD]
+    except (KeyError, TypeError):
         raise refusal from None
 
-    reaches_only_the_selector = (
-        list(patch) == [SPEC_FIELD]
-        and list(patch[SPEC_FIELD]) == [TEMPLATE_FIELD]
-        and list(patch[SPEC_FIELD][TEMPLATE_FIELD]) == [SPEC_FIELD]
-        and list(patch[SPEC_FIELD][TEMPLATE_FIELD][SPEC_FIELD]) == [NODE_SELECTOR_FIELD]
-    )
-
     if (
-        not reaches_only_the_selector
+        list(template) != [SPEC_FIELD]
+        or list(template[SPEC_FIELD]) != [NODE_SELECTOR_FIELD]
         or not isinstance(selector, dict)
         or list(selector) != [GPU_PRODUCT_LABEL]
     ):
@@ -1475,7 +1566,49 @@ def _the_accelerator_in(body: str) -> str | None:
     if accelerator is not None and not isinstance(accelerator, str):
         raise refusal
 
-    return accelerator
+    return replicas, True, accelerator
+
+
+def _the_floor_in(spec: Any) -> int:
+    """The floor the patch asks for, or a refusal.
+
+    Refused, all with a 400, where the spec reaches anything but the floor and
+    where the floor is not a count. A real server rejects a malformed merge patch
+    the same way, and a caller has to be able to tell that from a floor it
+    successfully set.
+    """
+    if not isinstance(spec, dict) or list(spec) != [MIN_REPLICAS_FIELD]:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"the patch must be a merge patch setting "
+                f"{SPEC_FIELD}.{MIN_REPLICAS_FIELD}"
+            ),
+        )
+
+    return _a_count(spec[MIN_REPLICAS_FIELD], MIN_REPLICAS_FIELD)
+
+
+def _a_count(value: Any, field: str) -> int:
+    """`value` as a count of at least one, or a 400 naming `field`."""
+    if isinstance(value, bool):
+        raise HTTPException(status_code=400, detail=f"invalid number: {value}")
+
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid number: {value}",
+        ) from None
+
+    if count < 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field} must be at least one, not {count}",
+        )
+
+    return count
 
 
 def _the_autoscaler_of(application: str) -> ArgoCdManagedResource:
@@ -1505,7 +1638,7 @@ def _the_autoscaler_of(application: str) -> ArgoCdManagedResource:
             {
                 "apiVersion": f"{AUTOSCALER_GROUP}/{AUTOSCALER_VERSION}",
                 "kind": AUTOSCALER_KIND,
-                "metadata": {"name": application, "namespace": "production"},
+                "metadata": _the_metadata_of(AUTOSCALER_KIND, application),
                 "spec": {
                     "scaleTargetRef": {
                         "apiVersion": "apps/v1",
@@ -1552,10 +1685,12 @@ def argocd_patch_application(application: str,
     part of rolling back rather than a separate concern, and it is the half a
     withdrawal has to put back.
 
-    A merge patch (RFC 7386) only, of `spec.syncPolicy` only. The real route
-    also takes a JSON patch, and a patch of anything in the application; this
-    application has a sync policy and nothing else that may change, so any
-    other patch is refused rather than answered as though it had landed.
+    A merge patch (RFC 7386) only, of `spec.syncPolicy` and the annotations on
+    the application's own metadata only - the second being how a writer marks
+    the change as its own. The real route also takes a JSON patch, and a patch
+    of anything in the application; this application has a sync policy and
+    nothing else that may change, so any other patch is refused rather than
+    answered as though it had landed.
     """
     _the_platform_has_to_answer()
 
@@ -1575,10 +1710,12 @@ def argocd_patch_application(application: str,
     if not _touches_only_the_sync_policy(patch):
         raise HTTPException(
             status_code=400,
-            detail="only spec.syncPolicy may be patched here"
+            detail="only spec.syncPolicy and metadata.annotations may be patched here"
         )
 
-    patched = _merged({"spec": {"syncPolicy": state.sync_policy}}, patch)
+    annotations = _the_annotations_in(patch)
+    patched = _merged({"spec": {"syncPolicy": state.sync_policy}},
+                      {key: value for key, value in patch.items() if key == "spec"})
     policy = patched.get("spec", {}).get("syncPolicy") or {}
 
     try:
@@ -1589,12 +1726,15 @@ def argocd_patch_application(application: str,
         ) from error
 
     state.set_sync_policy(policy)
+    state.annotate(APPLICATION_KIND, annotations)
 
     return argocd_application(application)
 
 
 def _touches_only_the_sync_policy(patch: Any) -> bool:
-    if not isinstance(patch, dict) or set(patch) - {"spec"}:
+    """Whether the patch reaches the sync policy, the annotations beside it, or
+    both, and nothing else - the annotations' own shape is read apart."""
+    if not isinstance(patch, dict) or set(patch) - {"spec", METADATA_FIELD}:
         return False
 
     spec = patch.get("spec", {})
@@ -2163,7 +2303,11 @@ def argocd_application(application: str) -> ArgoCdApplication:
     has a deploy, not how its telemetry is produced.
     """
     return ArgoCdApplication(
-        metadata=ArgoCdApplicationMetadata(name=application, namespace="argocd"),
+        metadata=ArgoCdApplicationMetadata(
+            name=application,
+            namespace="argocd",
+            annotations=state.annotations_of(APPLICATION_KIND),
+        ),
         spec=_the_spec_now(),
         status=ArgoCdApplicationStatus(history=_the_revision_history()),
     )
