@@ -317,6 +317,10 @@ services:
       # does, as every push's run wants; the nightly passes 1, so the path a
       # real source produces - a minute reported once it is over - is walked too.
       PROMETHEUS_REPORTING_LAG_MINUTES: "${PROMETHEUS_REPORTING_LAG_MINUTES:-0}"
+      # Which accounts the Argo CD stand-in knows, as a JSON map from API token
+      # to account name. Unset, it knows nobody, and every rollback through it is
+      # refused as a real Argo CD refuses a token it never issued.
+      ARGOCD_ACCOUNTS: "${ARGOCD_ACCOUNTS:-}"
     extra_hosts:
       # Linux daemons do not resolve `host.docker.internal` on their own; Docker
       # Desktop does. Declaring it costs nothing where it is already there and

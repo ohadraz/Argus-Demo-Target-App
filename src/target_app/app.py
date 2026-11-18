@@ -7,13 +7,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from io_shop.endpoints import the_shops_routes
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from target_app import alert_rules, console, prometheus
+from target_app import alert_rules, console, prometheus, scenarios
 from target_app.accelerators import (
     GPU_PRODUCT_LABEL,
     PRICING_NODE,
@@ -64,6 +64,7 @@ from target_app.scenarios import (
     scenario_span_minutes,
 )
 from target_app.settings import (
+    get_argocd_settings,
     get_prometheus_settings,
     get_scenario_settings,
     get_unleash_settings,
@@ -1620,7 +1621,9 @@ def _merged(target: Any, patch: Any) -> Any:
 
 
 @app.post("/argocd/{application}/rollback", response_model=ArgoCdApplication)
-def argocd_rollback(application: str, body: ArgoCdRollback) -> ArgoCdApplication:
+def argocd_rollback(application: str,
+                    body: ArgoCdRollback,
+                    authorization: str | None = Header(default=None)) -> ArgoCdApplication:
     """Stands in for Argo CD's `POST /api/v1/applications/{name}/rollback`.
 
     Returns the application to a revision it has already deployed. Nothing is
@@ -1637,8 +1640,17 @@ def argocd_rollback(application: str, body: ArgoCdRollback) -> ArgoCdApplication
     Refused, too, for a history entry that does not exist. A platform that
     accepted a rollback to a revision it never deployed would have a caller
     believe production had moved when it had not.
+
+    Recorded as the platform records it: a rollback is a sync, and every sync
+    the platform completes is a history entry of its own - the revision it
+    synced, under the account whose token asked for it. So the newest entry
+    after a rollback is the rollback, and a later rollback addressed to "the one
+    before" is addressed to what this one took the application off. Which way
+    it goes is decided by the revision the entry carries: back to the revision
+    the scenario deployed puts the rollback back, anything else rolls back.
     """
     _the_platform_has_to_answer()
+    account = _the_account_of(authorization)
 
     if state.syncs_itself:
         raise HTTPException(
@@ -1650,22 +1662,28 @@ def argocd_rollback(application: str, body: ArgoCdRollback) -> ArgoCdApplication
         )
 
     history = _the_revision_history()
+    target = next((entry for entry in history if entry.id == body.id), None)
 
-    if body.id not in {entry.id for entry in history}:
+    if target is None:
         raise HTTPException(
             status_code=400,
             detail=f"no revision history entry with id {body.id}",
         )
 
-    if body.id == history[-1].id:
-        # The newest entry is the revision the application was already on, so
-        # asking for it is not a rollback at all - it is a withdrawal, which is
-        # how Argus puts a mitigation back. The endpoint is the platform's own
-        # and takes a direction the same way the platform's does: by which
-        # history entry it is addressed to.
+    if target.revision == _the_deployed_history()[-1].revision:
         state.withdraw_the_rollback()
     else:
         state.roll_the_deployment_back()
+
+    at = to_the_second(scenarios.utc_now())
+    _rollbacks_since_the_seed().append(ArgoCdRevisionHistory(
+        id=history[-1].id + 1,
+        revision=target.revision,
+        deployedAt=at,
+        deployStartedAt=at,
+        source=target.source,
+        initiatedBy=ArgoCdInitiator(username=account),
+    ))
 
     return argocd_application(application)
 
@@ -2160,8 +2178,51 @@ def _the_spec_now() -> ArgoCdApplicationSpec:
     )
 
 
+_ROLLBACKS: dict[datetime, list[ArgoCdRevisionHistory]] = {}
+
+
+def _rollbacks_since_the_seed() -> list[ArgoCdRevisionHistory]:
+    """The history entries rollbacks have added since the scenario was seeded -
+    forgotten with the scenario, as a new application's history starts empty."""
+    active = state.active
+    seeded_at = active.seeded_at if active is not None else None
+
+    if seeded_at is None:
+        return []
+
+    for other in [key for key in _ROLLBACKS if key != seeded_at]:
+        del _ROLLBACKS[other]
+
+    return _ROLLBACKS.setdefault(seeded_at, [])
+
+
+def _the_account_of(authorization: str | None) -> str:
+    """The account the request's bearer token belongs to.
+
+    Refused without one, and for one nobody issued, as Argo CD refuses both with
+    anonymous access off - its default. A change made under no account could not
+    be told apart from anybody's, and a history that recorded one would have the
+    caller's own change read back as a stranger's.
+    """
+    scheme, _, token = (authorization or "").partition(" ")
+    account = get_argocd_settings().accounts.get(token) if scheme == "Bearer" else None
+
+    if account is None:
+        raise HTTPException(status_code=401, detail="invalid session: token is not valid")
+
+    return account
+
+
 def _the_revision_history() -> list[ArgoCdRevisionHistory]:
-    """What this application has had deployed to it, oldest first.
+    """What this application has had deployed to it, oldest first: what the
+    scenario deployed, then every rollback since."""
+    deployed = _the_deployed_history()
+
+    return deployed + _rollbacks_since_the_seed() if deployed else deployed
+
+
+def _the_deployed_history() -> list[ArgoCdRevisionHistory]:
+    """What the scenario deployed to this application, oldest first.
 
     Two sources, because a deploy can be staged two ways. An authored scenario
     hangs one on whichever of its minutes it landed in; a generated scenario

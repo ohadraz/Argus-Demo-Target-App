@@ -73,7 +73,11 @@ from target_app.scenarios import (
     TIMESTAMP_FORMAT,
     UPSTREAM_DEPENDENCY_FAILURE,
 )
-from target_app.settings import get_scenario_settings, the_deployed_replica_count
+from target_app.settings import (
+    get_argocd_settings,
+    get_scenario_settings,
+    the_deployed_replica_count,
+)
 from target_app.state import ScenarioState
 
 """The service's own endpoints, asked the way anybody actually asks them.
@@ -88,6 +92,21 @@ No lifespan: it waits for a real flag provider, and nothing here stages a flag.
 """
 
 RESTART_ACTION_PATH = "/argocd/io-shop/resource/actions/v2"
+
+# One account the Argo CD stand-in knows, and the header its token is sent in.
+AN_ARGOCD_TOKEN = "argocd_test_token"
+AN_ARGOCD_ACCOUNT = "deployer"
+AS_THE_DEPLOYER = {"Authorization": f"Bearer {AN_ARGOCD_TOKEN}"}
+
+
+@pytest.fixture(autouse=True)
+def an_argocd_that_knows_one_account(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """The stand-in configured with one account, for every test, and forgotten
+    after it - its settings are read once and cached."""
+    monkeypatch.setenv("ARGOCD_ACCOUNTS", json.dumps({AN_ARGOCD_TOKEN: AN_ARGOCD_ACCOUNT}))
+    get_argocd_settings.cache_clear()
+    yield
+    get_argocd_settings.cache_clear()
 
 
 def _the_catalogs_own_clients_replaced_by(
@@ -707,7 +726,7 @@ def test_a_rollback_is_refused_while_the_application_syncs_itself(
     # bring it back the moment it is allowed to.
     a_staged_cache_misconfiguration(client)
 
-    refused = client.post("/argocd/io-shop/rollback", json={"id": 1})
+    refused = client.post("/argocd/io-shop/rollback", json={"id": 1}, headers=AS_THE_DEPLOYER)
 
     assert refused.status_code == 400
 
@@ -718,7 +737,7 @@ def test_a_rollback_to_a_revision_never_deployed_is_refused(
     a_staged_cache_misconfiguration(client)
     suspend_automated_sync(client)
 
-    refused = client.post("/argocd/io-shop/rollback", json={"id": 99})
+    refused = client.post("/argocd/io-shop/rollback", json={"id": 99}, headers=AS_THE_DEPLOYER)
 
     assert refused.status_code == 400
 
@@ -729,9 +748,64 @@ def test_suspending_automated_sync_then_rolling_back_is_accepted(
     a_staged_cache_misconfiguration(client)
     suspend_automated_sync(client)
 
-    rolled_back = client.post("/argocd/io-shop/rollback", json={"id": 1})
+    rolled_back = client.post("/argocd/io-shop/rollback", json={"id": 1}, headers=AS_THE_DEPLOYER)
 
     assert rolled_back.status_code == 200
+
+
+def test_a_rollback_is_recorded_as_the_newest_history_entry_under_the_tokens_account(
+    client: TestClient
+) -> None:
+    # What Argo CD does with every sync it completes: the revision it synced,
+    # under the account that asked for it.
+    a_staged_cache_misconfiguration(client)
+    suspend_automated_sync(client)
+    deployed = client.get("/argocd/io-shop").json()["status"]["history"]
+
+    client.post("/argocd/io-shop/rollback", json={"id": deployed[0]["id"]},
+                headers=AS_THE_DEPLOYER)
+
+    history = client.get("/argocd/io-shop").json()["status"]["history"]
+    assert len(history) == len(deployed) + 1
+    assert history[-1]["id"] == deployed[-1]["id"] + 1
+    assert history[-1]["revision"] == deployed[0]["revision"]
+    assert history[-1]["initiatedBy"]["username"] == AN_ARGOCD_ACCOUNT
+
+
+@pytest.mark.parametrize("headers", [{}, {"Authorization": "Bearer a-token-nobody-issued"}],
+                         ids=["no-token", "unknown-token"])
+def test_a_rollback_without_a_token_the_platform_issued_is_refused_and_changes_nothing(
+    client: TestClient, headers: dict[str, str]
+) -> None:
+    a_staged_cache_misconfiguration(client)
+    suspend_automated_sync(client)
+    deployed = client.get("/argocd/io-shop").json()["status"]["history"]
+
+    refused = client.post("/argocd/io-shop/rollback", json={"id": deployed[0]["id"]},
+                          headers=headers)
+
+    assert refused.status_code == 401
+    assert client.get("/argocd/io-shop").json()["status"]["history"] == deployed
+
+
+def test_a_rollback_back_to_the_deployed_revision_puts_the_rollback_back_and_is_recorded(
+    client: TestClient
+) -> None:
+    # A put-back is addressed to the entry the rollback took the application
+    # off, which is no longer the newest once the rollback is recorded - so it
+    # is told by the revision it carries.
+    a_staged_cache_misconfiguration(client)
+    suspend_automated_sync(client)
+    deployed = client.get("/argocd/io-shop").json()["status"]["history"]
+    client.post("/argocd/io-shop/rollback", json={"id": deployed[0]["id"]},
+                headers=AS_THE_DEPLOYER)
+
+    client.post("/argocd/io-shop/rollback", json={"id": deployed[-1]["id"]},
+                headers=AS_THE_DEPLOYER)
+
+    history = client.get("/argocd/io-shop").json()["status"]["history"]
+    assert len(history) == len(deployed) + 2
+    assert history[-1]["revision"] == deployed[-1]["revision"]
 
 
 def test_the_application_starts_with_self_heal_on(client: TestClient) -> None:
@@ -765,7 +839,7 @@ def test_restoring_removes_the_switch_and_the_application_syncs_itself_again(
     automated = the_automated_sync(client)
     assert automated["enabled"] is None
     assert automated["selfHeal"] is True
-    assert client.post("/argocd/io-shop/rollback", json={"id": 1}).status_code == 400
+    assert client.post("/argocd/io-shop/rollback", json={"id": 1}, headers=AS_THE_DEPLOYER).status_code == 400
 
 
 def test_a_patch_removing_automated_entirely_leaves_the_application_unsynced(
@@ -784,7 +858,7 @@ def test_a_patch_removing_automated_entirely_leaves_the_application_unsynced(
     )
 
     assert the_automated_sync(client) is None
-    assert client.post("/argocd/io-shop/rollback", json={"id": 1}).status_code == 200
+    assert client.post("/argocd/io-shop/rollback", json={"id": 1}, headers=AS_THE_DEPLOYER).status_code == 200
 
 
 def test_a_patch_type_other_than_merge_is_refused(client: TestClient) -> None:
@@ -1647,7 +1721,7 @@ def test_rolling_the_deployment_back_converges_the_manifest(
     a_staged_paused_rollout(client)
     suspend_automated_sync(client)
 
-    rolled_back = client.post("/argocd/io-shop/rollback", json={"id": 1})
+    rolled_back = client.post("/argocd/io-shop/rollback", json={"id": 1}, headers=AS_THE_DEPLOYER)
 
     assert rolled_back.status_code == 200
 
@@ -1743,14 +1817,14 @@ def test_the_paused_rollout_is_offered_in_the_console(client: TestClient) -> Non
 def test_withdrawing_the_rollback_returns_the_shop_to_the_mixture(
     client: TestClient
 ) -> None:
-    # The newest history entry is the revision the application was already on,
-    # so asking for it is the withdrawal rather than a second rollback - and the
-    # platform reports a fleet split again.
+    # Addressed to the entry the rollback took the application off - the
+    # scenario's deployed revision - so it is the withdrawal rather than a second
+    # rollback, and the platform reports a fleet split again.
     a_staged_paused_rollout(client)
     suspend_automated_sync(client)
-    client.post("/argocd/io-shop/rollback", json={"id": 1})
+    client.post("/argocd/io-shop/rollback", json={"id": 1}, headers=AS_THE_DEPLOYER)
 
-    withdrawn = client.post("/argocd/io-shop/rollback", json={"id": 2})
+    withdrawn = client.post("/argocd/io-shop/rollback", json={"id": 2}, headers=AS_THE_DEPLOYER)
 
     assert withdrawn.status_code == 200
 
@@ -1767,7 +1841,7 @@ def test_a_converged_fleet_says_when_it_converged(client: TestClient) -> None:
     # minute ago twelve hours back.
     a_staged_paused_rollout(client)
     suspend_automated_sync(client)
-    client.post("/argocd/io-shop/rollback", json={"id": 1})
+    client.post("/argocd/io-shop/rollback", json={"id": 1}, headers=AS_THE_DEPLOYER)
 
     condition = the_deployment_of(client, "io-shop")["status"]["conditions"][0]
 
@@ -2030,7 +2104,7 @@ def test_a_rollback_is_refused_by_a_platform_that_will_not_act(
     # second call to a platform that is taking none.
     a_staged_unreachable_control_plane(client)
 
-    refused = client.post("/argocd/io-shop/rollback", json={"id": 1})
+    refused = client.post("/argocd/io-shop/rollback", json={"id": 1}, headers=AS_THE_DEPLOYER)
 
     assert refused.status_code == 503
 

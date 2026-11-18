@@ -175,6 +175,23 @@ class PrometheusSettings(BaseSettings):
     reporting_lag_minutes: int = Field(default=0, ge=0, le=1)
 
 
+class ArgoCdSettings(BaseSettings):
+    """Who the shop's Argo CD stand-in knows, by the token each one presents.
+
+    `accounts` maps an API token to the account it belongs to, as Argo CD's own
+    accounts each hold tokens. A rollback is recorded under the account that
+    asked for it - its history entry carries it - and a rollback under a token
+    nobody issued is refused, as Argo CD refuses it. Empty by default, so a stand-in nobody
+    configured knows nobody, and an unset variable is no setting at all rather
+    than a map nobody can parse.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="ARGOCD_", extra="ignore",
+                                      env_ignore_empty=True)
+
+    accounts: dict[str, str] = Field(default_factory=dict)
+
+
 def the_deployed_cache_endpoint(values_file: Path = VALUES_FILE) -> CacheEndpoint:
     """Where the deployment says the cache is.
 
@@ -291,3 +308,8 @@ def get_scenario_settings() -> ScenarioSettings:
 @lru_cache
 def get_prometheus_settings() -> PrometheusSettings:
     return PrometheusSettings()
+
+
+@lru_cache
+def get_argocd_settings() -> ArgoCdSettings:
+    return ArgoCdSettings()
