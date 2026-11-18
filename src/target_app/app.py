@@ -323,6 +323,12 @@ REPLICAS_FIELD = "replicas"
 METADATA_FIELD = "metadata"
 ANNOTATIONS_FIELD = "annotations"
 APPLICATION_KIND = "Application"
+# What a pod template runs, in Kubernetes' words, and where this estate's images
+# are built to. The revision a shop nobody deployed to settled on, for a
+# Deployment whose history is empty.
+CONTAINERS_FIELD = "containers"
+IMAGE_REPOSITORY = "ghcr.io/io-shop"
+A_SETTLED_REVISION = "0000000000000000000000000000000000000000"
 
 # How a Deployment says how far a rolling update has got, in Kubernetes' own
 # vocabulary. A rollout in progress and a rollout that finished are the same
@@ -1256,9 +1262,10 @@ def _the_deployment_of(application: str) -> dict[str, Any]:
                 "type": ROLLING_UPDATE_STRATEGY,
                 "rollingUpdate": {"maxSurge": "100%", "maxUnavailable": 0},
             },
-            # The pod template, and of it only the node selector - the one part
-            # of it a caller may change here, and absent until somebody has.
-            TEMPLATE_FIELD: {SPEC_FIELD: _the_pod_spec()},
+            # The pod template: the image of the revision running, and the node
+            # selector - the one part of it a caller may change here, and
+            # absent until somebody has.
+            TEMPLATE_FIELD: {SPEC_FIELD: _the_pod_spec(application)},
         },
         "status": {
             "replicas": (
@@ -1284,15 +1291,38 @@ def _the_metadata_of(kind: str, application: str) -> dict[str, Any]:
     }
 
 
-def _the_pod_spec() -> dict[str, Any]:
-    """The part of the pod template a pin changes: its node selector, where the
-    deployment's pods are held to one card, and nothing where they are not."""
+def _the_pod_spec(application: str) -> dict[str, Any]:
+    """The pod template's spec as it is running: one container, on the image of
+    the revision the platform last deployed, and the node selector a pin
+    changes - where the deployment's pods are held to one card, and nothing
+    where they are not."""
+    containers = {CONTAINERS_FIELD: [_a_container_of(application, _the_revision_running())]}
     pinned_to = state.accelerator_pin
 
     if pinned_to is None:
-        return {}
+        return containers
 
-    return {NODE_SELECTOR_FIELD: {GPU_PRODUCT_LABEL: pinned_to}}
+    return {**containers, NODE_SELECTOR_FIELD: {GPU_PRODUCT_LABEL: pinned_to}}
+
+
+def _the_revision_running() -> str:
+    """The revision the platform last deployed - the newest entry of its history,
+    a rollback's included - or the one a shop nobody deployed to settled on."""
+    history = _the_revision_history()
+
+    return history[-1].revision if history else A_SETTLED_REVISION
+
+
+def _a_container_of(application: str, revision: str) -> dict[str, str]:
+    """The application's one container as `revision` declares it: named for the
+    application, on the image that revision was built as.
+
+    An image per revision, as a build pipeline tags one, so a caller can tell
+    which revision a Deployment is running from its pods - and a rollback
+    somebody made with kubectl, which Argo CD's history never sees, from one
+    the platform made.
+    """
+    return {"name": application, "image": f"{IMAGE_REPOSITORY}/{application}:{revision[:12]}"}
 
 
 def _is_paused(rollout: PausedRollout | None) -> bool:
@@ -2311,6 +2341,43 @@ def argocd_application(application: str) -> ArgoCdApplication:
         spec=_the_spec_now(),
         status=ArgoCdApplicationStatus(history=_the_revision_history()),
     )
+
+
+class ArgoCdManifests(BaseModel):
+    """Argo CD's `ManifestResponse`: each manifest the revision renders, as the
+    JSON text of one object."""
+
+    manifests: list[str]
+
+
+@app.get("/argocd/{application}/manifests", response_model=ArgoCdManifests)
+def argocd_manifests(application: str, revision: str) -> ArgoCdManifests:
+    """Stands in for Argo CD's `GET /api/v1/applications/{name}/manifests`.
+
+    What git asks for at `revision`, rendered: here the one Deployment, on the
+    image that revision was built as. What a caller compares with the live
+    Deployment to learn whether what is running is what the platform deployed -
+    a rollback somebody made with kubectl leaves the platform's history alone
+    and the running image changed.
+
+    Any revision renders, as git renders any commit asked of it. The pricing
+    service renders no Deployment of the shop's, for the reason it has no
+    managed Deployment to report.
+    """
+    if application == PRICING_APPLICATION:
+        return ArgoCdManifests(manifests=[])
+
+    return ArgoCdManifests(manifests=[json.dumps({
+        "apiVersion": "apps/v1",
+        "kind": DEPLOYMENT_KIND,
+        "metadata": {"name": application, "namespace": "production"},
+        "spec": {
+            REPLICAS_FIELD: the_deployed_replica_count(),
+            TEMPLATE_FIELD: {
+                SPEC_FIELD: {CONTAINERS_FIELD: [_a_container_of(application, revision)]}
+            },
+        },
+    })])
 
 
 def _the_spec_now() -> ArgoCdApplicationSpec:

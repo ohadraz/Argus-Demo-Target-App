@@ -925,6 +925,56 @@ def test_a_sync_patch_reaching_past_the_annotations_is_refused_whole(
     assert the_automated_sync(client).get("enabled") is not False
 
 
+def the_images_running(client: TestClient) -> list[str]:
+    manifest = json.loads(client.get("/argocd/io-shop/resource").json()["manifest"])
+
+    return [c["image"] for c in manifest["spec"]["template"]["spec"]["containers"]]
+
+
+def the_images_rendered_at(client: TestClient, revision: str) -> list[str]:
+    rendered = client.get(
+        "/argocd/io-shop/manifests", params={"revision": revision}
+    ).json()["manifests"]
+    [deployment] = [json.loads(m) for m in rendered if json.loads(m)["kind"] == "Deployment"]
+
+    return [c["image"] for c in deployment["spec"]["template"]["spec"]["containers"]]
+
+
+def test_the_deployment_runs_the_image_of_the_revision_last_deployed(
+    client: TestClient
+) -> None:
+    a_staged_cache_misconfiguration(client)
+    history = client.get("/argocd/io-shop").json()["status"]["history"]
+
+    assert the_images_running(client) == the_images_rendered_at(client, history[-1]["revision"])
+    assert the_images_running(client) != the_images_rendered_at(client, history[-2]["revision"])
+
+
+def test_a_rollback_moves_the_deployment_onto_the_image_it_rolled_back_to(
+    client: TestClient
+) -> None:
+    # What lets a caller tell the platform's rollback from one made with
+    # kubectl: the running image follows the platform's history.
+    a_staged_cache_misconfiguration(client)
+    suspend_automated_sync(client)
+    history = client.get("/argocd/io-shop").json()["status"]["history"]
+
+    client.post("/argocd/io-shop/rollback", json={"id": history[-2]["id"]},
+                headers=AS_THE_DEPLOYER)
+
+    assert the_images_running(client) == the_images_rendered_at(client, history[-2]["revision"])
+
+
+def test_the_pricing_service_renders_no_deployment(client: TestClient) -> None:
+    a_staged_cache_misconfiguration(client)
+
+    rendered = client.get(
+        "/argocd/io-pricing/manifests", params={"revision": "dont-care"}
+    ).json()["manifests"]
+
+    assert rendered == []
+
+
 def test_a_patch_setting_a_field_the_policy_does_not_have_is_refused(
     client: TestClient
 ) -> None:
