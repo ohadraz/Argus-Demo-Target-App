@@ -4,6 +4,7 @@ import json
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from email.utils import formatdate
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +20,10 @@ from pydantic import (
     ValidationError,
     model_serializer,
 )
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from target_app import alert_rules, console, prometheus, scenarios
+from target_app import alert_rules, clock, console, prometheus, scenarios
 from target_app.accelerators import (
     GPU_PRODUCT_LABEL,
     PRICING_NODE,
@@ -230,7 +233,34 @@ def _set_to(client: FlagClient, enabled: bool) -> None:
         client.disable()
 
 
+class _DatedOnTheStacksClock:
+    """Dates every response by the stack's clock rather than the wall's.
+
+    The `Date` header is how a party with no other window on its clock is seen
+    to keep the stack's time, and uvicorn writes its own from the wall - so the
+    server is started with `date_header=False` and the header is written here.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+
+        async def dated(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message)["date"] = formatdate(
+                    clock.now().timestamp(), usegmt=True
+                )
+            await send(message)
+
+        await self._app(scope, receive, dated)
+
+
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(_DatedOnTheStacksClock)
 
 # The shop's own artwork. Served from a directory rather than inlined so the
 # image can be edited as an image, and mounted from a path relative to this
@@ -1388,7 +1418,7 @@ def _the_deployment_settled_at(rollout: PausedRollout | None) -> datetime:
     active = state.active
 
     if active is None or active.serving_since is None:
-        return datetime.now(UTC) - SETTLED_UPTIME
+        return clock.now() - SETTLED_UPTIME
 
     return active.serving_since
 
@@ -1961,7 +1991,7 @@ def grafana_rules(rule_uid: str = Query(...)) -> JSONResponse:
     its data source holds, so a minute the shop never published is a minute it
     does not see.
     """
-    now = datetime.now(UTC)
+    now = clock.now()
     rule = alert_rules.SERIES_RULES.get(rule_uid)
 
     if rule is not None:
@@ -2008,7 +2038,7 @@ def _the_alert_the_shop_would_raise() -> dict[str, Any]:
     """The alert `raise_alert` would send now, built from the same checks."""
     return an_alert_for(
         state.active_scenario_id,
-        datetime.now(UTC),
+        clock.now(),
         finding=state.the_integrity_check_found(),
         unheard_from_since=state.the_minute_the_shop_went_quiet(),
         stale=state.the_cache_check_found(),
@@ -2082,7 +2112,7 @@ def _the_exposition() -> str:
     return prometheus.an_exposition(
         [bucket.model_dump() for bucket in _the_buckets()],
         staged_at=active.seeded_at,
-        now=datetime.now(UTC)
+        now=clock.now()
     )
 
 
@@ -2116,7 +2146,7 @@ def prometheus_query_range(query: str | None = Query(None),
             prometheus.read_time(start),
             prometheus.read_time(end),
             prometheus.read_step(step),
-            now=datetime.now(UTC),
+            now=clock.now(),
             reporting_lag_minutes=get_prometheus_settings().reporting_lag_minutes
         )
     except prometheus.BadData as error:

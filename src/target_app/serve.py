@@ -24,8 +24,12 @@ HOST = "0.0.0.0"
 
 
 def main() -> None:
-    """Starts the listener."""
-    uvicorn.run(app, host=HOST, port=PORT)
+    """Starts the listener.
+
+    Without uvicorn's own `Date` header, which it reads off the wall: the app
+    dates its responses by the stack's clock.
+    """
+    uvicorn.run(app, host=HOST, port=PORT, date_header=False)
 
 
 if __name__ == "__main__":

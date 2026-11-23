@@ -34,7 +34,7 @@ import random
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from functools import lru_cache
 from typing import Any
 
@@ -52,6 +52,7 @@ from io_shop.summary_cache import (
     LookUpSummary,
     SummaryEntry,
 )
+from target_app import clock
 from target_app.accelerators import A100, V100
 from target_app.settings import (
     LAST_KNOWN_GOOD_CATEGORISER_MODEL,
@@ -3249,4 +3250,4 @@ def _flag_evaluation_line(
 
 
 def utc_now() -> datetime:
-    return datetime.now(UTC)
+    return clock.now()

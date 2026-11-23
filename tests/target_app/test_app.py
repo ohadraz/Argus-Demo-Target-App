@@ -4,6 +4,7 @@ import json
 import time
 from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from statistics import median
 from typing import Any
 from unittest.mock import Mock
@@ -18,6 +19,7 @@ from io_shop.visits import (
     record_visit,
 )
 from target_app import app as app_module
+from target_app import clock
 from target_app.alert_rules import (
     CATEGORISATION_CONFIDENCE_LOW,
     DASHBOARD_UID,
@@ -2726,3 +2728,13 @@ def test_the_window_carries_the_held_share(client: TestClient) -> None:
 
     assert all(bucket["fraud_held_for_review_ratio"] is not None for bucket in buckets)
 
+
+
+def test_a_response_is_dated_once_by_the_stacks_clock(client: TestClient) -> None:
+    # Uvicorn's own header is off, so this one is the only one a reader finds.
+    answer = client.get("/health")
+
+    dates = answer.headers.get_list("date")
+
+    assert len(dates) == 1
+    assert abs(parsedate_to_datetime(dates[0]) - clock.now()) < timedelta(seconds=2)

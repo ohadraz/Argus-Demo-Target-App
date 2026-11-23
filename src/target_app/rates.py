@@ -24,10 +24,12 @@ cache is exercised rather than sidestepped.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any, Final
 from zoneinfo import ZoneInfo
+
+from target_app import clock
 
 # Frankfurter's own response vocabulary, named here because this is the module
 # that writes it.
@@ -109,7 +111,7 @@ def rates_quoted_against(base: str, now: datetime | None = None) -> dict[str, An
     return {
         _AMOUNT: _ONE_UNIT,
         _BASE: quoted,
-        _PUBLISHED_ON: _the_last_publication(now or datetime.now(UTC)).isoformat(),
+        _PUBLISHED_ON: _the_last_publication(now or clock.now()).isoformat(),
         _RATES: {
             currency: float((per_euro / per_base).quantize(_QUOTED_PLACES))
             for currency, per_euro in _PER_EURO.items()

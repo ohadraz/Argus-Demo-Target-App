@@ -17,7 +17,9 @@ mitigation can be graded against.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
+
+from target_app import clock
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -1530,7 +1532,7 @@ def bucket_id(seeded_at: datetime, offset_minutes: int, span_minutes: int) -> st
 
 
 def utc_now() -> datetime:
-    return datetime.now(UTC)
+    return clock.now()
 
 
 # The failover again, told the way it is when the promotion left no trace. Built

@@ -26,7 +26,8 @@ services:
   # The stack's clock: simulated time is SIM_CLOCK_EPOCH + (real - EPOCH) *
   # SIM_CLOCK_SPEED, the formula every process that reads it agrees on. This
   # writes the offset that puts real time there into a spec file every 100ms,
-  # on a volume every faked service reads.
+  # on a volume every faked service reads. The Target Service is handed the
+  # epoch and speed instead, and works the time out itself.
   #
   # One shared offset rather than libfaketime's own speed factor, which anchors
   # to each process's start: measured, containers started a few seconds apart
@@ -289,10 +290,13 @@ services:
       # describing some.
       cache:
         condition: service_healthy
-    volumes:
-      - sim-clock:/clock:ro
     environment:
-      <<: *on-the-stacks-clock
+      # The stack's clock, worked out in the shop's own code from what
+      # `sim-clock` is handed (`target_app.clock`) rather than preloaded: under
+      # libfaketime a burst of requests on a starved CPU stalled the whole shop
+      # for seconds at a time.
+      SIM_CLOCK_EPOCH: "${SIM_CLOCK_EPOCH:-0}"
+      SIM_CLOCK_SPEED: "${SIM_CLOCK_SPEED:-1}"
       UNLEASH_BASE_URL: "http://unleash:4242"
       UNLEASH_PROJECT: "default"
       UNLEASH_ENVIRONMENT: "production"
