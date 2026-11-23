@@ -156,12 +156,12 @@ def client() -> Iterator[TestClient]:
     typical_purchase_flags = a_flag_client_named("typical-purchase-feature", enabled=False)
 
     was = app_module.state
-    # Both of the provider's history seams stubbed, for one reason: each reaches
-    # the provider's own database, which no test here has. One clears the log on a
-    # reset; the other backdates a staging toggle to when the change it stages
-    # actually happened.
+    # The provider's history seams stubbed, for one reason: each reaches the
+    # provider's own database, which no test here has. One clears the log on a
+    # reset; one backdates a staging toggle to when the change it stages actually
+    # happened; and one reads where the log has got to before a staging writes.
     app_module.state = ScenarioState(
-        flags, fallback_flags, typical_purchase_flags, Mock(), Mock()
+        flags, fallback_flags, typical_purchase_flags, Mock(), Mock(), Mock()
     )
     was_read_directly = _the_catalogs_own_clients_replaced_by(
         flags, fallback_flags, typical_purchase_flags
@@ -1032,12 +1032,12 @@ def a_shop_whose_flag_is_on() -> Iterator[TestClient]:
     typical_purchase_flags = a_flag_client_named("typical-purchase-feature", enabled=True)
 
     was = app_module.state
-    # Both of the provider's history seams stubbed, for one reason: each reaches
-    # the provider's own database, which no test here has. One clears the log on a
-    # reset; the other backdates a staging toggle to when the change it stages
-    # actually happened.
+    # The provider's history seams stubbed, for one reason: each reaches the
+    # provider's own database, which no test here has. One clears the log on a
+    # reset; one backdates a staging toggle to when the change it stages actually
+    # happened; and one reads where the log has got to before a staging writes.
     app_module.state = ScenarioState(
-        flags, fallback_flags, typical_purchase_flags, Mock(), Mock()
+        flags, fallback_flags, typical_purchase_flags, Mock(), Mock(), Mock()
     )
     was_read_directly = _the_catalogs_own_clients_replaced_by(
         flags, fallback_flags, typical_purchase_flags

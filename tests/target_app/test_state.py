@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 from dataclasses import replace
 from datetime import datetime, timedelta
 from unittest.mock import Mock
@@ -48,6 +49,11 @@ from target_app.state import (
 )
 
 
+# Where a stubbed provider log has got to when a case first asks: any entry
+# will do, as long as each later ask finds it further on.
+SOME_LOG_POSITION = 41
+
+
 def present[T](value: T | None) -> T:
     """`value`, which the case staged and so cannot be `None`.
 
@@ -92,6 +98,7 @@ def a_scenario_state(
     forget_the_flag_history: Mock | None = None,
     backdate_the_flag_history: Mock | None = None,
     typical_purchase_flags: Mock | None = None,
+    where_the_flag_history_is: Mock | None = None,
 ) -> ScenarioState:
     """A state object whose other flags nobody is looking at.
 
@@ -105,7 +112,9 @@ def a_scenario_state(
     the real one reaches the provider's own database, so a reset here would go
     looking for a database no unit test has. Backdating it is stubbed for exactly
     that second reason - it reaches the same database - and defaulted because only
-    the cases about the history ever look at what it was asked.
+    the cases about the history ever look at what it was asked. Where the log has
+    got to is read from that database too, so it is stubbed as well, and answers
+    in the order a staging asks: before the put-back, then before the toggles.
     """
     return ScenarioState(
         flags,
@@ -113,6 +122,7 @@ def a_scenario_state(
         typical_purchase_flags or a_typical_purchase_flag_reporting(False),
         forget_the_flag_history or Mock(),
         backdate_the_flag_history or Mock(),
+        where_the_flag_history_is or Mock(side_effect=itertools.count(SOME_LOG_POSITION)),
     )
 
 
@@ -1707,10 +1717,41 @@ def test_staging_it_records_the_flag_change_when_the_change_happened() -> None:
 
     state = a_state_with_the_totals_drifting(backdate)
 
-    flags, at, since = backdate.call_args.args
+    flags, at, after = backdate.call_args.args
     assert flags == [state._flags.name]
     assert at == present(present(state.active).timeline).turned_on_at
-    assert since > at
+    assert after == WHERE_THE_LOG_IS_BEFORE_THE_TOGGLES
+
+
+# Where a stubbed log stands as a staging reads it: before the put-back, and
+# then before the toggles that stage the incident, once the put-back's entries
+# are cleared. Asked in that order, so the second is the larger.
+WHERE_THE_LOG_IS_BEFORE_THE_PUT_BACK = SOME_LOG_POSITION
+WHERE_THE_LOG_IS_BEFORE_THE_TOGGLES = SOME_LOG_POSITION + 1
+
+
+def test_staging_moves_the_entries_written_after_it_began_whatever_they_say_their_time_is(
+) -> None:
+    # The provider stamps an entry on its own clock, which in a sped-up stack
+    # trails this service's by up to a step of the shared offset. Picked out by
+    # their stamps, the toggles stamped just behind the staging's own instant
+    # were left where the provider wrote them - after the onset, outside the
+    # window an investigation reads - and a walk found no change to the flag it
+    # blamed. Picked out by the order they were written in, every one is moved.
+    backdate = Mock()
+    flags = a_flag_client_reporting(True)
+    flags.name = "monthly-spend-feature"
+    state = a_scenario_state(
+        flags,
+        backdate_the_flag_history=backdate,
+        where_the_flag_history_is=Mock(side_effect=[WHERE_THE_LOG_IS_BEFORE_THE_PUT_BACK,
+                                                    WHERE_THE_LOG_IS_BEFORE_THE_TOGGLES]),
+    )
+
+    state.seed(SCENARIOS[SILENT_DATA_CORRUPTION])
+
+    _, _, after = backdate.call_args.args
+    assert after == WHERE_THE_LOG_IS_BEFORE_THE_TOGGLES
 
 
 def test_staging_a_flag_scenario_records_the_change_at_the_instant_the_flag_turned_on() -> None:
@@ -1726,10 +1767,10 @@ def test_staging_a_flag_scenario_records_the_change_at_the_instant_the_flag_turn
 
     state.seed(SCENARIOS[FEATURE_FLAG_TOGGLE])
 
-    named, at, since = backdate.call_args.args
+    named, at, after = backdate.call_args.args
     assert named == ["monthly-spend-feature"]
     assert at == present(present(state.active).timeline).turned_on_at
-    assert since > at
+    assert after == WHERE_THE_LOG_IS_BEFORE_THE_TOGGLES
 
 
 def test_the_slow_rollout_is_staged_on_the_typical_purchase_figure_s_own_flag() -> None:
@@ -1779,20 +1820,19 @@ def test_staging_forgets_what_putting_the_flags_back_recorded_and_nothing_before
     flags.name = "monthly-spend-feature"
     fallback_flags = a_flag_client_reporting(True)
     fallback_flags.name = "legacy-checkout-fallback"
-    before = utc_now()
 
     a_scenario_state(flags, fallback_flags, forget, backdate).seed(
         SCENARIOS[FEATURE_FLAG_TOGGLE]
     )
 
     forget.assert_called_once()
-    named, since = forget.call_args.args
+    named, after = forget.call_args.args
     _, _, staged_from = backdate.call_args.args
     assert named == [
         "monthly-spend-feature", "legacy-checkout-fallback", "typical-purchase-feature"
     ]
-    assert since is not None
-    assert before <= since <= staged_from
+    assert after == WHERE_THE_LOG_IS_BEFORE_THE_PUT_BACK
+    assert staged_from == WHERE_THE_LOG_IS_BEFORE_THE_TOGGLES
 
 
 def test_staging_a_scenario_no_flag_stages_backdates_no_history() -> None:

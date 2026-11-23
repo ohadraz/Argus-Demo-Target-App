@@ -57,6 +57,7 @@ from target_app.generator import (
 from target_app.history import (
     forget_the_changes_to,
     record_the_change_as_having_happened_at,
+    the_last_recorded_change,
 )
 from target_app.integrity import (
     the_accounts_the_check_examines,
@@ -211,15 +212,19 @@ def _the_decoys_quiet_state(scenario: Scenario) -> bool:
     return quiet_state_for(scenario.decoy_flag_role)
 
 
-# Clearing the flag provider's recorded history - all of it, or what was recorded
-# from an instant on - injected so that a test can watch a reset or a staging ask
+# Clearing the flag provider's recorded history - all of it, or what was written
+# after an entry - injected so that a test can watch a reset or a staging ask
 # for it without a provider database to ask.
-HistoryEraser = Callable[[Sequence[str], datetime | None], None]
+HistoryEraser = Callable[[Sequence[str], int | None], None]
 
 # And moving a recorded change back to when it happened, injected for the same
 # reason. Its own seam rather than a flag on the eraser's: a reset erases and a
 # staging backdates, and the two are asked for at opposite ends of a run.
-HistoryBackdater = Callable[[Sequence[str], datetime, datetime], None]
+HistoryBackdater = Callable[[Sequence[str], datetime, int], None]
+
+# Where the provider's log has got to, injected for the same reason: what a
+# staging reads before it writes, so it can tell its own entries from the rest.
+HistoryMark = Callable[[], int]
 
 
 def _how_long_ago_this_one_began(scenario: Scenario) -> timedelta:
@@ -464,12 +469,14 @@ class ScenarioState:
         backdate_the_flag_history: HistoryBackdater = (
             record_the_change_as_having_happened_at
         ),
+        where_the_flag_history_is: HistoryMark = the_last_recorded_change,
     ) -> None:
         self._flags = flags
         self._fallback_flags = fallback_flags
         self._typical_purchase_flags = typical_purchase_flags
         self._forget_the_flag_history = forget_the_flag_history
         self._backdate_the_flag_history = backdate_the_flag_history
+        self._where_the_flag_history_is = where_the_flag_history_is
         self._active: ActiveScenario | None = None
         self._moments: list[FlagMoment] = []
         self._last_seen: dict[str, bool] = {}
@@ -556,16 +563,19 @@ class ScenarioState:
         comes before the incident rather than inside it, and a change left in
         the log is a suspect nobody staged.
         """
-        calm_from = utc_now()
+        calm_from = self._where_the_flag_history_is()
         # A mark is about a change, and the changes it was about belong to the
         # run before. See `annotations_of`.
         self._annotations = {}
         self._put_the_flags_back_where_they_rest()
-        self._forget_what_the_flags_did(since=calm_from)
+        self._forget_what_the_flags_did(after=calm_from)
         # After the clearing, not before: it can take a moment for the provider
         # to agree a flag has moved, and an onset anchored ahead of that would
         # backdate the incident to before the world it starts from.
         now = utc_now()
+        # Where the log has got to before this staging writes to it: what it
+        # writes is every entry after this one (`record_the_change_as_having_happened_at`).
+        staged_from = self._where_the_flag_history_is()
 
         if not scenario.is_generated:
             self._remember_where_the_flags_are_now()
@@ -961,7 +971,7 @@ class ScenarioState:
         self._backdate_the_flag_history(
             self._the_flags_staged_by(scenario),
             onset,
-            now,
+            staged_from,
         )
         self._active = ActiveScenario(
             scenario=scenario,
@@ -1817,9 +1827,9 @@ class ScenarioState:
 
         self._forget_what_the_flags_did()
 
-    def _forget_what_the_flags_did(self, since: datetime | None = None) -> None:
+    def _forget_what_the_flags_did(self, after: int | None = None) -> None:
         """Clears every flag's recorded history, whichever one was staged - all
-        of it, or only what was recorded from `since` on.
+        of it, or only what was written after the entry `after` names.
 
         Every one, for the reason the flags themselves are all put back: a run
         abandoned by a restart left changes behind under a flag this service no
@@ -1827,7 +1837,7 @@ class ScenarioState:
         next investigation still finds something in.
         """
         self._forget_the_flag_history(
-            [client.name for client, _ in self._the_shops_flags()], since
+            [client.name for client, _ in self._the_shops_flags()], after
         )
 
     def _the_flags_staged_by(self, scenario: Scenario) -> list[str]:

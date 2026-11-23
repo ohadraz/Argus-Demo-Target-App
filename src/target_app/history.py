@@ -32,6 +32,13 @@ _THE_FLAG_IT_IS_ABOUT = "feature_name"
 # windows its search by. `timestamp with time zone`, so an aware instant goes in
 # and comes back out as the same moment.
 _WHEN_IT_HAPPENED = "created_at"
+# And the order the provider wrote entries in: a serial, so every entry written
+# after another has the larger one. What picks out the entries a staging wrote,
+# rather than the time they say they were written at - the provider stamps that
+# on its own clock, which in a sped-up stack trails the one this service works
+# out by up to a step of the offset it reads (`sim-clock`), so an entry written
+# after a moment this service read can say it was written before it.
+_THE_ORDER_IT_WAS_WRITTEN_IN = "id"
 
 
 class FlagHistoryUnavailable(Exception):
@@ -44,27 +51,49 @@ class FlagHistoryUnavailable(Exception):
     """
 
 
+def the_last_recorded_change(settings: UnleashSettings | None = None) -> int:
+    """Where the provider's log has got to: its latest entry's place in the
+    order it was written in, or 0 for an empty log. What a staging reads before
+    it writes, so it can tell its own entries from every one before them."""
+    resolved = settings if settings is not None else get_unleash_settings()
+
+    try:
+        with psycopg.connect(resolved.database_url, connect_timeout=5) as connection:
+            row = connection.execute(
+                f"SELECT COALESCE(MAX({_THE_ORDER_IT_WAS_WRITTEN_IN}), 0) FROM {_THE_AUDIT_LOG}"
+            ).fetchone()
+    except psycopg.Error as error:
+        raise FlagHistoryUnavailable(
+            f"could not read the flag history in [{resolved.database_url}]: {error}"
+        ) from error
+
+    return int(row[0]) if row is not None else 0
+
+
 def forget_the_changes_to(
     flags: Sequence[str],
-    since: datetime | None = None,
+    after: int | None = None,
     settings: UnleashSettings | None = None,
 ) -> None:
     """Deletes the recorded changes to these flags from the provider's log:
-    every one, or those recorded from `since` on.
+    every one, or those written after the entry `after` names
+    (`the_last_recorded_change`).
 
     Every change for a reset, not the ones since some moment: the reset's own
     put-backs are written a fraction of a second before this runs, and a cutoff
     would either keep them or need a clock this has no reason to hold. A demo's
     history starts when the demo does.
 
-    From `since` for a staging, which puts the flags back before it moves them
+    After `after` for a staging, which puts the flags back before it moves them
     and has to clear only that: what was recorded before it happened when it
     happened, and an earlier incident a later one is compared with is part of
-    it.
+    it. By the order the entries were written in, never by when they say they
+    were: see `_THE_ORDER_IT_WAS_WRITTEN_IN`.
     """
     resolved = settings if settings is not None else get_unleash_settings()
-    since_clause = f" AND {_WHEN_IT_HAPPENED} >= %s" if since is not None else ""
-    parameters = (list(flags), since) if since is not None else (list(flags),)
+    since_clause = (f" AND {_THE_ORDER_IT_WAS_WRITTEN_IN} > %s"
+                    if after is not None else "")
+    parameters = (list(flags), after) if after is not None else (list(flags),)
 
     try:
         with psycopg.connect(resolved.database_url, connect_timeout=5) as connection:
@@ -82,10 +111,11 @@ def forget_the_changes_to(
 def record_the_change_as_having_happened_at(
     flags: Sequence[str],
     at: datetime,
-    since: datetime,
+    after: int,
     settings: UnleashSettings | None = None,
 ) -> None:
-    """Moves every recorded change to these flags since `since` back to `at`.
+    """Moves every recorded change to these flags written after the entry
+    `after` names (`the_last_recorded_change`) back to `at`.
 
     The same reach past the API that the eraser above makes, for the same reason
     and with the same justification: an audit log that cannot be written is right
@@ -100,9 +130,12 @@ def record_the_change_as_having_happened_at(
     anyway is a change that cannot have caused what began before it. So the
     change is recorded when the change happened.
 
-    `since` is what keeps this to the staging toggles. A demo's log may hold
+    `after` is what keeps this to the staging toggles. A demo's log may hold
     changes from before this scenario was staged, and those happened when they
-    happened; only what seeding just wrote is moved.
+    happened; only what seeding just wrote is moved. Picked out by the order
+    they were written in, never by when they say they were: an entry the
+    provider stamped a moment behind this service's clock was once left where
+    it was written, after the onset, and the incident's own change went unread.
 
     Its own failure rather than a silent pass, exactly as the eraser's is. A
     scenario staged with its flag change at the wrong instant looks perfectly well
@@ -116,8 +149,8 @@ def record_the_change_as_having_happened_at(
             connection.execute(
                 f"UPDATE {_THE_AUDIT_LOG} SET {_WHEN_IT_HAPPENED} = %s "
                 f"WHERE {_THE_FLAG_IT_IS_ABOUT} = ANY(%s) "
-                f"AND {_WHEN_IT_HAPPENED} >= %s",
-                (at, list(flags), since),
+                f"AND {_THE_ORDER_IT_WAS_WRITTEN_IN} > %s",
+                (at, list(flags), after),
             )
     except psycopg.Error as error:
         raise FlagHistoryUnavailable(
